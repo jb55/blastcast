@@ -486,6 +486,30 @@ async fn a_second_phone_takes_over_without_ending_the_session() {
 }
 
 #[tokio::test]
+async fn a_connection_reused_after_its_teardown_can_still_be_taken_over() {
+    let rig = Rig::start().await;
+    let mut first = Phone::connect(rig.addr).await;
+    first.start().await;
+    let teardown = first.request("TEARDOWN", &[], None).await;
+    assert_eq!(teardown.status, 200);
+    // The same socket, streaming again.
+    first.start().await;
+    let mut second = Phone::connect(rig.addr).await;
+    second.start().await;
+
+    // The first phone's connection is dropped, so only one plays.
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(2), first.rtsp.read(&mut byte))
+        .await
+        .expect("the first phone is cut off");
+    assert!(matches!(read, Ok(0) | Err(_)));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(rig.recorder.events(), [MetadataEvent::PlayBegin]);
+    rig.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_new_record_soon_after_a_teardown_keeps_the_session() {
     let rig = Rig::start().await;
     let mut phone = Phone::connect(rig.addr).await;

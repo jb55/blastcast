@@ -244,7 +244,7 @@ impl Connection {
     fn teardown(&mut self) -> Response {
         self.stream = None;
         self.announce = None;
-        self.receiver.end(self.id);
+        self.receiver.release(self.id);
         Response::ok()
     }
 

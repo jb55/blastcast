@@ -316,11 +316,18 @@ impl Receiver {
         }
     }
 
-    /// `conn` stopped (torn down, closed or dropped): if the session was
-    /// on it, the session ends unless a sender records again soon.
+    /// `conn`'s task ended (closed or dropped): it leaves the session, and
+    /// there is nothing left of it to drop.
     fn end(self: &Arc<Self>, conn: u64) {
+        self.lock().connections.remove(&conn);
+        self.release(conn);
+    }
+
+    /// `conn` stopped streaming (torn down, or ended): if the session was
+    /// on it, the session ends unless a sender records again soon. The
+    /// connection stays droppable, as a sender can stream on it again.
+    fn release(self: &Arc<Self>, conn: u64) {
         let mut state = self.lock();
-        state.connections.remove(&conn);
         if state.current == Some(conn) {
             state.current = None;
         }
