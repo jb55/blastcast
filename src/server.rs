@@ -493,13 +493,17 @@ impl SendspinServer {
     fn register(&self, conn: &Arc<Connection>) {
         let client_id = conn.client_id();
         let mut connections = self.lock();
-        if let Some(old) = connections.insert(client_id.to_owned(), conn.clone()) {
+        let old = connections.insert(client_id.to_owned(), conn.clone());
+        // After server/hello, which is already queued. Before the old
+        // connection closes: its read loop then queues the disconnect,
+        // which must reach the groups after this to be ignored, or the
+        // reconnect loses its group.
+        self.groups.connect(conn.clone());
+        if let Some(old) = old {
             tracing::info!(client_id, "new connection replaces the old one");
             old.close();
             self.remove_player(client_id);
         }
-        // After server/hello, which is already queued.
-        self.groups.connect(conn.clone());
         if conn.has_role("player") {
             // Unavailable until its first client/state says otherwise.
             let mut state = PlayerState::new(client_id, PROVIDER, conn.name());

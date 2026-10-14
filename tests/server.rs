@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use tas_audio::{SESSION_FORMAT, ServerClock, SineSource};
 use tas_core::{CommandError, PlayerCommand as Cmd, PlayerFeature, PlayerRegistry};
 use tas_sendspin::protocol::{
     ClientGoodbye, ClientHello, ClientMessage, ClientState, ConnectionReason, GoodbyeReason,
@@ -281,6 +282,49 @@ async fn a_reconnect_replaces_the_old_connection() {
         h.registry.get("kitchen").is_some_and(|p| p.available)
     })
     .await;
+}
+
+/// The old connection's disconnect races the new one's connect to the
+/// groups task. Run on several threads and many times: when the old
+/// connection was closed before the connect was queued, the disconnect won
+/// within a few hundred reconnects and the player fell into a stopped group
+/// of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_keeps_its_playing_group() {
+    let clock = ServerClock::new();
+    let mut cfg = config();
+    cfg.clock = clock;
+    let h = start(cfg).await;
+    let (mut ws, _) = handshake(&h.url, "kitchen", &["player@v1"]).await;
+    let groups = h.server.groups();
+    let group = groups.group_of("kitchen").unwrap().id;
+    let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
+    groups.play(&group, Box::new(sine)).await.unwrap();
+
+    for attempt in 0..1000 {
+        let old_conn = h.server.connection("kitchen").unwrap();
+        let mut new = connect(&h.url).await;
+        send(&mut new, &hello("kitchen", &["player@v1"])).await;
+        let ServerMessage::Hello(_) = next_server_message(&mut new).await else {
+            panic!("expected server/hello");
+        };
+        // The old one may still have audio in flight before it closes.
+        while !matches!(next(&mut ws).await, None | Some(Message::Close(_))) {}
+        // Its cleanup, the disconnect included, has run.
+        eventually("the old player is gone", || {
+            Arc::strong_count(&old_conn) == 1
+        })
+        .await;
+
+        let info = groups.group_of("kitchen").expect("still in a group");
+        assert_eq!(info.id, group, "attempt {attempt}: same group");
+        assert_eq!(
+            info.playback_state,
+            PlaybackState::Playing,
+            "attempt {attempt}: still playing"
+        );
+        ws = new;
+    }
 }
 
 #[tokio::test]
