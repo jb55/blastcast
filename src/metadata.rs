@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use tas_core::{Image, ImageSource};
 use tokio::sync::broadcast;
 
 use crate::config::{PLAY_BEGIN, PLAY_END, ReceiverInfo};
@@ -112,6 +113,15 @@ impl Artwork {
             [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
             [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
             _ => None,
+        }
+    }
+
+    /// The image to serve: of [`Self::content_type`], or untyped bytes
+    /// for the client to sniff.
+    pub fn image(&self) -> Image {
+        Image {
+            bytes: self.bytes.clone(),
+            content_type: self.content_type().unwrap_or("application/octet-stream"),
         }
     }
 }
@@ -469,6 +479,18 @@ impl AirplayMetadata {
     }
 }
 
+/// Serves each receiver's current cover art by its [`Artwork::hash`], for
+/// as long as it is the current one.
+impl ImageSource for AirplayMetadata {
+    fn image(&self, id: &str) -> Option<Image> {
+        lock(&self.receivers)
+            .values()
+            .filter_map(|r| r.now.artwork.as_ref())
+            .find(|art| art.hash == id)
+            .map(Artwork::image)
+    }
+}
+
 impl ReceiverHandler for AirplayMetadata {
     fn started(&self, receiver: &ReceiverInfo) {
         lock(&self.receivers).insert(receiver.target_id.clone(), Receiver::default());
@@ -778,6 +800,32 @@ mod tests {
         assert_eq!(end.target_id, "ss-kitchen");
         assert_eq!(end.event, MetadataEvent::PlayEnd);
         assert!(meta.targets().is_empty());
+    }
+
+    #[test]
+    fn the_current_art_is_served_by_its_hash_until_the_session_ends() {
+        let meta = AirplayMetadata::new();
+        let info = receiver();
+        meta.started(&info);
+        let hash = super::Artwork::new(art()).hash;
+        assert_eq!(meta.image(&hash), None);
+
+        meta.metadata(&info, b"MA_PLAY_BEGIN\n");
+        meta.metadata(&info, &item("ssnc", "PICT", &art()));
+        let image = meta.image(&hash).unwrap();
+        assert_eq!(&image.bytes[..], &art()[..]);
+        assert_eq!(image.content_type, "image/jpeg");
+        assert_eq!(meta.image("0000000000000000"), None);
+
+        // A new image replaces it, at a new id.
+        let png = b"\x89PNG\r\n\x1a\n....".to_vec();
+        let png_hash = super::Artwork::new(png.clone()).hash;
+        meta.metadata(&info, &item("ssnc", "PICT", &png));
+        assert_eq!(meta.image(&hash), None);
+        assert_eq!(meta.image(&png_hash).unwrap().content_type, "image/png");
+
+        meta.metadata(&info, b"MA_PLAY_END\n");
+        assert_eq!(meta.image(&png_hash), None);
     }
 
     #[test]

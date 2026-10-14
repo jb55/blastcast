@@ -18,7 +18,9 @@
 //!   the player's `current_media` as a source session
 //!   ([`PlayerRegistry::set_source_session`]) and to its protocol's
 //!   now-playing (Sendspin's metadata role), and the cover art to the
-//!   protocol's artwork.
+//!   protocol's artwork. The art's URL on the API's imageproxy goes in
+//!   `current_media.image_url`, which the session is re-sent for when
+//!   the art changes.
 //!
 //! Each receiver's source is listed in its target's `source_list` while
 //! the receiver runs, passive, with no transport controls: the sender is
@@ -44,6 +46,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use tas_core::images::image_url;
 use tas_core::player::{MediaType, PlayerMedia, PlayerSource, unix_now};
 use tas_core::{CommandError, PlayerCommand, PlayerRegistry, SourceMetadata, SourceSession};
 use tokio::sync::broadcast::error::RecvError;
@@ -100,6 +103,10 @@ pub struct AirplayRouter {
     registry: Arc<PlayerRegistry>,
     audio: Arc<AirplayAudio>,
     metadata: Arc<AirplayMetadata>,
+    /// The API's base URL, which serves the cover art (as
+    /// [`AirplayMetadata`]'s [`tas_core::ImageSource`]). Without it no
+    /// `image_url` is set.
+    base_url: Option<String>,
     /// Held across a whole start or stop, so they never interleave.
     targets: tokio::sync::Mutex<HashMap<String, Target>>,
     next_session: AtomicU64,
@@ -110,11 +117,13 @@ impl AirplayRouter {
         registry: Arc<PlayerRegistry>,
         audio: Arc<AirplayAudio>,
         metadata: Arc<AirplayMetadata>,
+        base_url: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry,
             audio,
             metadata,
+            base_url,
             targets: tokio::sync::Mutex::default(),
             next_session: AtomicU64::new(1),
         })
@@ -209,6 +218,7 @@ impl AirplayRouter {
             MetadataEvent::Artwork(art) => {
                 if let Some(player) = self.claimed(id).await {
                     self.artwork(&player, Some(art.bytes)).await;
+                    self.session(id, &player, Instant::now());
                 }
             }
             MetadataEvent::Track(_)
@@ -348,15 +358,8 @@ impl AirplayRouter {
 
     /// Shows what `target_id`'s sender is playing on `player_id`.
     async fn now_playing(&self, target_id: &str, player_id: &str) {
-        let now = self.metadata.now_playing(target_id).unwrap_or_default();
         let at = Instant::now();
-        self.registry.set_source_session(
-            player_id,
-            Some(SourceSession {
-                source_id: source_id(target_id),
-                media: media(target_id, &now, at),
-            }),
-        );
+        let now = self.session(target_id, player_id, at);
         if let Err(e) = self
             .registry
             .set_source_metadata(player_id, Some(metadata(&now, at)))
@@ -364,6 +367,20 @@ impl AirplayRouter {
         {
             log_unshown(player_id, &e);
         }
+    }
+
+    /// Sets `player_id`'s `current_media` to what `target_id`'s sender is
+    /// playing, as of `at`, and returns that.
+    fn session(&self, target_id: &str, player_id: &str, at: Instant) -> NowPlaying {
+        let now = self.metadata.now_playing(target_id).unwrap_or_default();
+        self.registry.set_source_session(
+            player_id,
+            Some(SourceSession {
+                source_id: source_id(target_id),
+                media: media(target_id, &now, at, self.base_url.as_deref()),
+            }),
+        );
+        now
     }
 
     async fn artwork(&self, player_id: &str, image: Option<Arc<[u8]>>) {
@@ -422,8 +439,9 @@ fn log_unshown(player_id: &str, e: &CommandError) {
     }
 }
 
-/// The player's `current_media` for `now`, as of `at`.
-fn media(target_id: &str, now: &NowPlaying, at: Instant) -> PlayerMedia {
+/// The player's `current_media` for `now`, as of `at`, with its art
+/// served under `base_url`.
+fn media(target_id: &str, now: &NowPlaying, at: Instant, base_url: Option<&str>) -> PlayerMedia {
     let track = now.track.clone().unwrap_or_default();
     let secs = |d: std::time::Duration| u32::try_from(d.as_secs()).unwrap_or(u32::MAX);
     let elapsed = now.elapsed(at);
@@ -437,6 +455,9 @@ fn media(target_id: &str, now: &NowPlaying, at: Instant) -> PlayerMedia {
         source_id: Some(source_id(target_id)),
         elapsed_time: elapsed.map(secs),
         elapsed_time_last_updated: elapsed.map(|_| unix_now()),
+        image_url: base_url
+            .zip(now.artwork.as_ref())
+            .map(|(base, art)| image_url(base, &art.hash, art.image().content_type)),
         ..Default::default()
     }
 }
@@ -462,7 +483,7 @@ mod tests {
     use async_trait::async_trait;
     use tas_audio::LiveSource;
     use tas_core::player::PlayerState;
-    use tas_core::{PlayerControl, PlayerFeature};
+    use tas_core::{ImageSource, PlayerControl, PlayerFeature};
     use tokio::io::AsyncWriteExt;
     use tokio::net::unix::pipe;
 
@@ -568,7 +589,12 @@ mod tests {
             }
             let audio = AirplayAudio::new();
             let metadata = AirplayMetadata::new();
-            let router = AirplayRouter::new(registry.clone(), audio.clone(), metadata.clone());
+            let router = AirplayRouter::new(
+                registry.clone(),
+                audio.clone(),
+                metadata.clone(),
+                Some(BASE_URL.into()),
+            );
             if run {
                 tokio::spawn(router.clone().run());
             }
@@ -640,6 +666,7 @@ mod tests {
     }
 
     const KITCHEN: &str = "airplay_receiver://audio_source/kitchen";
+    const BASE_URL: &str = "http://10.0.0.5:8095";
 
     #[tokio::test]
     async fn a_session_plays_on_its_target_and_stops_at_the_end() {
@@ -661,6 +688,7 @@ mod tests {
         let media = p.current_media.unwrap();
         assert_eq!(media.uri, KITCHEN);
         assert_eq!(media.media_type, MediaType::AudioSource);
+        assert_eq!(media.image_url, None);
         let claim = rig.router.claim("kitchen").await.unwrap();
         assert_eq!(claim.player_id, "kitchen");
 
@@ -689,9 +717,16 @@ mod tests {
             rig.wait(2).await,
             ["kitchen metadata Teardrop", "kitchen artwork 9"]
         );
+        // The art alone re-sends the session, with its URL.
         let media = rig.get("kitchen").current_media.unwrap();
         assert_eq!(media.title.as_deref(), Some("Teardrop"));
         assert_eq!(media.artist.as_deref(), Some("Massive Attack"));
+        let hash = crate::metadata::Artwork::new(art.to_vec()).hash;
+        assert_eq!(
+            media.image_url,
+            Some(format!("{BASE_URL}/imageproxy/{hash}?size=0&fmt=jpg"))
+        );
+        assert!(rig.metadata.image(&hash).is_some());
 
         // Later ones set the volume; a mute mutes, and the next volume
         // unmutes first.
