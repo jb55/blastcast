@@ -143,7 +143,7 @@ pub async fn run(
         let server = server.clone();
         async move {
             server
-                .run_connection(from_bridge, to_bridge, ConnectionReason::Playback)
+                .run_local_connection(from_bridge, to_bridge, ConnectionReason::Playback)
                 .await
         }
     });
