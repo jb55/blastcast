@@ -8,6 +8,11 @@
 //! with the player role is a player in the [`PlayerRegistry`] for as long as
 //! it is connected; a second connection with the same `client_id` replaces
 //! the first.
+//!
+//! Clock sync is the server's half of NTP: each `client/time` is answered
+//! with `server/time`, `server_received` read as the frame arrives and
+//! `server_transmitted` by the writer as it writes. The client runs the
+//! time filter; the server only answers, and answers fast.
 
 use std::collections::HashMap;
 use std::fmt::{self, Display};
@@ -23,6 +28,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::response::Response;
 use axum::routing::get;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
+use tas_audio::ServerClock;
 use tas_core::{PlayerRegistry, PlayerState};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -30,8 +36,8 @@ use tokio::time::timeout;
 use crate::connection::{Connection, Frame, write_loop};
 use crate::player::SendspinPlayer;
 use crate::protocol::{
-    ClientHello, ClientMessage, ClientState, ConnectionReason, DecodeError, GoodbyeReason,
-    PROTOCOL_VERSION, Role, ServerHello, ServerMessage, roles,
+    ClientHello, ClientMessage, ClientState, ClientTime, ConnectionReason, DecodeError,
+    GoodbyeReason, PROTOCOL_VERSION, Role, ServerHello, ServerMessage, ServerTime, roles,
 };
 
 /// Where clients connect, as advertised in the mDNS TXT `path`.
@@ -58,6 +64,10 @@ pub struct ServerConfig {
     pub hello_timeout: Duration,
     /// How long one frame may take to write before the client is dropped.
     pub write_timeout: Duration,
+    /// The clock every time on the wire is read from: `server/time`,
+    /// `server_transmitted` and audio chunk timestamps. Give the server the
+    /// one the audio pipeline paces with.
+    pub clock: ServerClock,
 }
 
 impl ServerConfig {
@@ -69,6 +79,7 @@ impl ServerConfig {
             ping_interval: Duration::from_secs(30),
             hello_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(10),
+            clock: ServerClock::new(),
         }
     }
 }
@@ -210,7 +221,7 @@ impl SendspinServer {
             ?active_roles,
             "sendspin client connected"
         );
-        let (conn, queues) = Connection::new(hello, active_roles, reason);
+        let (conn, queues) = Connection::new(hello, active_roles, reason, self.config.clock);
         let conn = Arc::new(conn);
         // Queued before anything else can be, so it is the first message.
         let _ = conn.send(ServerMessage::Hello(ServerHello {
@@ -330,9 +341,11 @@ impl SendspinServer {
                 }
                 Ok(Some(Ok(frame))) => frame,
             };
+            // Before anything else, for a client/time's server_received.
+            let received_us = conn.clock().now_us();
             match frame {
                 Frame::Text(text) => {
-                    if self.dispatch(conn, &text).is_break() {
+                    if self.dispatch(conn, &text, received_us).is_break() {
                         return;
                     }
                 }
@@ -344,8 +357,9 @@ impl SendspinServer {
         }
     }
 
-    /// Handles one text message. Breaks when the connection should end.
-    fn dispatch(&self, conn: &Arc<Connection>, text: &str) -> ControlFlow<()> {
+    /// Handles one text message, which arrived at `received_us` on the
+    /// server clock. Breaks when the connection should end.
+    fn dispatch(&self, conn: &Arc<Connection>, text: &str, received_us: i64) -> ControlFlow<()> {
         let client_id = conn.client_id();
         let msg = match ClientMessage::decode(text) {
             Ok(msg) => msg,
@@ -370,9 +384,8 @@ impl SendspinServer {
                 // The spec has the server initiate the disconnect.
                 return ControlFlow::Break(());
             }
-            ClientMessage::Time(_)
-            | ClientMessage::Command(_)
-            | ClientMessage::RequestFormat(_) => {
+            ClientMessage::Time(time) => on_client_time(conn, time, received_us),
+            ClientMessage::Command(_) | ClientMessage::RequestFormat(_) => {
                 tracing::debug!(client_id, text, "not handled yet");
             }
         }
@@ -453,6 +466,15 @@ impl SendspinServer {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Answers a `client/time`. The writer stamps `server_transmitted`.
+fn on_client_time(conn: &Connection, time: ClientTime, received_us: i64) {
+    let _ = conn.send(ServerMessage::Time(ServerTime {
+        client_transmitted: time.client_transmitted,
+        server_received: received_us,
+        server_transmitted: 0,
+    }));
 }
 
 async fn upgrade(

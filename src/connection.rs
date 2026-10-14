@@ -4,7 +4,10 @@
 //! Control messages and audio have separate queues, and the writer always
 //! takes a waiting control message first, so a `server/time` reply never
 //! sits behind a second of audio. Messages are serialized in the writer, at
-//! the moment they are written, not when they are queued.
+//! the moment they are written, not when they are queued: the writer waits
+//! until the socket can take a frame, then stamps `server_transmitted` from
+//! the server clock and writes it, as the spec's transmit-timestamp rule
+//! asks.
 
 use std::fmt::Display;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +15,8 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::{Sink, SinkExt};
+use futures_util::{Sink, SinkExt, future};
+use tas_audio::ServerClock;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 
@@ -54,6 +58,7 @@ pub struct Connection {
     hello: ClientHello,
     active_roles: Vec<String>,
     reason: ConnectionReason,
+    clock: ServerClock,
     layout: Mutex<HeaderLayout>,
     control: mpsc::Sender<ServerMessage>,
     audio: mpsc::Sender<Bytes>,
@@ -74,6 +79,7 @@ impl Connection {
         hello: ClientHello,
         active_roles: Vec<String>,
         reason: ConnectionReason,
+        clock: ServerClock,
     ) -> (Self, Queues) {
         let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
         let (audio, audio_rx) = mpsc::channel(AUDIO_QUEUE);
@@ -81,6 +87,7 @@ impl Connection {
             hello,
             active_roles,
             reason,
+            clock,
             // Every plaintext v1 client reads the 9-byte header; the Noise
             // handshake will switch this.
             layout: Mutex::new(HeaderLayout::Legacy),
@@ -123,6 +130,11 @@ impl Connection {
 
     pub fn connection_reason(&self) -> ConnectionReason {
         self.reason
+    }
+
+    /// The server clock, which every time sent to this client is read from.
+    pub fn clock(&self) -> ServerClock {
+        self.clock
     }
 
     /// The audio chunk header this client reads.
@@ -204,6 +216,10 @@ impl Connection {
 /// Drains a connection's queues into its socket, control first, and pings
 /// every `ping_interval`. Ends when the connection is closed or a write
 /// fails or takes longer than `write_timeout`, closing the connection.
+///
+/// A control message is stamped and serialized only once the socket is
+/// ready for it, so its `server_transmitted` leaves out the time it spent
+/// queued and the time the socket was backed up.
 pub(crate) async fn write_loop<Si>(
     conn: &Connection,
     mut sink: Si,
@@ -218,14 +234,26 @@ pub(crate) async fn write_loop<Si>(
     let mut ping = tokio::time::interval_at(Instant::now() + ping_interval, ping_interval);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        let frame = tokio::select! {
+        let next = tokio::select! {
             biased;
             _ = closed.wait_for(|c| *c) => break,
-            Some(msg) = queues.control.recv() => Frame::Text(msg.to_json()),
-            Some(chunk) = queues.audio.recv() => Frame::Binary(chunk),
-            _ = ping.tick() => Frame::Ping(Bytes::new()),
+            Some(msg) = queues.control.recv() => Next::Control(msg),
+            Some(chunk) = queues.audio.recv() => Next::Frame(Frame::Binary(chunk)),
+            _ = ping.tick() => Next::Frame(Frame::Ping(Bytes::new())),
         };
-        match timeout(write_timeout, sink.send(frame)).await {
+        let write = async {
+            future::poll_fn(|cx| sink.poll_ready_unpin(cx)).await?;
+            let frame = match next {
+                Next::Control(mut msg) => {
+                    msg.stamp_transmitted(conn.clock.now_us());
+                    Frame::Text(msg.to_json())
+                }
+                Next::Frame(frame) => frame,
+            };
+            sink.start_send_unpin(frame)?;
+            sink.flush().await
+        };
+        match timeout(write_timeout, write).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::debug!(client_id = conn.client_id(), error = %e, "write failed");
@@ -250,10 +278,16 @@ pub(crate) async fn write_loop<Si>(
     .await;
 }
 
+/// What the writer took off its queues, before it is stamped.
+enum Next {
+    Control(ServerMessage),
+    Frame(Frame),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ServerHello, StreamClear};
+    use crate::protocol::{ServerHello, ServerTime, StreamClear};
     use futures_util::StreamExt;
 
     fn conn(roles: &[&str]) -> (Connection, Queues) {
@@ -263,7 +297,7 @@ mod tests {
             ..Default::default()
         };
         let roles = roles.iter().map(|r| r.to_string()).collect();
-        Connection::new(hello, roles, ConnectionReason::Playback)
+        Connection::new(hello, roles, ConnectionReason::Playback, ServerClock::new())
     }
 
     #[test]
@@ -343,6 +377,49 @@ mod tests {
         assert!(text_at <= 2, "control written at {text_at}: {frames:?}");
         c.close();
         assert_eq!(socket.next().await, Some(Frame::Close));
+        writer.await.unwrap();
+    }
+
+    /// `server_transmitted` is the time the socket took the message, not
+    /// the time it was queued: here the socket is backed up for 250 ms.
+    #[tokio::test(start_paused = true)]
+    async fn stamps_transmit_time_when_written_not_when_queued() {
+        let (c, q) = conn(&["player@v1"]);
+        c.mark_ready();
+        let (sink, mut socket) = futures_channel::mpsc::channel::<Frame>(0);
+        let c = std::sync::Arc::new(c);
+        let writer = {
+            let c = c.clone();
+            tokio::spawn(async move {
+                write_loop(&c, sink, q, Duration::from_secs(60), Duration::from_secs(5)).await
+            })
+        };
+        // The audio frame takes the socket's one slot, so the reply waits.
+        c.send_audio(Bytes::from_static(b"a")).unwrap();
+        tokio::task::yield_now().await;
+        let queued_at = c.clock().now_us();
+        c.send(ServerMessage::Time(ServerTime {
+            client_transmitted: 42,
+            server_received: queued_at,
+            server_transmitted: 0,
+        }))
+        .unwrap();
+        tokio::time::advance(Duration::from_millis(250)).await;
+
+        assert_eq!(
+            socket.next().await,
+            Some(Frame::Binary(Bytes::from_static(b"a")))
+        );
+        let Some(Frame::Text(text)) = socket.next().await else {
+            panic!("expected server/time");
+        };
+        let ServerMessage::Time(t) = ServerMessage::decode(&text).unwrap() else {
+            panic!("expected server/time, got {text}");
+        };
+        assert_eq!(t.client_transmitted, 42);
+        assert_eq!(t.server_received, queued_at);
+        assert_eq!(t.server_transmitted, queued_at + 250_000);
+        c.close();
         writer.await.unwrap();
     }
 

@@ -50,6 +50,19 @@ impl ServerMessage {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("server messages always serialize")
     }
+
+    /// Sets `server_transmitted`, on the messages that carry it, to `now_us`.
+    /// A connection's writer calls this just before it writes the message,
+    /// never when it is queued; whatever was there before is overwritten.
+    pub fn stamp_transmitted(&mut self, now_us: i64) {
+        match self {
+            Self::Time(t) => t.server_transmitted = now_us,
+            Self::StreamStart(s) => s.server_transmitted = Some(now_us),
+            Self::StreamClear(c) => c.server_transmitted = Some(now_us),
+            Self::StreamEnd(e) => e.server_transmitted = Some(now_us),
+            Self::Hello(_) | Self::State(_) | Self::Command(_) | Self::GroupUpdate(_) => {}
+        }
+    }
 }
 
 /// `server/hello`, the answer to `client/hello`.
@@ -65,7 +78,8 @@ pub struct ServerHello {
 }
 
 /// `server/time`, the answer to `client/time`. All three in microseconds;
-/// the server's two are on the server clock.
+/// the server's two are on the server clock. Queue it with
+/// `server_transmitted` 0: the writer stamps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerTime {
     pub client_transmitted: i64,
@@ -264,4 +278,42 @@ pub struct StreamEnd {
     pub server_transmitted: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamps_only_the_messages_that_carry_a_transmit_time() {
+        let mut time = ServerMessage::Time(ServerTime {
+            client_transmitted: 1,
+            server_received: 2,
+            server_transmitted: 0,
+        });
+        time.stamp_transmitted(3);
+        assert_eq!(
+            time,
+            ServerMessage::Time(ServerTime {
+                client_transmitted: 1,
+                server_received: 2,
+                server_transmitted: 3,
+            })
+        );
+
+        let mut clear = ServerMessage::StreamClear(StreamClear {
+            server_transmitted: Some(-1),
+            roles: None,
+        });
+        clear.stamp_transmitted(7);
+        assert!(clear.to_json().contains(r#""server_transmitted":7"#));
+
+        let mut start = ServerMessage::StreamStart(StreamStart::default());
+        start.stamp_transmitted(8);
+        assert!(start.to_json().contains(r#""server_transmitted":8"#));
+
+        let mut state = ServerMessage::State(ServerState::default());
+        state.stamp_transmitted(9);
+        assert_eq!(state, ServerMessage::State(ServerState::default()));
+    }
 }
