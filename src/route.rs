@@ -53,6 +53,7 @@ use tas_core::{
     CommandError, PlayerCommand, PlayerRegistry, SourceMetadata, SourceSelect, SourceSession,
 };
 use tokio::sync::broadcast::error::RecvError;
+use tracing::Instrument;
 
 use crate::audio::AirplayAudio;
 use crate::config::ReceiverInfo;
@@ -148,7 +149,10 @@ impl AirplayRouter {
         async move {
             loop {
                 match events.recv().await {
-                    Ok(event) => self.handle(event).await,
+                    Ok(event) => {
+                        let span = tracing::info_span!("airplay", target_id = %event.target_id);
+                        self.handle(event).instrument(span).await
+                    }
                     Err(RecvError::Lagged(missed)) => {
                         tracing::warn!(missed, "missed AirPlay events; resyncing");
                         self.resync().await;
@@ -283,6 +287,7 @@ impl AirplayRouter {
         player_id: &str,
     ) -> Result<u64, CommandError> {
         let session = self.next_session.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(target_id, player_id, session, "AirPlay source claimed");
         t.claim = Some(Claim {
             player_id: player_id.to_owned(),
             session,
