@@ -9,6 +9,7 @@ pub mod group;
 mod membership;
 pub mod player;
 pub mod protocol;
+pub mod secure;
 pub mod server;
 pub mod stats;
 pub mod status;

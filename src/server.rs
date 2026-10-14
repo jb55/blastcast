@@ -44,9 +44,12 @@ use crate::membership::Membership;
 use crate::player::SendspinPlayer;
 use crate::protocol::{
     ClientHello, ClientMessage, ClientState, ClientTime, ConnectionReason, DecodeError,
-    GoodbyeReason, PROTOCOL_VERSION, PlayerCommandKind, Role, ServerHello, ServerMessage,
-    ServerTime, roles,
+    GoodbyeReason, HeaderLayout, PROTOCOL_VERSION, PlayerCommandKind, Role, ServerHello,
+    ServerMessage, ServerTime, roles,
 };
+use crate::secure::link::Link;
+use crate::secure::session::{Outcome, Security};
+use crate::secure::trust::{MemoryTrust, Trust};
 use crate::stats::LastError;
 use crate::status::PlayerStatus;
 
@@ -81,6 +84,18 @@ pub struct ServerConfig {
     /// `server_transmitted` and audio chunk timestamps. Give the server the
     /// one the audio pipeline paces with.
     pub clock: ServerClock,
+    /// The identity, pairings and approvals of encrypted clients. In
+    /// memory unless the server is given the state file.
+    pub trust: Arc<dyn Trust>,
+    /// Whether to take the legacy plaintext v1 handshake as well as the
+    /// encrypted one, as Music Assistant's `allow_legacy_clients` does.
+    /// On by default, since that is what current devices speak.
+    pub allow_legacy_clients: bool,
+    /// Whether an encrypted client that offers unpaired access is
+    /// approved, and plays, as soon as it connects. Music Assistant
+    /// approves guest access this way. Off, a client waits at empty
+    /// activities until it is approved or paired.
+    pub auto_approve_unpaired: bool,
 }
 
 impl ServerConfig {
@@ -100,6 +115,9 @@ impl ServerConfig {
             hello_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(10),
             clock: ServerClock::new(),
+            trust: Arc::new(MemoryTrust::new()),
+            allow_legacy_clients: true,
+            auto_approve_unpaired: true,
         }
     }
 }
@@ -121,6 +139,12 @@ pub enum HandshakeError {
     NotHello,
     #[error("client/hello {0}")]
     Invalid(&'static str),
+    #[error("a legacy plaintext client, and allow_legacy_clients is off")]
+    Legacy,
+    #[error("bad client/init: {0}")]
+    Init(String),
+    #[error("noise handshake failed: {0}")]
+    Noise(String),
 }
 
 /// How a connection ended.
@@ -164,6 +188,19 @@ pub struct SendspinServer {
     membership: Arc<Membership>,
     /// Clients that disconnected, by `client_id`, for `/debug`.
     departed: Mutex<HashMap<String, Departed>>,
+    /// Encrypted clients held at setup, by `client_id`.
+    held: Mutex<HashMap<String, Held>>,
+    /// The last pairing attempt with each client: when, and how it went.
+    pairings: Mutex<HashMap<String, (i64, String)>>,
+}
+
+/// An encrypted client connected but not playing: unapproved, unpaired,
+/// or pairing.
+#[derive(Debug, Clone)]
+pub(crate) struct Held {
+    pub(crate) name: String,
+    pub(crate) why: String,
+    pub(crate) since_us: i64,
 }
 
 /// How a client's last connection ended.
@@ -199,6 +236,8 @@ impl SendspinServer {
             registry,
             connections: Mutex::new(HashMap::new()),
             departed: Mutex::new(HashMap::new()),
+            held: Mutex::new(HashMap::new()),
+            pairings: Mutex::new(HashMap::new()),
         })
     }
 
@@ -250,12 +289,16 @@ impl SendspinServer {
     }
 
     /// Serves one connection over any websocket adapted to [`Frame`]s, from
-    /// the hello to the close. A dialer runs the same thing on the sockets
-    /// it opens, with its own `reason`.
+    /// its first message to the close. A dialer runs the same thing on the
+    /// sockets it opens, with its own `reason`.
+    ///
+    /// The first message says which protocol the client speaks:
+    /// `client/init` starts the encrypted handshake, `client/hello` is a
+    /// legacy plaintext client, taken only while `allow_legacy_clients`.
     pub async fn run_connection<St, Si, E>(
         self: &Arc<Self>,
-        mut stream: St,
-        mut sink: Si,
+        stream: St,
+        sink: Si,
         reason: ConnectionReason,
     ) -> Disconnect
     where
@@ -264,7 +307,51 @@ impl SendspinServer {
         Si: Sink<Frame> + Unpin + Send + 'static,
         Si::Error: Display,
     {
-        let hello = match self.read_hello(&mut stream).await {
+        let allow_legacy = self.config.allow_legacy_clients;
+        self.run(stream, sink, reason, allow_legacy).await
+    }
+
+    /// [`SendspinServer::run_connection`] for a client in this process,
+    /// such as an AirPlay bridge: it speaks the plaintext protocol whatever
+    /// `allow_legacy_clients` says, since nothing crosses a network.
+    pub async fn run_local_connection<St, Si, E>(
+        self: &Arc<Self>,
+        stream: St,
+        sink: Si,
+        reason: ConnectionReason,
+    ) -> Disconnect
+    where
+        St: Stream<Item = Result<Frame, E>> + Unpin,
+        E: Display,
+        Si: Sink<Frame> + Unpin + Send + 'static,
+        Si::Error: Display,
+    {
+        self.run(stream, sink, reason, true).await
+    }
+
+    async fn run<St, Si, E>(
+        self: &Arc<Self>,
+        mut stream: St,
+        mut sink: Si,
+        reason: ConnectionReason,
+        allow_legacy: bool,
+    ) -> Disconnect
+    where
+        St: Stream<Item = Result<Frame, E>> + Unpin,
+        E: Display,
+        Si: Sink<Frame> + Unpin + Send + 'static,
+        Si::Error: Display,
+    {
+        let first = match self.read_first(&mut stream).await {
+            Ok(text) if is_init(&text) => {
+                let link = Link::new(stream, sink);
+                return self.serve_secure(link, text, reason).await;
+            }
+            Ok(_) if !allow_legacy => Err(HandshakeError::Legacy),
+            Ok(text) => decode_hello(&text),
+            Err(e) => Err(e),
+        };
+        let hello = match first {
             Ok(hello) => hello,
             Err(e) => {
                 tracing::warn!(error = %e, "refusing sendspin connection");
@@ -278,16 +365,17 @@ impl SendspinServer {
             client_id = %hello.client_id,
             name = %hello.name,
         );
-        self.serve_client(hello, stream, sink, reason)
+        self.serve_client(hello, stream, sink, reason, None)
             .instrument(span)
             .await
     }
 
-    async fn serve_client<St, Si, E>(
+    /// An encrypted connection: setup, then the same serving as a legacy
+    /// one over the decrypted stream and encrypting sink.
+    async fn serve_secure<St, Si, E>(
         self: &Arc<Self>,
-        hello: ClientHello,
-        mut stream: St,
-        sink: Si,
+        link: Link<St, Si>,
+        init: String,
         reason: ConnectionReason,
     ) -> Disconnect
     where
@@ -296,18 +384,92 @@ impl SendspinServer {
         Si: Sink<Frame> + Unpin + Send + 'static,
         Si::Error: Display,
     {
-        let active_roles = self.activate_roles(&hello.supported_roles);
-        tracing::info!(?active_roles, ?reason, "sendspin client connected");
+        match self.secure_setup(link, init, reason).await {
+            Outcome::Ready {
+                link,
+                hello,
+                active_roles,
+                security,
+            } => {
+                let span = tracing::info_span!(
+                    "sendspin",
+                    client_id = %hello.client_id,
+                    name = %hello.name,
+                );
+                let (stream, sink) = link.split();
+                let secure = Some((active_roles, security));
+                self.serve_client(hello, stream, sink, reason, secure)
+                    .instrument(span)
+                    .await
+            }
+            Outcome::Ended {
+                client_id,
+                goodbye,
+                error,
+            } => {
+                tracing::info!(
+                    client_id,
+                    ?goodbye,
+                    ?error,
+                    "encrypted client left during setup"
+                );
+                Disconnect::Ended {
+                    client_id,
+                    goodbye,
+                    replaced: false,
+                }
+            }
+            Outcome::Refused(e) => {
+                tracing::warn!(error = %e, "refusing encrypted sendspin connection");
+                Disconnect::Refused(e)
+            }
+        }
+    }
+
+    /// Serves a client past its hello. `secure` is the roles an encrypted
+    /// client's `server/activate` gave it, and how it got in; a legacy
+    /// client is sent `server/hello` here instead.
+    async fn serve_client<St, Si, E>(
+        self: &Arc<Self>,
+        hello: ClientHello,
+        mut stream: St,
+        sink: Si,
+        reason: ConnectionReason,
+        secure: Option<(Vec<String>, Security)>,
+    ) -> Disconnect
+    where
+        St: Stream<Item = Result<Frame, E>> + Unpin,
+        E: Display,
+        Si: Sink<Frame> + Unpin + Send + 'static,
+        Si::Error: Display,
+    {
+        let (active_roles, security) = match secure {
+            Some((roles, security)) => (roles, Some(security)),
+            None => (self.activate_roles(&hello.supported_roles), None),
+        };
+        tracing::info!(
+            ?active_roles,
+            ?reason,
+            ?security,
+            "sendspin client connected"
+        );
         let (conn, queues) = Connection::new(hello, active_roles, reason, self.config.clock);
         let conn = Arc::new(conn);
-        // Queued before anything else can be, so it is the first message.
-        let _ = conn.send(ServerMessage::Hello(ServerHello {
-            server_id: self.config.server_id.clone(),
-            name: self.config.name.clone(),
-            version: PROTOCOL_VERSION,
-            active_roles: conn.active_roles().to_vec(),
-            connection_reason: reason,
-        }));
+        if let Some(security) = security {
+            // The current spec's audio chunk carries send_ahead.
+            conn.set_header_layout(HeaderLayout::SendAhead);
+            conn.set_security(security);
+        } else {
+            // Queued before anything else can be, so it is the first
+            // message.
+            let _ = conn.send(ServerMessage::Hello(ServerHello {
+                server_id: self.config.server_id.clone(),
+                name: self.config.name.clone(),
+                version: PROTOCOL_VERSION,
+                active_roles: conn.active_roles().to_vec(),
+                connection_reason: reason,
+            }));
+        }
         // Registered before the writer starts, so a client that has its
         // server/hello is already in the registry.
         self.register(&conn);
@@ -356,39 +518,70 @@ impl SendspinServer {
         active
     }
 
-    async fn read_hello<St, E>(&self, stream: &mut St) -> Result<ClientHello, HandshakeError>
+    /// The first text frame: `client/init` or a legacy `client/hello`.
+    async fn read_first<St, E>(&self, stream: &mut St) -> Result<String, HandshakeError>
     where
         St: Stream<Item = Result<Frame, E>> + Unpin,
         E: Display,
     {
         let deadline = self.config.hello_timeout;
-        let text = loop {
+        loop {
             match timeout(deadline, stream.next()).await {
                 Err(_) => return Err(HandshakeError::Timeout(deadline)),
                 Ok(None | Some(Ok(Frame::Close))) => return Err(HandshakeError::Closed),
                 Ok(Some(Err(e))) => return Err(HandshakeError::Read(e.to_string())),
                 Ok(Some(Ok(Frame::Ping(_) | Frame::Pong(_)))) => continue,
                 Ok(Some(Ok(Frame::Binary(_)))) => return Err(HandshakeError::NotText),
-                Ok(Some(Ok(Frame::Text(text)))) => break text,
+                Ok(Some(Ok(Frame::Text(text)))) => return Ok(text),
             }
-        };
-        let ClientMessage::Hello(hello) = ClientMessage::decode(&text)? else {
-            return Err(HandshakeError::NotHello);
-        };
-        let mut hello = *hello;
-        if hello.client_id.is_empty() {
-            return Err(HandshakeError::Invalid("has no client_id"));
         }
-        if hello.client_id.len() > MAX_ID_LEN || hello.name.len() > MAX_ID_LEN {
-            return Err(HandshakeError::Invalid("client_id or name is too long"));
+    }
+
+    /// Clients that are connected but can't play yet, for `/debug`.
+    pub(crate) fn held(&self) -> MutexGuard<'_, HashMap<String, Held>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Notes that `client_id` is held at setup, and why.
+    pub(crate) fn hold(&self, client_id: &str, name: &str, why: &str) {
+        self.held().insert(
+            client_id.to_owned(),
+            Held {
+                name: name.to_owned(),
+                why: why.to_owned(),
+                since_us: self.config.clock.now_us(),
+            },
+        );
+    }
+
+    pub(crate) fn unhold(&self, client_id: &str) {
+        self.held().remove(client_id);
+    }
+
+    /// Ends the operator's pairing request for `client_id`, noting how.
+    pub(crate) fn end_request(&self, client_id: &str, outcome: &str) {
+        if let Err(e) = self.config.trust.end_pairing_request(client_id) {
+            tracing::warn!(client_id, error = %e, "can't clear the pairing request");
         }
-        if hello.supported_roles.len() > MAX_ROLES {
-            return Err(HandshakeError::Invalid("lists too many roles"));
-        }
-        if hello.name.is_empty() {
-            hello.name = hello.client_id.clone();
-        }
-        Ok(hello)
+        self.record_pairing(client_id, outcome);
+    }
+
+    /// How the last pairing attempt with `client_id` went, for `/debug`.
+    pub(crate) fn record_pairing(&self, client_id: &str, outcome: &str) {
+        self.pairings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                client_id.to_owned(),
+                (self.config.clock.now_us(), outcome.to_owned()),
+            );
+    }
+
+    pub(crate) fn pairing_outcomes(&self) -> HashMap<String, (i64, String)> {
+        self.pairings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     async fn read_loop<St, E>(&self, conn: &Arc<Connection>, stream: &mut St)
@@ -650,6 +843,41 @@ impl SendspinServer {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Whether a first message is `client/init`, the encrypted handshake.
+fn is_init(text: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Kind<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
+    }
+    serde_json::from_str::<Kind<'_>>(text).is_ok_and(|k| k.kind == "client/init")
+}
+
+/// A legacy first message, which must be `client/hello`.
+fn decode_hello(text: &str) -> Result<ClientHello, HandshakeError> {
+    let ClientMessage::Hello(hello) = ClientMessage::decode(text)? else {
+        return Err(HandshakeError::NotHello);
+    };
+    check_hello(*hello)
+}
+
+/// sendspin-go's limits on a hello, and its name defaulted to its id.
+pub(crate) fn check_hello(mut hello: ClientHello) -> Result<ClientHello, HandshakeError> {
+    if hello.client_id.is_empty() {
+        return Err(HandshakeError::Invalid("has no client_id"));
+    }
+    if hello.client_id.len() > MAX_ID_LEN || hello.name.len() > MAX_ID_LEN {
+        return Err(HandshakeError::Invalid("client_id or name is too long"));
+    }
+    if hello.supported_roles.len() > MAX_ROLES {
+        return Err(HandshakeError::Invalid("lists too many roles"));
+    }
+    if hello.name.is_empty() {
+        hello.name = hello.client_id.clone();
+    }
+    Ok(hello)
 }
 
 /// Copies what a player reported into its registry state: availability,

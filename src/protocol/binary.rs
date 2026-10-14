@@ -5,9 +5,9 @@
 //! the 9-byte header; the current spec (commit bda23f3) puts a big-endian
 //! u32 `send_ahead` after the timestamp, 13 bytes. A client reads the header
 //! its own version knows, so the server picks the [`HeaderLayout`] per
-//! client: every plaintext v1 client gets `Legacy`, and `SendAhead` waits for
-//! the encrypted (Noise) connections that come with the newer spec. Other
-//! binary types never carry `send_ahead`.
+//! client: every plaintext v1 client gets `Legacy`, every encrypted (Noise)
+//! one `SendAhead`, which the writer restamps as the chunk goes out (see
+//! [`restamp_send_ahead`]). Other binary types never carry `send_ahead`.
 
 /// Audio chunk, the player role's slot 0.
 pub const AUDIO_CHUNK: u8 = 4;
@@ -105,6 +105,21 @@ pub fn audio_chunk(
     out
 }
 
+/// Rewrites an audio chunk's `send_ahead` for a transmit at `now_us`,
+/// which the spec wants taken as late as possible: by the writer, just
+/// before the chunk is encrypted, not when it was queued. Anything that
+/// isn't a 13-byte-header audio chunk is returned as it is.
+pub fn restamp_send_ahead(frame: bytes::Bytes, now_us: i64) -> bytes::Bytes {
+    let need = HeaderLayout::SendAhead.header_len(AUDIO_CHUNK);
+    if frame.first() != Some(&AUDIO_CHUNK) || frame.len() < need {
+        return frame;
+    }
+    let timestamp_us = i64::from_be_bytes(frame[1..9].try_into().expect("8 bytes"));
+    let mut out = frame.to_vec();
+    out[9..13].copy_from_slice(&send_ahead(now_us, timestamp_us).to_be_bytes());
+    out.into()
+}
+
 /// Encode an artwork image for `channel` (0-3).
 pub fn artwork(channel: u8, timestamp_us: i64, image: &[u8]) -> Vec<u8> {
     assert!(channel < ARTWORK_CHANNELS, "artwork channel {channel} > 3");
@@ -183,6 +198,21 @@ mod tests {
                 need: 13
             })
         );
+    }
+
+    #[test]
+    fn restamps_send_ahead_at_write_time() {
+        let queued = audio_chunk(HeaderLayout::SendAhead, 1_000_000, 900_000, &[7]);
+        let sent = restamp_send_ahead(queued.into(), 400_000);
+        let f = BinaryFrame::decode(&sent, HeaderLayout::SendAhead).unwrap();
+        assert_eq!(f.send_ahead_us, Some(600_000));
+        assert_eq!(f.timestamp_us, 1_000_000);
+        assert_eq!(f.payload, [7]);
+        // Artwork and legacy chunks are left alone.
+        let art = bytes::Bytes::from(artwork(0, 5, b"img"));
+        assert_eq!(restamp_send_ahead(art.clone(), 1), art);
+        let short = bytes::Bytes::from(audio_chunk(HeaderLayout::Legacy, 5, 0, &[]));
+        assert_eq!(restamp_send_ahead(short.clone(), 1), short);
     }
 
     #[test]

@@ -92,10 +92,21 @@ pub fn next_step(outcome: Option<&Disconnect>, stable: bool) -> Step {
             None | Some(GoodbyeReason::Restart) if stable => Step::Redial,
             None | Some(GoodbyeReason::Restart) => Step::Backoff,
             Some(GoodbyeReason::Shutdown) => Step::Backoff,
-            Some(GoodbyeReason::UserRequest) => Step::Park,
-            // `another_server`, and `concurrent_attempt` from clients newer
-            // than our enum.
-            Some(GoodbyeReason::AnotherServer | GoodbyeReason::Unknown) => Step::Rejected,
+            // Each says: don't come back until something changes, such as
+            // the operator pairing it, which it then re-announces for.
+            Some(
+                GoodbyeReason::UserRequest
+                | GoodbyeReason::Unauthorized
+                | GoodbyeReason::PairingRequired
+                | GoodbyeReason::LockedDown
+                | GoodbyeReason::Unpaired,
+            ) => Step::Park,
+            // Another server holds it, and reasons newer than our enum.
+            Some(
+                GoodbyeReason::AnotherServer
+                | GoodbyeReason::ConcurrentAttempt
+                | GoodbyeReason::Unknown,
+            ) => Step::Rejected,
         },
     }
 }

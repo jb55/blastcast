@@ -47,6 +47,9 @@ impl ClientMessage {
 /// `client/hello`: who the client is and which roles it can take.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ClientHello {
+    /// In the hello itself only from legacy clients; an encrypted client
+    /// gives it in `client/init`.
+    #[serde(default)]
     pub client_id: String,
     pub name: String,
     #[serde(default)]
@@ -86,6 +89,45 @@ pub struct ClientHello {
     pub artwork_support: Option<ArtworkSupport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visualizer_support: Option<VisualizerSupport>,
+
+    /// The pairing methods an encrypted client offers now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_pair_methods: Option<PairMethods>,
+    /// Whether an encrypted client takes playback without pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpaired_access: Option<UnpairedAccess>,
+}
+
+/// `supported_pair_methods`: what each pairing method a client offers
+/// needs from the operator. Keys this build doesn't know are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PairMethods {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_psk: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_pairing_code: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_pairing_code: Option<DynamicCodeMethod>,
+}
+
+/// The `dynamic_pairing_code` descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DynamicCodeMethod {
+    /// `display`, `speaker`.
+    #[serde(default)]
+    pub out_channels: Vec<String>,
+    /// `digits`, `qr_code`.
+    #[serde(default)]
+    pub formats: Vec<String>,
+    /// The digit audio pack a speaker client wants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digit_audio: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UnpairedAccess {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl ClientHello {

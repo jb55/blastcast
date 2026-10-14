@@ -4,6 +4,7 @@
 use serde::Serialize;
 
 use crate::protocol::{ConnectionReason, GoodbyeReason, PlaybackState};
+use crate::secure::session::Security;
 use crate::server::SendspinServer;
 use crate::stats::{ErrorSnapshot, StatsSnapshot};
 use crate::status::PlayerTiming;
@@ -17,6 +18,27 @@ pub struct DebugReport {
     /// Clients whose last connection ended, newest first.
     pub departed: Vec<DepartedDebug>,
     pub groups: Vec<GroupDebug>,
+    /// Encrypted clients connected but not playing, and why.
+    pub held: Vec<HeldDebug>,
+    /// The last pairing attempt with each client, newest first.
+    pub pairings: Vec<PairingDebug>,
+    /// The `server_id` encrypted clients know this server by.
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HeldDebug {
+    pub client_id: String,
+    pub name: String,
+    pub why: String,
+    pub s_ago: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairingDebug {
+    pub client_id: String,
+    pub outcome: String,
+    pub s_ago: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -25,6 +47,9 @@ pub struct ClientDebug {
     pub name: String,
     pub roles: Vec<String>,
     pub reason: ConnectionReason,
+    /// How an encrypted client got in; absent for a legacy one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<Security>,
     pub group_id: Option<String>,
     pub available: bool,
     pub volume: Option<u8>,
@@ -98,6 +123,7 @@ impl SendspinServer {
                     name: conn.name().to_owned(),
                     roles: conn.active_roles().to_vec(),
                     reason: conn.connection_reason(),
+                    security: conn.security(),
                     group_id: self.groups().group_of(conn.client_id()).map(|g| g.id),
                     available: status.available,
                     volume: status.volume,
@@ -132,11 +158,35 @@ impl SendspinServer {
             })
             .collect();
         groups.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut held: Vec<HeldDebug> = self
+            .held()
+            .iter()
+            .map(|(client_id, h)| HeldDebug {
+                client_id: client_id.clone(),
+                name: h.name.clone(),
+                why: h.why.clone(),
+                s_ago: (now - h.since_us) as f64 / 1e6,
+            })
+            .collect();
+        held.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        let mut pairings: Vec<PairingDebug> = self
+            .pairing_outcomes()
+            .into_iter()
+            .map(|(client_id, (at_us, outcome))| PairingDebug {
+                client_id,
+                outcome,
+                s_ago: (now - at_us) as f64 / 1e6,
+            })
+            .collect();
+        pairings.sort_by(|a, b| a.s_ago.total_cmp(&b.s_ago));
         DebugReport {
             clock_us: now,
             clients,
             departed,
             groups,
+            held,
+            pairings,
+            server_id: self.config().trust.identity().id(),
         }
     }
 }

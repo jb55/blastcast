@@ -31,6 +31,7 @@ use crate::protocol::{
     ArtworkChannelSupport, ClientHello, ClientState, ConnectionReason, GoodbyeReason, HeaderLayout,
     RequestFormatArtwork, RequestFormatPlayer, Role, ServerMessage, binary,
 };
+use crate::secure::session::Security;
 use crate::stats::LinkStats;
 use crate::status::{PlayerStatus, StatusChange};
 
@@ -72,6 +73,8 @@ pub struct Connection {
     reason: ConnectionReason,
     clock: ServerClock,
     layout: Mutex<HeaderLayout>,
+    /// How an encrypted client got in; `None` for a legacy one.
+    security: Mutex<Option<Security>>,
     control: mpsc::Sender<ServerMessage>,
     /// Tagged with the audio epoch; artwork is untagged.
     audio: mpsc::Sender<(Option<u64>, Bytes)>,
@@ -118,9 +121,10 @@ impl Connection {
             active_roles,
             reason,
             clock,
-            // Every plaintext v1 client reads the 9-byte header; the Noise
-            // handshake will switch this.
+            // Every plaintext v1 client reads the 9-byte header; an
+            // encrypted one is switched to the 13-byte one.
             layout: Mutex::new(HeaderLayout::Legacy),
+            security: Mutex::new(None),
             control,
             audio,
             audio_epoch: AtomicU64::new(0),
@@ -179,6 +183,18 @@ impl Connection {
 
     pub fn set_header_layout(&self, layout: HeaderLayout) {
         *self.layout.lock().unwrap_or_else(PoisonError::into_inner) = layout;
+    }
+
+    /// How an encrypted client got in; `None` for a legacy plaintext one.
+    pub fn security(&self) -> Option<Security> {
+        self.security
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_security(&self, security: Security) {
+        *self.security.lock().unwrap_or_else(PoisonError::into_inner) = Some(security);
     }
 
     /// Whether the client has sent a `client/state`, so audio may flow.
@@ -416,6 +432,11 @@ pub(crate) async fn write_loop<Si>(
                 Next::Control(mut msg) => {
                     msg.stamp_transmitted(conn.clock.now_us());
                     Frame::Text(msg.to_json())
+                }
+                Next::Frame(Frame::Binary(chunk))
+                    if conn.header_layout() == HeaderLayout::SendAhead =>
+                {
+                    Frame::Binary(binary::restamp_send_ahead(chunk, conn.clock.now_us()))
                 }
                 Next::Frame(frame) => frame,
             };

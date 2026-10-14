@@ -1,4 +1,6 @@
-//! The Sendspin wire format, as the legacy plaintext v1 clients speak it.
+//! The Sendspin wire format. The messages after the hello are the same for
+//! legacy plaintext v1 clients and encrypted ones; the encrypted handshake,
+//! hello, activation and pairing messages are in [`crate::secure`].
 //!
 //! Every text frame is a JSON envelope, `{"type": "client/hello", "payload":
 //! {...}}`. [`ClientMessage`] holds what a client sends and [`ServerMessage`]
@@ -25,9 +27,9 @@ mod types;
 pub use binary::{BinaryFrame, FrameError, HeaderLayout};
 pub use client::{
     ArtworkChannelSupport, ArtworkSupport, ClientCommand, ClientGoodbye, ClientHello,
-    ClientMessage, ClientState, ClientTime, ControllerCommand, DeviceInfo, MetadataSupport,
-    PlayerStateReport, PlayerSupport, RequestFormatArtwork, RequestFormatPlayer,
-    StreamRequestFormat, VisualizerSupport,
+    ClientMessage, ClientState, ClientTime, ControllerCommand, DeviceInfo, DynamicCodeMethod,
+    MetadataSupport, PairMethods, PlayerStateReport, PlayerSupport, RequestFormatArtwork,
+    RequestFormatPlayer, StreamRequestFormat, UnpairedAccess, VisualizerSupport,
 };
 pub use envelope::DecodeError;
 pub use server::{

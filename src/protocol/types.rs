@@ -97,6 +97,16 @@ pub enum GoodbyeReason {
     Shutdown,
     Restart,
     UserRequest,
+    /// The server declared activities the client won't allow.
+    Unauthorized,
+    /// The client takes no unpaired connection; pair it first.
+    PairingRequired,
+    /// Unpaired, and it offers no way to pair.
+    LockedDown,
+    /// Another server holds the client.
+    ConcurrentAttempt,
+    /// The client dropped this server's pairing record.
+    Unpaired,
     #[serde(other)]
     Unknown,
 }
