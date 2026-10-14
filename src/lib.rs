@@ -15,7 +15,7 @@ pub mod browse;
 pub mod service;
 
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::Arc;
 
 use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
@@ -214,6 +214,50 @@ pub fn interface_name(wanted: &str) -> Option<String> {
     found.map(|i| i.name)
 }
 
+/// The address a device on the LAN can reach us on, for URLs we hand out
+/// (MA's publish IP). On `interface` (a name or one of its addresses) when
+/// one is given; otherwise the one the default route leaves from, else any
+/// IPv4 that isn't loopback or link-local. Loopback when there is none.
+pub fn publish_ip(interface: Option<&str>) -> IpAddr {
+    let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    if let Some(wanted) = interface {
+        if let Ok(ip) = wanted.parse::<IpAddr>() {
+            return ip;
+        }
+        let ips: Vec<IpAddr> = if_addrs::get_if_addrs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|i| i.name == wanted)
+            .map(|i| i.ip())
+            .collect();
+        return ips
+            .iter()
+            .find(|ip| ip.is_ipv4())
+            .or(ips.first())
+            .copied()
+            .unwrap_or(loopback);
+    }
+    default_route_ip()
+        .or_else(|| {
+            if_addrs::get_if_addrs()
+                .ok()?
+                .into_iter()
+                .map(|i| i.ip())
+                .find(|ip| matches!(ip, IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local()))
+        })
+        .unwrap_or(loopback)
+}
+
+/// The source address of the default IPv4 route. Connecting a UDP socket
+/// only picks the route; nothing is sent.
+fn default_route_ip() -> Option<IpAddr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    // TEST-NET-2, which nobody answers; any routed address would do.
+    socket.connect((Ipv4Addr::new(198, 51, 100, 1), 9)).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
 /// Map the configured interface to what mdns-sd matches on, checking it
 /// exists so a typo fails at startup instead of advertising nowhere.
 fn resolve_interface(wanted: &str) -> Result<IfKind> {
@@ -248,6 +292,19 @@ mod tests {
         assert_eq!(interface_name("lo").as_deref(), Some("lo"));
         assert_eq!(interface_name("127.0.0.1").as_deref(), Some("lo"));
         assert_eq!(interface_name("no-such-if0"), None);
+    }
+
+    #[test]
+    fn publish_ip_on_an_interface() {
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(publish_ip(Some("lo")), lo);
+        assert_eq!(
+            publish_ip(Some("10.1.2.3")),
+            "10.1.2.3".parse::<IpAddr>().unwrap()
+        );
+        // Without an interface it is whatever this machine has, but never
+        // unspecified.
+        assert!(!publish_ip(None).is_unspecified());
     }
 
     #[test]
