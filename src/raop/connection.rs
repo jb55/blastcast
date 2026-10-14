@@ -30,7 +30,7 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use super::announce::{Announce, Decoder};
-use super::clock::{self, Anchor, Timeline};
+use super::clock::{self, SyncPacket, Timeline};
 use super::crypto::{self, AudioCipher};
 use super::playout::{Inserted, Playout};
 use super::rtsp::{self, Request, Response};
@@ -534,12 +534,12 @@ async fn receive_control(shared: Arc<Shared>, socket: Arc<UdpSocket>, peer: IpAd
                 }
             }
             Some(rtp::PAYLOAD_SYNC) => {
-                if let Some(anchor) = Anchor::parse(packet) {
+                if let Some(sync) = SyncPacket::parse(packet) {
                     let mut ingest = shared.lock();
                     if ingest.timeline.anchor.is_none() {
-                        tracing::debug!(?anchor, "the AirPlay sender's first sync");
+                        tracing::debug!(?sync, "the AirPlay sender's first sync");
                     }
-                    ingest.timeline.anchor = Some(anchor);
+                    ingest.timeline.sync(sync);
                 }
             }
             other => tracing::trace!(?other, "unknown AirPlay control packet"),
@@ -574,7 +574,7 @@ async fn keep_time(
                 }
                 let packet = &buf[..n];
                 let now = clock.now_us();
-                if shared.lock().timeline.map.reply(packet, now) {
+                if shared.lock().timeline.estimator.reply(packet, now) {
                     continue;
                 }
                 // It asks ours: the server clock, as NTP.

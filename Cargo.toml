@@ -11,6 +11,7 @@ aes.workspace = true
 alac.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+blastcast.workspace = true
 cbc.workspace = true
 tas-core.workspace = true
 tas-audio.workspace = true
