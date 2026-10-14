@@ -1,0 +1,12 @@
+{"dir": "c2s", "kind": "text", "data": "{\"type\":\"client/hello\",\"payload\":{\"client_id\":\"tas-capture\",\"name\":\"tas capture\",\"version\":1,\"supported_roles\":[\"player@v1\",\"metadata@v1\",\"controller@v1\"],\"device_info\":{\"product_name\":\"capture script\",\"manufacturer\":\"tune-assistant-server\",\"software_version\":\"0.1.0\"},\"player@v1_support\":{\"supported_formats\":[{\"codec\":\"pcm\",\"channels\":2,\"sample_rate\":48000,\"bit_depth\":16}],\"buffer_capacity\":1048576,\"supported_commands\":[\"volume\",\"mute\"]}}}"}
+{"dir": "c2s", "kind": "text", "data": "{\"type\":\"client/state\",\"payload\":{\"player\":{\"state\":\"synchronized\",\"volume\":80,\"muted\":false}}}"}
+{"dir": "c2s", "kind": "text", "data": "{\"type\":\"client/time\",\"payload\":{\"client_transmitted\":738346049529}}"}
+{"dir": "s2c", "kind": "text", "data": "{\"type\":\"server/hello\",\"payload\":{\"server_id\":\"3174e35b-8b91-454a-810e-e04a75a589f9\",\"name\":\"capture-server\",\"version\":1,\"active_roles\":[\"player@v1\",\"metadata@v1\"],\"connection_reason\":\"playback\"}}"}
+{"dir": "s2c", "kind": "text", "data": "{\"type\":\"group/update\",\"payload\":{\"playback_state\":\"playing\",\"group_id\":\"3174e35b-8b91-454a-810e-e04a75a589f9\"}}"}
+{"dir": "s2c", "kind": "text", "data": "{\"type\":\"server/state\",\"payload\":{\"metadata\":{\"timestamp\":1554106,\"title\":\"Test Tone\",\"artist\":\"Sendspin\",\"album\":\"Test Signal\"}}}"}
+{"dir": "s2c", "kind": "text", "data": "{\"type\":\"stream/start\",\"payload\":{\"player\":{\"codec\":\"pcm\",\"sample_rate\":192000,\"channels\":2,\"bit_depth\":24}}}"}
+{"dir": "s2c", "kind": "text", "data": "{\"type\":\"server/time\",\"payload\":{\"client_transmitted\":738346049529,\"server_received\":1554270,\"server_transmitted\":1554275}}"}
+{"dir": "s2c", "kind": "binary", "hex": "0400000000001f7403bb61dabb61dae1", "len": 23049}
+{"dir": "s2c", "kind": "binary", "hex": "0400000000001fc2ac459e25459e256c", "len": 23049}
+{"dir": "s2c", "kind": "binary", "hex": "04000000000020114f1bde3c1bde3c64", "len": 23049}
+{"dir": "s2c", "kind": "binary", "hex": "040000000000205ff0000000000000e7", "len": 23049}
