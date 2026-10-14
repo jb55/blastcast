@@ -1,0 +1,21 @@
+[package]
+name = "blastcast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# No tas-* dependency, ever: protocol crates depend on blastcast, never the
+# reverse, so it can move to its own repo as a directory copy.
+# scripts/check.sh enforces it.
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
