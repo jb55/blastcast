@@ -8,6 +8,9 @@
 //! with the player role is a player in the [`PlayerRegistry`] for as long as
 //! it is connected; a second connection with the same `client_id` replaces
 //! the first. Every client is in one [`Groups`] group from its hello on.
+//! A controller's `client/command`, every status change and an artwork
+//! `stream/request-format` go to the groups, which run the controller,
+//! metadata and artwork roles.
 //!
 //! Clock sync is the server's half of NTP: each `client/time` is answered
 //! with `server/time`, `server_received` read as the frame arrives and
@@ -58,7 +61,8 @@ pub struct ServerConfig {
     pub server_id: String,
     /// Shown by clients; also the mDNS TXT `name`.
     pub name: String,
-    /// The versioned roles this server can take, e.g. `player@v1`.
+    /// The versioned roles this server can take, e.g. `player@v1`. All of
+    /// player, controller, metadata and artwork by default.
     pub roles: Vec<String>,
     /// A ping goes out this often; a client silent for two of these is
     /// disconnected.
@@ -78,7 +82,14 @@ impl ServerConfig {
         Self {
             server_id: server_id.into(),
             name: name.into(),
-            roles: vec![roles::PLAYER_V1.to_owned()],
+            roles: [
+                roles::PLAYER_V1,
+                roles::CONTROLLER_V1,
+                roles::METADATA_V1,
+                roles::ARTWORK_V1,
+            ]
+            .map(str::to_owned)
+            .to_vec(),
             ping_interval: Duration::from_secs(30),
             hello_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(10),
@@ -397,16 +408,36 @@ impl SendspinServer {
                 return ControlFlow::Break(());
             }
             ClientMessage::Time(time) => on_client_time(conn, time, received_us),
-            ClientMessage::RequestFormat(request) => match request.player {
-                Some(player) if conn.has_role("player") => {
-                    tracing::info!(client_id, ?player, "player asked for another format");
-                    conn.request_format(player);
+            ClientMessage::RequestFormat(request) => {
+                match request.player {
+                    Some(player) if conn.has_role("player") => {
+                        tracing::info!(client_id, ?player, "player asked for another format");
+                        conn.request_format(player);
+                    }
+                    Some(_) => {
+                        tracing::debug!(client_id, "player format request from a non-player")
+                    }
+                    None => {}
                 }
-                _ => tracing::debug!(client_id, text, "format request not handled"),
-            },
-            ClientMessage::Command(_) => {
-                tracing::debug!(client_id, text, "not handled yet");
+                match request.artwork {
+                    Some(artwork) if conn.has_role("artwork") => {
+                        tracing::info!(client_id, ?artwork, "artwork channel changed");
+                        if conn.request_artwork(&artwork) {
+                            self.groups.refresh();
+                        }
+                    }
+                    Some(_) => {
+                        tracing::debug!(client_id, "artwork request from a non-artwork client")
+                    }
+                    None => {}
+                }
             }
+            ClientMessage::Command(command) => match command.controller {
+                Some(controller) if conn.has_role("controller") => {
+                    self.groups.command(conn.clone(), controller);
+                }
+                _ => tracing::debug!(client_id, text, "command not handled"),
+            },
         }
         ControlFlow::Continue(())
     }
@@ -426,6 +457,10 @@ impl SendspinServer {
             // never back when it returns.
             tracing::info!(client_id, "client became unavailable");
             self.groups.unavailable(conn.clone());
+        }
+        if change.changed || change.first {
+            // Group volume, and whether artwork may be sent, follow it.
+            self.groups.refresh();
         }
         if change.changed && conn.has_role("player") && self.is_current(conn) {
             let status = conn.player_status();

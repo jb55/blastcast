@@ -13,7 +13,8 @@
 //! `stream/end` for the player would otherwise be followed by chunks queued
 //! before it, from the stream it replaces. Each of those messages starts a
 //! new audio epoch when it is queued, and the writer drops chunks queued in
-//! an older one.
+//! an older one. Artwork goes on the audio queue too, but untagged: no
+//! audio stream message makes an image stale.
 
 use std::fmt::Display;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,8 +28,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 
 use crate::protocol::{
-    ClientHello, ClientState, ConnectionReason, GoodbyeReason, HeaderLayout, RequestFormatPlayer,
-    Role, ServerMessage,
+    ArtworkChannelSupport, ClientHello, ClientState, ConnectionReason, GoodbyeReason, HeaderLayout,
+    RequestFormatArtwork, RequestFormatPlayer, Role, ServerMessage, binary,
 };
 use crate::status::{PlayerStatus, StatusChange};
 
@@ -71,7 +72,8 @@ pub struct Connection {
     clock: ServerClock,
     layout: Mutex<HeaderLayout>,
     control: mpsc::Sender<ServerMessage>,
-    audio: mpsc::Sender<(u64, Bytes)>,
+    /// Tagged with the audio epoch; artwork is untagged.
+    audio: mpsc::Sender<(Option<u64>, Bytes)>,
     /// Bumped by each player `stream/start`, `stream/clear` and
     /// `stream/end`; audio is queued tagged with it.
     audio_epoch: AtomicU64,
@@ -81,6 +83,9 @@ pub struct Connection {
     /// Every `stream/request-format` the client sent, merged: a later
     /// request's fields override an earlier one's.
     format_request: watch::Sender<Option<RequestFormatPlayer>>,
+    /// The artwork channels from the hello, as `stream/request-format`
+    /// has changed them since.
+    artwork: Mutex<Vec<ArtworkChannelSupport>>,
     goodbye: Mutex<Option<GoodbyeReason>>,
     closed: watch::Sender<bool>,
 }
@@ -88,7 +93,7 @@ pub struct Connection {
 /// The receiving ends of a connection's queues, for its writer.
 pub(crate) struct Queues {
     pub(crate) control: mpsc::Receiver<ServerMessage>,
-    pub(crate) audio: mpsc::Receiver<(u64, Bytes)>,
+    pub(crate) audio: mpsc::Receiver<(Option<u64>, Bytes)>,
 }
 
 impl Connection {
@@ -101,6 +106,11 @@ impl Connection {
         let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
         let (audio, audio_rx) = mpsc::channel(AUDIO_QUEUE);
         let status = watch::channel(PlayerStatus::from_hello(&hello)).0;
+        let artwork = hello.artwork().map_or_else(Vec::new, |a| {
+            let mut channels = a.channels.clone();
+            channels.truncate(binary::ARTWORK_CHANNELS.into());
+            channels
+        });
         let conn = Self {
             hello,
             active_roles,
@@ -115,6 +125,7 @@ impl Connection {
             ready: AtomicBool::new(false),
             status,
             format_request: watch::channel(None).0,
+            artwork: Mutex::new(artwork),
             goodbye: Mutex::new(None),
             closed: watch::channel(false).0,
         };
@@ -232,6 +243,33 @@ impl Connection {
         });
     }
 
+    /// The artwork channels the client takes now, channel 0 first. Empty
+    /// for a client without the artwork role's support object.
+    pub fn artwork_channels(&self) -> Vec<ArtworkChannelSupport> {
+        self.artwork
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Applies an artwork `stream/request-format` to its channel. False
+    /// for a channel the hello didn't declare.
+    pub(crate) fn request_artwork(&self, request: &RequestFormatArtwork) -> bool {
+        let mut channels = self.artwork.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(channel) = channels.get_mut(usize::from(request.channel)) else {
+            return false;
+        };
+        if let Some(source) = &request.source {
+            channel.source.clone_from(source);
+        }
+        if let Some(format) = &request.format {
+            channel.format.clone_from(format);
+        }
+        channel.media_width = request.media_width.unwrap_or(channel.media_width);
+        channel.media_height = request.media_height.unwrap_or(channel.media_height);
+        true
+    }
+
     /// The reason the client gave in `client/goodbye`, once it has.
     pub fn goodbye(&self) -> Option<GoodbyeReason> {
         *self.goodbye.lock().unwrap_or_else(PoisonError::into_inner)
@@ -261,10 +299,20 @@ impl Connection {
         }
     }
 
-    /// Queues a binary frame (an encoded audio chunk or artwork). Refused
-    /// until the client's first `client/state`, while it is unavailable,
-    /// and when the queue is full, which is the streamer's to handle.
+    /// Queues an encoded audio chunk. Refused until the client's first
+    /// `client/state`, while it is unavailable, and when the queue is full,
+    /// which is the streamer's to handle.
     pub fn send_audio(&self, frame: Bytes) -> Result<(), SendError> {
+        self.send_binary(Some(self.audio_epoch()), frame)
+    }
+
+    /// Queues an artwork frame, refused as [`Connection::send_audio`] is.
+    /// It is never dropped as stale audio is.
+    pub fn send_artwork(&self, frame: Bytes) -> Result<(), SendError> {
+        self.send_binary(None, frame)
+    }
+
+    fn send_binary(&self, epoch: Option<u64>, frame: Bytes) -> Result<(), SendError> {
         if self.is_closed() {
             return Err(SendError::Closed);
         }
@@ -274,12 +322,10 @@ impl Connection {
         if !self.is_available() {
             return Err(SendError::Unavailable);
         }
-        self.audio
-            .try_send((self.audio_epoch(), frame))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => SendError::Full,
-                mpsc::error::TrySendError::Closed(_) => SendError::Closed,
-            })
+        self.audio.try_send((epoch, frame)).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => SendError::Full,
+            mpsc::error::TrySendError::Closed(_) => SendError::Closed,
+        })
     }
 
     /// The epoch audio queued now is tagged with; the writer drops frames
@@ -335,7 +381,7 @@ pub(crate) async fn write_loop<Si>(
             _ = closed.wait_for(|c| *c) => break,
             Some(msg) = queues.control.recv() => Next::Control(msg),
             Some((epoch, chunk)) = queues.audio.recv() => {
-                if epoch != conn.audio_epoch() {
+                if epoch.is_some_and(|e| e != conn.audio_epoch()) {
                     continue;
                 }
                 Next::Frame(Frame::Binary(chunk))

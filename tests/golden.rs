@@ -108,7 +108,7 @@ fn capture_handshake_reads_as_expected() {
     let ServerMessage::State(state) = &server[2] else {
         panic!("{:?}", server[2])
     };
-    let meta = state.metadata.as_ref().unwrap();
+    let meta = state.metadata.as_ref().unwrap().as_ref().unwrap();
     assert_eq!(meta.title, Some(Some("Test Tone".into())));
     assert_eq!(meta.artwork_url, None, "omitted, not null");
 
@@ -232,7 +232,7 @@ fn metadata_null_and_omitted_differ() {
     let ServerMessage::State(s) = ServerMessage::decode(&r.data).unwrap() else {
         panic!()
     };
-    let m = s.metadata.unwrap();
+    let m = s.metadata.unwrap().unwrap();
     assert_eq!(m.title, Some(None), "null clears");
     assert_eq!(m.album, None, "omitted keeps");
     assert_eq!(m.artist, Some(Some("Sendspin".into())));

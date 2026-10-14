@@ -103,13 +103,15 @@ pub struct ServerTime {
     pub server_transmitted: i64,
 }
 
-/// `server/state`: what metadata and controller clients show.
+/// `server/state`: what metadata and controller clients show. A role
+/// object that is `None` is omitted ("unchanged"); `Some(None)` is `null`,
+/// which clears all of that role's state.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ServerState {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<MetadataState>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub controller: Option<ControllerState>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "tristate")]
+    pub metadata: Option<Option<MetadataState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "tristate")]
+    pub controller: Option<Option<ControllerState>>,
 }
 
 /// The `metadata` object in `server/state`. Each field after `timestamp` is

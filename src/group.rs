@@ -19,21 +19,39 @@
 //!   moved back when it returns.
 //! - **Volume and mute** go to every member that takes them, all set to the
 //!   same value. How a group's volume maps to its members' is the caller's
-//!   choice; this layer only carries it out.
+//!   choice; this layer only carries it out. A controller's `volume` is the
+//!   exception: it follows the spec's redistribution (see [`controller`]).
+//!
+//! A group also carries what its source says about itself, for the
+//! controller, metadata and artwork roles (see [`roles`]): a [`Transport`]
+//! (the commands the source takes), [`TrackMetadata`] and an artwork
+//! image. Whoever starts the group's audio sets them; the groups send each
+//! member what its roles show and forward a controller's commands.
 //!
 //! The groups are run by one task, so a change is applied whole before the
-//! next starts; queries read a snapshot it publishes after each one.
+//! next starts; queries read a snapshot it publishes after each one. After
+//! every change the task brings each member's controller, metadata and
+//! artwork state up to date with its group, sending only what differs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, RandomState};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use bytes::Bytes;
 use tas_audio::{AudioError, LiveSource, ServerClock};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::connection::Connection;
-use crate::protocol::{GroupUpdate, PlaybackState, PlayerCommand, ServerCommand, ServerMessage};
+use crate::protocol::{
+    ControllerCommand, GroupUpdate, MediaCommand, PlaybackState, PlayerCommand, Progress,
+    RepeatMode, ServerCommand, ServerMessage,
+};
 use crate::stream::AudioStream;
+
+mod controller;
+mod roles;
+
+use roles::{Artwork, Metadata, Sent};
 
 /// A group as it is now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +61,60 @@ pub struct GroupInfo {
     /// Client ids, in the order they joined.
     pub members: Vec<String>,
     pub playback_state: PlaybackState,
+}
+
+/// What a group's source says is playing, for its metadata clients. Every
+/// `server/state` carries all of it; a field that is `None` is sent as
+/// `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TrackMetadata {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album_artist: Option<String>,
+    pub album: Option<String>,
+    pub artwork_url: Option<String>,
+    pub year: Option<u32>,
+    pub track: Option<u32>,
+    /// The position as of the call that sets it; the groups stamp it with
+    /// the server clock, and clients extrapolate from there.
+    pub progress: Option<Progress>,
+}
+
+/// The commands a group's source takes from a controller, and the state it
+/// reports back. Volume, mute and `switch` are the groups' own and are not
+/// listed here.
+#[derive(Clone)]
+pub struct Transport {
+    /// Any of play, pause, stop, next, previous, the repeat and shuffle
+    /// commands, seek and seek_relative. An AirPlay sender takes none.
+    pub commands: Vec<MediaCommand>,
+    pub repeat: RepeatMode,
+    pub shuffle: bool,
+    /// How far a `seek` may go, in milliseconds. `seek` is offered only
+    /// when this is known.
+    pub seek_max_ms: Option<u64>,
+    pub control: Arc<dyn TransportControl>,
+}
+
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transport")
+            .field("commands", &self.commands)
+            .field("repeat", &self.repeat)
+            .field("shuffle", &self.shuffle)
+            .field("seek_max_ms", &self.seek_max_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Carries out a controller's commands on a group's source.
+pub trait TransportControl: Send + Sync {
+    /// A controller in `group_id` sent `command`, one the [`Transport`]
+    /// lists. A `seek` is already checked against `seek_max_ms`.
+    ///
+    /// Called on the groups' task, so it must not block, and it must not
+    /// wait on [`Groups`]: spawn anything that does.
+    fn command(&self, group_id: &str, command: &ControllerCommand);
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -125,6 +197,29 @@ enum Op {
         mute: bool,
         reply: Reply<()>,
     },
+    SetTransport {
+        group_id: String,
+        transport: Option<Transport>,
+        reply: Reply<()>,
+    },
+    SetMetadata {
+        group_id: String,
+        metadata: Option<TrackMetadata>,
+        reply: Reply<()>,
+    },
+    SetArtwork {
+        group_id: String,
+        image: Option<Bytes>,
+        reply: Reply<()>,
+    },
+    /// A controller's `client/command`.
+    Command {
+        conn: Arc<Connection>,
+        command: ControllerCommand,
+    },
+    /// A client's status or artwork channels changed; bring the roles up
+    /// to date.
+    Refresh,
     /// A group's stream played out; `generation` names which one.
     Ended {
         group_id: String,
@@ -145,6 +240,8 @@ impl Groups {
             groups: BTreeMap::new(),
             member_of: HashMap::new(),
             previous: HashMap::new(),
+            sent: HashMap::new(),
+            next_state_id: 1,
             id_prefix: format!("{:08x}", RandomState::new().hash_one(0u8) as u32),
             next_id: 0,
             next_generation: 0,
@@ -264,6 +361,63 @@ impl Groups {
         .await
     }
 
+    /// Sets the commands the group's source takes, or clears them. The
+    /// group's controllers are sent the new `supported_commands`.
+    pub async fn set_transport(
+        &self,
+        group_id: &str,
+        transport: Option<Transport>,
+    ) -> Result<(), GroupError> {
+        self.call(|reply| Op::SetTransport {
+            group_id: group_id.into(),
+            transport,
+            reply,
+        })
+        .await
+    }
+
+    /// Sets what the group is playing, or clears it, for its metadata
+    /// clients. Set it again whenever the track, position or speed
+    /// changes: the spec wants a new state on every play, pause and seek.
+    /// When the group stops, the position is frozen for them.
+    pub async fn set_metadata(
+        &self,
+        group_id: &str,
+        metadata: Option<TrackMetadata>,
+    ) -> Result<(), GroupError> {
+        self.call(|reply| Op::SetMetadata {
+            group_id: group_id.into(),
+            metadata,
+            reply,
+        })
+        .await
+    }
+
+    /// Sets the group's artwork, a JPEG or PNG, or clears it. Each artwork
+    /// client is sent it scaled to every album channel it declared.
+    pub async fn set_artwork(
+        &self,
+        group_id: &str,
+        image: Option<Bytes>,
+    ) -> Result<(), GroupError> {
+        self.call(|reply| Op::SetArtwork {
+            group_id: group_id.into(),
+            image,
+            reply,
+        })
+        .await
+    }
+
+    /// A controller's command for its group.
+    pub(crate) fn command(&self, conn: Arc<Connection>, command: ControllerCommand) {
+        let _ = self.ops.send(Op::Command { conn, command });
+    }
+
+    /// A client's status or artwork channels changed.
+    pub(crate) fn refresh(&self) {
+        let _ = self.ops.send(Op::Refresh);
+    }
+
     /// A client connected: it gets a group of its own, or, replacing an
     /// older connection of the same client, takes its place in its group.
     pub(crate) fn connect(&self, conn: Arc<Connection>) {
@@ -296,6 +450,9 @@ struct Group {
     name: String,
     members: Vec<Arc<Connection>>,
     stream: Option<Playing>,
+    transport: Option<Transport>,
+    metadata: Option<Metadata>,
+    artwork: Option<Artwork>,
 }
 
 struct Playing {
@@ -373,6 +530,11 @@ struct Actor {
     groups: BTreeMap<String, Group>,
     member_of: HashMap<String, String>,
     previous: HashMap<String, String>,
+    /// What each connected client was last sent for its roles.
+    sent: HashMap<String, Sent>,
+    /// Numbers each metadata and artwork value, so a client's copy can be
+    /// told apart from the group's; 0 is "none".
+    next_state_id: u64,
     id_prefix: String,
     next_id: u64,
     next_generation: u64,
@@ -383,6 +545,7 @@ impl Actor {
         while let Some(op) = ops.recv().await {
             self.handle(op).await;
             self.publish();
+            self.sync_roles().await;
         }
         for (_, group) in std::mem::take(&mut self.groups) {
             if let Some(playing) = group.stream {
@@ -398,6 +561,7 @@ impl Actor {
                 if self.current_group(&conn).is_some() {
                     self.detach(conn.client_id()).await;
                     self.previous.remove(conn.client_id());
+                    self.sent.remove(conn.client_id());
                 }
             }
             Op::Unavailable(conn) => self.unavailable(conn).await,
@@ -470,10 +634,45 @@ impl Actor {
                     .map(|g| g.command(PlayerCommand::mute(mute)));
                 let _ = reply.send(r);
             }
+            Op::SetTransport {
+                group_id,
+                transport,
+                reply,
+            } => {
+                let r = self.group_mut(&group_id).map(|g| g.transport = transport);
+                let _ = reply.send(r);
+            }
+            Op::SetMetadata {
+                group_id,
+                metadata,
+                reply,
+            } => {
+                let id = self.state_id();
+                let now = self.clock.now_us();
+                let r = self.group_mut(&group_id).map(|g| {
+                    g.metadata = metadata.map(|m| Metadata::new(id, now, m));
+                });
+                let _ = reply.send(r);
+            }
+            Op::SetArtwork {
+                group_id,
+                image,
+                reply,
+            } => {
+                let id = self.state_id();
+                let r = self.group_mut(&group_id).map(|g| {
+                    g.artwork = image.map(|image| Artwork::new(id, image));
+                });
+                let _ = reply.send(r);
+            }
+            Op::Command { conn, command } => self.controller_command(conn, command).await,
+            Op::Refresh => {}
             Op::Ended {
                 group_id,
                 generation,
             } => {
+                let id = self.state_id();
+                let now = self.clock.now_us();
                 let Some(group) = self.groups.get_mut(&group_id) else {
                     return;
                 };
@@ -484,6 +683,7 @@ impl Actor {
                 {
                     tracing::info!(group_id, "group stream played out");
                     group.stream = None;
+                    group.freeze_progress(id, now);
                     group.update_all();
                 }
             }
@@ -492,6 +692,8 @@ impl Actor {
 
     fn connect(&mut self, conn: Arc<Connection>) {
         let client_id = conn.client_id();
+        // A new connection has been sent nothing yet.
+        self.sent.remove(client_id);
         let Some(group) = self
             .member_of
             .get(client_id)
@@ -606,6 +808,8 @@ impl Actor {
 
     /// Stops the group's stream, if it has one, and tells its members.
     async fn stop(&mut self, group_id: &str) {
+        let id = self.state_id();
+        let now = self.clock.now_us();
         let Some(group) = self.groups.get_mut(group_id) else {
             return;
         };
@@ -613,6 +817,7 @@ impl Actor {
             return;
         };
         playing.stream.stop().await;
+        group.freeze_progress(id, now);
         group.update_all();
         tracing::info!(group_id, "group stopped");
     }
@@ -649,6 +854,9 @@ impl Actor {
             name: conn.name().to_owned(),
             members: vec![conn.clone()],
             stream: None,
+            transport: None,
+            metadata: None,
+            artwork: None,
         };
         group.update(&conn);
         self.member_of
@@ -661,6 +869,12 @@ impl Actor {
     fn current_group(&self, conn: &Arc<Connection>) -> Option<&Group> {
         let group = self.groups.get(self.member_of.get(conn.client_id())?)?;
         group.is_member(conn).then_some(group)
+    }
+
+    fn state_id(&mut self) -> u64 {
+        let id = self.next_state_id;
+        self.next_state_id += 1;
+        id
     }
 
     fn group_mut(&mut self, group_id: &str) -> Result<&mut Group, GroupError> {

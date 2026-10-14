@@ -197,7 +197,10 @@ pub struct ArtworkChannelSupport {
     pub source: String,
     /// `jpeg`, `png` or `bmp`.
     pub format: String,
+    /// `width` in the current spec.
+    #[serde(alias = "width")]
     pub media_width: u32,
+    #[serde(alias = "height")]
     pub media_height: u32,
 }
 
@@ -212,9 +215,9 @@ pub struct VisualizerSupport {
 pub struct MetadataSupport {
     #[serde(default)]
     pub support_picture_formats: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "width")]
     pub media_width: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "height")]
     pub media_height: Option<u32>,
 }
 
@@ -340,8 +343,8 @@ pub struct RequestFormatArtwork {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "width")]
     pub media_width: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "height")]
     pub media_height: Option<u32>,
 }

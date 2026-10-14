@@ -157,7 +157,7 @@ async fn hello_gets_server_hello_with_the_activated_roles() {
     assert_eq!(hello.server_id, "tas-server-id");
     assert_eq!(hello.name, "Tune Assistant");
     assert_eq!(hello.version, 1);
-    assert_eq!(hello.active_roles, ["player@v1"]);
+    assert_eq!(hello.active_roles, ["player@v1", "metadata@v1"]);
     assert_eq!(hello.connection_reason, ConnectionReason::Playback);
 }
 
@@ -192,7 +192,7 @@ async fn a_client_without_the_player_role_is_not_a_player() {
     let ServerMessage::Hello(hello) = reply else {
         panic!("expected server/hello");
     };
-    assert!(hello.active_roles.is_empty());
+    assert_eq!(hello.active_roles, ["controller@v1"]);
     assert!(h.server.connection("remote").is_some());
     assert!(!h.registry.contains("remote"));
 }

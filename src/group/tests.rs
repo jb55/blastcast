@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use tas_audio::{SESSION_FORMAT, SineSource};
 
+use std::sync::Mutex;
+
 use super::*;
 use crate::connection::Queues;
 use crate::protocol::{
     BinaryFrame, ClientHello, ClientState, Codec, ConnectionReason, HeaderLayout,
-    PlayerCommandKind, PlayerSupport, StreamFormat, binary,
+    PlayerCommandKind, PlayerSupport, ServerState, StreamFormat, binary,
 };
 
 const PCM: StreamFormat = StreamFormat {
@@ -19,6 +21,11 @@ const PCM: StreamFormat = StreamFormat {
 };
 
 fn client(clock: ServerClock, id: &str) -> (Arc<Connection>, Queues) {
+    client_with(clock, id, &["player@v1"])
+}
+
+/// A player that takes volume and mute, with `roles` active.
+fn client_with(clock: ServerClock, id: &str, roles: &[&str]) -> (Arc<Connection>, Queues) {
     let hello = ClientHello {
         client_id: id.into(),
         name: format!("{id} speaker"),
@@ -31,7 +38,7 @@ fn client(clock: ServerClock, id: &str) -> (Arc<Connection>, Queues) {
     };
     let (conn, queues) = Connection::new(
         hello,
-        vec!["player@v1".into()],
+        roles.iter().map(|r| r.to_string()).collect(),
         ConnectionReason::Playback,
         clock,
     );
@@ -81,7 +88,7 @@ fn audio(conn: &Connection, q: &mut Queues) -> Vec<(i64, Vec<u8>)> {
     let epoch = conn.audio_epoch();
     let mut out = Vec::new();
     while let Ok((e, frame)) = q.audio.try_recv() {
-        if e != epoch {
+        if e != Some(epoch) {
             continue;
         }
         let f = BinaryFrame::decode(&frame, HeaderLayout::Legacy).unwrap();
@@ -391,4 +398,238 @@ async fn a_reconnect_keeps_the_clients_group() {
         ["group playing kitchen speaker", "start"]
     );
     assert!(!audio(&den2, &mut dq2).is_empty());
+}
+
+/// The `server/state` messages queued so far, skipping everything else.
+fn states(q: &mut Queues) -> Vec<ServerState> {
+    let mut out = Vec::new();
+    while let Ok(msg) = q.control.try_recv() {
+        if let ServerMessage::State(s) = msg {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// The `supported_commands` of the latest controller state queued.
+fn offered(q: &mut Queues) -> Vec<MediaCommand> {
+    states(q)
+        .into_iter()
+        .filter_map(|s| s.controller.flatten())
+        .next_back()
+        .expect("a controller state")
+        .supported_commands
+}
+
+fn cmd(command: MediaCommand) -> ControllerCommand {
+    ControllerCommand {
+        command,
+        volume: None,
+        mute: None,
+        position_ms: None,
+        offset_ms: None,
+    }
+}
+
+#[derive(Default)]
+struct Recorder(Mutex<Vec<(String, MediaCommand, Option<u64>)>>);
+
+impl TransportControl for Recorder {
+    fn command(&self, group_id: &str, command: &ControllerCommand) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((group_id.to_owned(), command.command, command.position_ms));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_transport_gets_only_the_commands_it_lists() {
+    let clock = ServerClock::new();
+    let groups = Groups::new(clock);
+    let (remote, mut rq) = client_with(clock, "remote", &["player@v1", "controller@v1"]);
+    groups.connect(remote.clone());
+    sleep_ms(1).await;
+    let group = groups.group_of("remote").unwrap().id;
+    assert_eq!(
+        offered(&mut rq),
+        [
+            MediaCommand::Volume,
+            MediaCommand::Mute,
+            MediaCommand::Switch
+        ]
+    );
+
+    let recorder = Arc::new(Recorder::default());
+    let transport = Transport {
+        commands: vec![MediaCommand::Pause, MediaCommand::Play, MediaCommand::Seek],
+        repeat: RepeatMode::All,
+        shuffle: true,
+        seek_max_ms: Some(1_000),
+        control: recorder.clone(),
+    };
+    groups.set_transport(&group, Some(transport)).await.unwrap();
+    let state = states(&mut rq).pop().unwrap().controller.flatten().unwrap();
+    assert_eq!(
+        state.supported_commands,
+        [
+            MediaCommand::Play,
+            MediaCommand::Pause,
+            MediaCommand::Volume,
+            MediaCommand::Mute,
+            MediaCommand::Switch,
+            MediaCommand::Seek
+        ]
+    );
+    assert_eq!(
+        (state.repeat, state.shuffle, state.seek_max_ms),
+        (RepeatMode::All, true, Some(1_000))
+    );
+
+    groups.command(remote.clone(), cmd(MediaCommand::Pause));
+    groups.command(remote.clone(), cmd(MediaCommand::Next));
+    let seek = |ms| ControllerCommand {
+        position_ms: Some(ms),
+        ..cmd(MediaCommand::Seek)
+    };
+    groups.command(remote.clone(), seek(2_000));
+    groups.command(remote.clone(), seek(500));
+    groups.command(remote.clone(), cmd(MediaCommand::Seek));
+    sleep_ms(1).await;
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        [
+            (group.clone(), MediaCommand::Pause, None),
+            (group.clone(), MediaCommand::Seek, Some(500)),
+        ],
+        "next isn't listed; a seek past seek_max_ms or without a position is dropped"
+    );
+
+    groups.set_transport(&group, None).await.unwrap();
+    assert_eq!(
+        offered(&mut rq),
+        [
+            MediaCommand::Volume,
+            MediaCommand::Mute,
+            MediaCommand::Switch
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_controller_stops_its_playing_group() {
+    let clock = ServerClock::new();
+    let groups = Groups::new(clock);
+    let (remote, mut rq) = client_with(clock, "remote", &["player@v1", "controller@v1"]);
+    groups.connect(remote.clone());
+    sleep_ms(1).await;
+    let group = groups.group_of("remote").unwrap().id;
+    groups.play(&group, tone(clock)).await.unwrap();
+    assert!(offered(&mut rq).contains(&MediaCommand::Stop));
+
+    groups.command(remote.clone(), cmd(MediaCommand::Stop));
+    sleep_ms(1).await;
+    assert_eq!(
+        groups.get(&group).unwrap().playback_state,
+        PlaybackState::Stopped
+    );
+    assert!(!offered(&mut rq).contains(&MediaCommand::Stop));
+}
+
+#[tokio::test(start_paused = true)]
+async fn switch_goes_back_to_the_previous_group_then_on_round_the_cycle() {
+    let clock = ServerClock::new();
+    let groups = Groups::new(clock);
+    let (kitchen, _kq) = client(clock, "kitchen");
+    let (den, _dq) = client_with(clock, "den", &["player@v1", "controller@v1"]);
+    let (attic, _aq) = client(clock, "attic");
+    for c in [&kitchen, &den, &attic] {
+        groups.connect(c.clone());
+    }
+    sleep_ms(1).await;
+    let group = groups.group_of("kitchen").unwrap().id;
+    let attics = groups.group_of("attic").unwrap().id;
+    groups.join("den", &group).await.unwrap();
+    groups.play(&group, tone(clock)).await.unwrap();
+    groups.play(&attics, tone(clock)).await.unwrap();
+
+    available(&den, false);
+    groups.unavailable(den.clone());
+    available(&den, true);
+    sleep_ms(1).await;
+    assert_eq!(groups.get(&group).unwrap().members, ["kitchen"]);
+
+    let switch = || groups.command(den.clone(), cmd(MediaCommand::Switch));
+    switch();
+    sleep_ms(1).await;
+    assert_eq!(
+        groups.group_of("den").unwrap().id,
+        group,
+        "back to where it was"
+    );
+    assert_eq!(groups.previous_group("den"), None);
+
+    switch();
+    sleep_ms(1).await;
+    assert_eq!(
+        groups.group_of("den").unwrap().id,
+        attics,
+        "the attic plays alone"
+    );
+    switch();
+    sleep_ms(1).await;
+    let solo = groups.group_of("den").unwrap();
+    assert_eq!(solo.members, ["den"], "then a group of its own");
+    switch();
+    sleep_ms(1).await;
+    assert_eq!(groups.group_of("den").unwrap().id, group, "and round again");
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_follows_the_group_and_its_position_freezes_on_stop() {
+    let clock = ServerClock::new();
+    let groups = Groups::new(clock);
+    let (kitchen, _kq) = client(clock, "kitchen");
+    let (panel, mut pq) = client_with(clock, "panel", &["metadata@v1"]);
+    groups.connect(kitchen.clone());
+    groups.connect(panel.clone());
+    sleep_ms(1).await;
+    assert!(states(&mut pq).is_empty(), "no metadata, nothing to clear");
+    let group = groups.group_of("kitchen").unwrap().id;
+    groups.join("panel", &group).await.unwrap();
+    groups.play(&group, tone(clock)).await.unwrap();
+    let progress = Progress {
+        track_progress: 1_000,
+        track_duration: 10_000,
+        playback_speed: 1_000,
+    };
+    let metadata = TrackMetadata {
+        title: Some("Song".into()),
+        progress: Some(progress),
+        ..Default::default()
+    };
+    groups.set_metadata(&group, Some(metadata)).await.unwrap();
+    let set = states(&mut pq).pop().unwrap().metadata.flatten().unwrap();
+    assert_eq!(set.progress, Some(Some(progress)));
+
+    sleep_ms(2_500).await;
+    groups.stop(&group).await.unwrap();
+    let frozen = states(&mut pq).pop().unwrap().metadata.flatten().unwrap();
+    assert_eq!(
+        frozen.progress,
+        Some(Some(Progress {
+            track_progress: 3_500,
+            track_duration: 10_000,
+            playback_speed: 0,
+        }))
+    );
+    assert_eq!(frozen.timestamp - set.timestamp, 2_500_000);
+    assert_eq!(frozen.title, Some(Some("Song".into())));
+
+    groups.leave("panel").await.unwrap();
+    assert_eq!(
+        states(&mut pq).pop().unwrap().metadata,
+        Some(None),
+        "its own group plays nothing"
+    );
 }
