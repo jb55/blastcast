@@ -13,6 +13,7 @@ use crate::protocol::{
     BinaryFrame, ClientHello, ClientState, Codec, ConnectionReason, HeaderLayout, PlayerSupport,
     RequestFormatPlayer, StreamFormat,
 };
+use tas_proto::Series;
 
 /// Bytes in a 20 ms chunk of 48 kHz stereo s16le.
 const CHUNK_BYTES: usize = 960 * 4;
@@ -707,4 +708,106 @@ async fn a_removed_player_gets_stream_end_even_while_paused() {
     tokio::time::timeout(Duration::from_secs(1), ended)
         .await
         .expect("ended() resolves once the task is gone");
+}
+
+/// `series` of `entity` as the hub holds it at `now_us`.
+fn track(
+    hub: &tas_telemetry::Telemetry,
+    now_us: i64,
+    series: Series,
+    entity: &str,
+) -> Vec<tas_telemetry::Point> {
+    hub.subscribe(now_us)
+        .history
+        .into_iter()
+        .find(|t| t.series == series && &*t.entity == entity)
+        .map_or_else(Vec::new, |t| t.points)
+}
+
+fn traced_player(
+    clock: ServerClock,
+    hub: &tas_telemetry::Telemetry,
+    client_id: &str,
+) -> (Arc<Connection>, Queues) {
+    let (conn, q) = named_player(clock, client_id, vec![pcm(48_000, 16)], 0);
+    let conn = Arc::into_inner(conn).unwrap().with_telemetry(hub);
+    available(&conn, true);
+    (Arc::new(conn), q)
+}
+
+#[tokio::test(start_paused = true)]
+async fn telemetry_matches_what_the_players_received() {
+    let clock = ServerClock::new();
+    let hub = tas_telemetry::Telemetry::new();
+    let (kitchen, mut kq) = traced_player(clock, &hub, "kitchen");
+    let (den, mut dq) = traced_player(clock, &hub, "den");
+    let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
+    let stream = AudioStream::start_with(clock, Box::new(sine), hub.probe("sendspin:0")).unwrap();
+    stream.add_player(kitchen.clone());
+    stream.add_player(den.clone());
+    sleep_ms(205).await;
+    let now = clock.now_us();
+
+    for (id, q) in [("kitchen", &mut kq), ("den", &mut dq)] {
+        let chunks = audio(q);
+        assert_eq!(chunks.len(), 10, "{id}");
+        let sent = track(&hub, now, Series::ChunkSent, id);
+        let spans: Vec<(i64, usize)> = sent.iter().map(|p| (p.value as i64, CHUNK_BYTES)).collect();
+        assert_eq!(spans, chunks, "{id}: a span per chunk, at its timestamp");
+        assert!(sent.iter().all(|p| p.duration_us == 20_000));
+        // Each chunk is queued as its source hands it over, 250 ms ahead.
+        let lead = track(&hub, now, Series::Lead, id);
+        let leads: Vec<(i64, f64)> = lead.iter().map(|p| (p.t_us, p.value)).collect();
+        let expected: Vec<(i64, f64)> = chunks
+            .iter()
+            .map(|&(ts, _)| (ts - DEFAULT_SEND_AHEAD_US, DEFAULT_SEND_AHEAD_US as f64))
+            .collect();
+        assert_eq!(leads, expected, "{id}");
+        let bytes = track(&hub, now, Series::ChunkBytes, id);
+        assert!(bytes.iter().all(|p| p.value == CHUNK_BYTES as f64), "{id}");
+        assert_eq!(track(&hub, now, Series::Buffered, id).len(), 10);
+        let start = track(&hub, now, Series::StreamStart, id);
+        assert_eq!(start.len(), 1, "{id}: stream/start is marked");
+        assert_eq!(start[0].value, DEFAULT_SEND_AHEAD_US as f64);
+    }
+
+    // The stream's own: its start, and the cursor and floor per chunk.
+    let s = "sendspin:0";
+    assert_eq!(track(&hub, now, Series::StreamStart, s).len(), 1);
+    let cursor = track(&hub, now, Series::Cursor, s);
+    let floor = track(&hub, now, Series::Floor, s);
+    assert_eq!((cursor.len(), floor.len()), (10, 10));
+    assert_eq!(cursor[0].value, 290_000.0, "the first chunk ends at 290 ms");
+    assert_eq!(floor[0].value, 270_000.0);
+
+    stream.stop().await;
+    let now = clock.now_us();
+    for id in ["kitchen", "den", s] {
+        assert_eq!(track(&hub, now, Series::StreamEnd, id).len(), 1, "{id}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shift_and_a_seek_are_marked_on_the_stream() {
+    let clock = ServerClock::new();
+    let hub = tas_telemetry::Telemetry::new();
+    let (conn, _q) = traced_player(clock, &hub, "kitchen");
+    let source = Delayed::new(vec![20, 20, 20, 1000, 20, 20, 20, 20]);
+    let stream = AudioStream::start_with(clock, source, hub.probe("s")).unwrap();
+    stream.add_player(conn.clone());
+    sleep_ms(1100).await;
+    // As in a_stalled_source_shifts_the_timeline_forward: the fourth chunk
+    // belonged at 330 ms and went at 1310 ms.
+    let shift = track(&hub, clock.now_us(), Series::TimelineShift, "s");
+    let shift: Vec<(i64, f64)> = shift.iter().map(|p| (p.t_us, p.value)).collect();
+    assert_eq!(shift, [(1_060_000, 980_000.0)]);
+
+    let sine = SineSource::new(SESSION_FORMAT, 220.0).paced(clock);
+    stream.seek(Box::new(sine)).unwrap();
+    sleep_ms(30).await;
+    let now = clock.now_us();
+    assert_eq!(track(&hub, now, Series::StreamClear, "s").len(), 1);
+    // The timeline starts afresh after the clear.
+    assert_eq!(track(&hub, now, Series::StreamStart, "s").len(), 2);
+    stream.stop().await;
 }

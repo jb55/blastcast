@@ -24,6 +24,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, future};
 use tas_audio::ServerClock;
+use tas_telemetry::Telemetry;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 
@@ -207,7 +208,16 @@ impl Connection {
         !self.ready.swap(true, Ordering::AcqRel)
     }
 
-    /// What the server has measured about this connection, for `/debug`.
+    /// Sends this connection's telemetry to `telemetry`, as the client's
+    /// id. Before anything is measured: what came before is not kept.
+    pub(crate) fn with_telemetry(mut self, telemetry: &Telemetry) -> Self {
+        let probe = telemetry.probe(self.client_id());
+        self.stats = LinkStats::with_probe(self.clock.now_us(), probe);
+        self
+    }
+
+    /// What the server has measured about this connection, for `/debug`
+    /// and telemetry.
     pub fn stats(&self) -> &LinkStats {
         &self.stats
     }

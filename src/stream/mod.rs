@@ -52,6 +52,13 @@
 //! and a player joining mid-stream gets the same timestamps as the rest.
 //! A `stream/request-format` moves the player to the format it asks for,
 //! answered with a fresh `stream/start`.
+//!
+//! **Telemetry.** A stream started with a [`Probe`] emits, as its own
+//! entity, the timeline cursor and the send-ahead floor per chunk, and
+//! marks for its start, each `stream/clear`, each shift (by how much) and
+//! its end. Each player emits its own per chunk (see
+//! [`LinkStats`](crate::stats::LinkStats)), and marks its `stream/start`
+//! and `stream/end`.
 
 mod buffer;
 mod encode;
@@ -65,6 +72,8 @@ use bytes::Bytes;
 use tas_audio::{
     AudioError, LiveSource, SESSION_FORMAT, ServerClock, Span, Timeline, to_session_format,
 };
+use tas_proto::Series;
+use tas_telemetry::Probe;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
@@ -136,6 +145,16 @@ impl AudioStream {
     /// Starts streaming `source`, timed on `clock`. The clock must be the
     /// one the players sync to, the server's `ServerConfig::clock`.
     pub fn start(clock: ServerClock, source: Box<dyn LiveSource>) -> Result<Self, AudioError> {
+        Self::start_with(clock, source, Probe::default())
+    }
+
+    /// As [`AudioStream::start`], with the stream's timings sent to
+    /// `probe`.
+    pub fn start_with(
+        clock: ServerClock,
+        source: Box<dyn LiveSource>,
+        probe: Probe,
+    ) -> Result<Self, AudioError> {
         let source = to_session_format(source)?;
         let (commands, rx) = mpsc::unbounded_channel();
         let (ended_tx, ended) = watch::channel(());
@@ -151,6 +170,7 @@ impl AudioStream {
             encodings: Vec::new(),
             pending: None,
             wake_us: None,
+            probe,
         };
         // Under the span of whoever started it: a group's session.
         let task = tokio::spawn(streamer.run(rx).in_current_span());
@@ -270,9 +290,14 @@ impl Output {
         self.started = true;
         self.open = true;
         let timing = self.conn.player_status().timing;
-        self.conn
-            .stats()
-            .stream_started(encoder.format(), send_ahead_us(&timing, live));
+        let send_ahead = send_ahead_us(&timing, live);
+        let stats = self.conn.stats();
+        stats.stream_started(encoder.format(), send_ahead);
+        stats.probe().mark(
+            Series::StreamStart,
+            self.conn.clock().now_us(),
+            send_ahead as f64,
+        );
         tracing::info!(
             client_id = self.conn.client_id(),
             format = ?encoder.format(),
@@ -286,6 +311,10 @@ impl Output {
                 server_transmitted: None,
                 roles: Some(vec![PLAYER_ROLE.into()]),
             }));
+            let stats = self.conn.stats();
+            stats
+                .probe()
+                .mark(Series::StreamEnd, self.conn.clock().now_us(), 0.0);
         }
         self.started = false;
         self.open = false;
@@ -436,6 +465,8 @@ struct Streamer {
     /// When to look again at the pending chunk, or, with the feed ended,
     /// when the last chunk has played.
     wake_us: Option<i64>,
+    /// Where the stream's own timings go.
+    probe: Probe,
 }
 
 impl Streamer {
@@ -473,6 +504,7 @@ impl Streamer {
         for out in &mut self.outputs {
             out.end();
         }
+        self.probe.mark(Series::StreamEnd, self.clock.now_us(), 0.0);
     }
 
     fn handle(&mut self, cmd: Command) {
@@ -498,6 +530,8 @@ impl Streamer {
                 self.wake_us = None;
                 self.timeline = None;
                 self.history.clear();
+                self.probe
+                    .mark(Series::StreamClear, self.clock.now_us(), 0.0);
                 for out in self.outputs.iter_mut().filter(|o| o.started) {
                     out.send_control(ServerMessage::StreamClear(StreamClear {
                         server_transmitted: None,
@@ -615,7 +649,7 @@ impl Streamer {
         let now = self.clock.now_us();
         let send_ahead = self.send_ahead_us();
         let floor = now + send_ahead;
-        self.place_timeline(floor);
+        self.place_timeline(floor, now);
         self.sync_outputs(now);
 
         if !self.live
@@ -631,6 +665,9 @@ impl Streamer {
             .as_mut()
             .expect("placed above")
             .advance(frames as u64);
+        self.probe
+            .sample(Series::Cursor, now, session_span.end_us() as f64);
+        self.probe.sample(Series::Floor, now, floor as f64);
         let live = self.live;
         for encoding in self.encodings.iter_mut().filter(|e| e.running) {
             let format = encoding.format();
@@ -651,8 +688,10 @@ impl Streamer {
     /// Starts the timeline at `floor`, or shifts it, and every running
     /// encoding's with it, forward to `floor` if the source fell more than
     /// [`SHIFT_TOLERANCE_US`] behind.
-    fn place_timeline(&mut self, floor: i64) {
+    fn place_timeline(&mut self, floor: i64, now: i64) {
         let Some(timeline) = &mut self.timeline else {
+            self.probe
+                .mark(Series::StreamStart, now, (floor - now) as f64);
             self.timeline = Some(Timeline::new(floor, SESSION_FORMAT.sample_rate));
             for encoding in self.encodings.iter_mut().filter(|e| e.running) {
                 encoding
@@ -667,6 +706,7 @@ impl Streamer {
                 shift_us = shift,
                 "source fell behind, shifting the timeline"
             );
+            self.probe.mark(Series::TimelineShift, now, shift as f64);
             timeline.rebase(floor);
             for encoding in self.encodings.iter_mut().filter(|e| e.running) {
                 let cursor = encoding.timeline.cursor_us();
@@ -833,7 +873,9 @@ fn send_chunk(out: &mut Output, bytes: &[u8], span: Span, now: i64, live: bool) 
     let len = bytes.len() as u64;
     if live && !out.tracker.can_send(len, span.duration_us) {
         tracing::debug!(client_id, "player buffer full, chunk dropped");
-        out.conn.stats().chunk_dropped();
+        out.conn
+            .stats()
+            .chunk_dropped(span.start_us, span.end_us(), now);
         out.conn.record_error("player buffer full, chunk dropped");
         return;
     }
@@ -848,11 +890,13 @@ fn send_chunk(out: &mut Output, bytes: &[u8], span: Span, now: i64, live: bool) 
             out.tracker.register(span.end_us(), len, span.duration_us);
             out.conn
                 .stats()
-                .chunk_sent(span.start_us, span.end_us(), now);
+                .chunk_sent(span.start_us, span.end_us(), bytes.len(), now);
         }
         Err(SendError::Full) => {
             tracing::debug!(client_id, "audio queue full, chunk dropped");
-            out.conn.stats().chunk_dropped();
+            out.conn
+                .stats()
+                .chunk_dropped(span.start_us, span.end_us(), now);
             out.conn.record_error("audio queue full, chunk dropped");
         }
         Err(SendError::NotReady | SendError::Unavailable) => out.started = false,

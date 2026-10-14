@@ -41,6 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 use tas_audio::{AudioError, AudioFormat, LiveSource, ServerClock};
+use tas_telemetry::Telemetry;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::connection::Connection;
@@ -79,6 +80,13 @@ pub struct StreamInfo {
     pub format: AudioFormat,
     /// Server-clock µs.
     pub started_us: i64,
+}
+
+impl StreamInfo {
+    /// The stream's id on `/v1/ws` and in telemetry: `sendspin:<generation>`.
+    pub fn id(&self) -> String {
+        format!("sendspin:{}", self.generation)
+    }
 }
 
 /// What a group's source says is playing, for its metadata clients. Every
@@ -250,11 +258,18 @@ impl Groups {
     /// Starts the task that runs the groups; call it inside a Tokio
     /// runtime. Streams are timed on `clock`, the one players sync to.
     pub fn new(clock: ServerClock) -> Self {
+        Self::with_telemetry(clock, Telemetry::default())
+    }
+
+    /// As [`Groups::new`], with each stream's timings sent to `telemetry`
+    /// under its [`StreamInfo::id`].
+    pub fn with_telemetry(clock: ServerClock, telemetry: Telemetry) -> Self {
         let (ops, rx) = mpsc::unbounded_channel();
         let view = Arc::new(Mutex::new(View::default()));
         let (changes, watch) = watch::channel(Vec::new());
         let actor = Actor {
             clock,
+            telemetry,
             ops: ops.downgrade(),
             view: view.clone(),
             changes,
@@ -573,6 +588,7 @@ struct Actor {
     id_prefix: String,
     next_id: u64,
     next_generation: u64,
+    telemetry: Telemetry,
 }
 
 impl Actor {
@@ -838,8 +854,17 @@ impl Actor {
         }
         // The stream's task, and every log line from it, is in this
         // session's span.
+        let info = StreamInfo {
+            generation,
+            source: kind,
+            live,
+            format,
+            started_us: clock.now_us(),
+        };
+        let probe = self.telemetry.probe(&info.id());
+        let group = self.groups.get_mut(group_id).expect("found above");
         let session = tracing::info_span!("session", group_id, generation);
-        let stream = session.in_scope(|| AudioStream::start(clock, source))?;
+        let stream = session.in_scope(|| AudioStream::start_with(clock, source, probe))?;
         let ended = stream.ended();
         let id = group_id.to_owned();
         tokio::spawn(async move {
@@ -851,13 +876,6 @@ impl Actor {
                 });
             }
         });
-        let info = StreamInfo {
-            generation,
-            source: kind,
-            live,
-            format,
-            started_us: clock.now_us(),
-        };
         group.stream = Some(Playing { stream, info });
         group.update_all();
         let playing = group.stream.as_ref().expect("set above");

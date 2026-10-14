@@ -34,6 +34,7 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
 use tas_audio::ServerClock;
 use tas_core::player::DeviceInfo;
 use tas_core::{PlayerFeature, PlayerRegistry, PlayerState};
+use tas_telemetry::Telemetry;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -96,6 +97,9 @@ pub struct ServerConfig {
     /// approves guest access this way. Off, a client waits at empty
     /// activities until it is approved or paired.
     pub auto_approve_unpaired: bool,
+    /// Where each connection's and each stream's timings go. Off by
+    /// default.
+    pub telemetry: Telemetry,
 }
 
 impl ServerConfig {
@@ -118,6 +122,7 @@ impl ServerConfig {
             trust: Arc::new(MemoryTrust::new()),
             allow_legacy_clients: true,
             auto_approve_unpaired: true,
+            telemetry: Telemetry::default(),
         }
     }
 }
@@ -226,7 +231,7 @@ impl SendspinServer {
     /// Call it inside a Tokio runtime: the groups run on a task of their
     /// own, and so does the mirror of their membership into the registry.
     pub fn new(config: ServerConfig, registry: Arc<PlayerRegistry>) -> Arc<Self> {
-        let groups = Groups::new(config.clock);
+        let groups = Groups::with_telemetry(config.clock, config.telemetry.clone());
         let membership = Membership::new(&groups, &registry);
         tokio::spawn(membership.clone().run());
         Arc::new(Self {
@@ -454,7 +459,7 @@ impl SendspinServer {
             "sendspin client connected"
         );
         let (conn, queues) = Connection::new(hello, active_roles, reason, self.config.clock);
-        let conn = Arc::new(conn);
+        let conn = Arc::new(conn.with_telemetry(&self.config.telemetry));
         if let Some(security) = security {
             // The current spec's audio chunk carries send_ahead.
             conn.set_header_layout(HeaderLayout::SendAhead);

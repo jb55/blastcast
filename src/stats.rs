@@ -13,11 +13,18 @@
 //!
 //! **Round trip.** The writer's websocket pings carry the server clock, and
 //! a pong echoes it back, so each pong is one RTT sample.
+//!
+//! **Telemetry.** Besides the aggregates `/debug` reads, each measurement
+//! goes to the connection's [`Probe`] as it is taken: every `client/time`'s
+//! offset, every pong's RTT, and per chunk its lead, size, the audio
+//! buffered after it and its span on the timeline, sent or dropped.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
+use tas_proto::Series;
+use tas_telemetry::Probe;
 
 use crate::protocol::{Codec, StreamFormat};
 
@@ -33,7 +40,10 @@ const PING_STAMP: usize = 8;
 /// One connection's measurements. Every method takes the server clock's
 /// `now_us`, so tests can drive it without waiting.
 #[derive(Debug)]
-pub struct LinkStats(Mutex<Inner>);
+pub struct LinkStats {
+    inner: Mutex<Inner>,
+    probe: Probe,
+}
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -76,21 +86,37 @@ pub struct LastError {
 }
 
 impl LinkStats {
+    /// Stats that emit no telemetry.
     pub fn new(now_us: i64) -> Self {
-        Self(Mutex::new(Inner {
-            connected_us: now_us,
-            ..Default::default()
-        }))
+        Self::with_probe(now_us, Probe::default())
+    }
+
+    /// Stats that emit each measurement to `probe` as well.
+    pub fn with_probe(now_us: i64, probe: Probe) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                connected_us: now_us,
+                ..Default::default()
+            }),
+            probe,
+        }
+    }
+
+    /// Where this connection's telemetry goes.
+    pub fn probe(&self) -> &Probe {
+        &self.probe
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A `client/time` that arrived at `received_us`.
     pub fn time_request(&self, client_transmitted: i64, received_us: i64) {
-        let t = &mut self.lock().time;
         let offset = received_us - client_transmitted;
+        self.probe
+            .sample(Series::ClockOffset, received_us, offset as f64);
+        let t = &mut self.lock().time;
         if let Some(prev) = t.offset_us {
             let d = (offset - prev).abs();
             t.jitter_us += (d - t.jitter_us) / JITTER_GAIN;
@@ -118,6 +144,7 @@ impl LinkStats {
         if rtt < 0 {
             return;
         }
+        self.probe.sample(Series::Rtt, now_us, rtt as f64);
         let rtts = &mut self.lock().rtts;
         if rtts.len() == RTT_WINDOW {
             rtts.pop_front();
@@ -146,8 +173,14 @@ impl LinkStats {
         }
     }
 
-    /// A chunk playing from `start_us` to `end_us` was queued at `now_us`.
-    pub fn chunk_sent(&self, start_us: i64, end_us: i64, now_us: i64) {
+    /// A chunk of `bytes` playing from `start_us` to `end_us` was queued
+    /// at `now_us`.
+    pub fn chunk_sent(&self, start_us: i64, end_us: i64, bytes: usize, now_us: i64) {
+        let p = &self.probe;
+        p.span(Series::ChunkSent, now_us, start_us, end_us - start_us);
+        p.sample(Series::Lead, now_us, (start_us - now_us) as f64);
+        p.sample(Series::ChunkBytes, now_us, bytes as f64);
+        p.sample(Series::Buffered, now_us, (end_us - now_us).max(0) as f64);
         if let Some(s) = &mut self.lock().stream {
             s.chunks_sent += 1;
             s.end_us = Some(end_us);
@@ -155,7 +188,11 @@ impl LinkStats {
         }
     }
 
-    pub fn chunk_dropped(&self) {
+    /// A chunk that would have played from `start_us` to `end_us` was
+    /// dropped at `now_us`.
+    pub fn chunk_dropped(&self, start_us: i64, end_us: i64, now_us: i64) {
+        self.probe
+            .span(Series::ChunkDropped, now_us, start_us, end_us - start_us);
         if let Some(s) = &mut self.lock().stream {
             s.chunks_dropped += 1;
         }
@@ -348,9 +385,9 @@ mod tests {
         let s = LinkStats::new(0);
         assert_eq!(s.snapshot(0, 0).stream, None);
         s.stream_started(pcm(), 250_000);
-        s.chunk_sent(250_000, 270_000, 0);
-        s.chunk_sent(270_000, 290_000, 20_000);
-        s.chunk_dropped();
+        s.chunk_sent(250_000, 270_000, 3840, 0);
+        s.chunk_sent(270_000, 290_000, 3840, 20_000);
+        s.chunk_dropped(290_000, 310_000, 40_000);
         let st = s.snapshot(100_000, 3).stream.unwrap();
         assert_eq!(st.buffered_ms, 190.0);
         assert_eq!(st.lead_ms, Some(250.0));
@@ -359,6 +396,26 @@ mod tests {
         assert_eq!(st.queued_frames, 3);
         s.stream_stopped();
         assert_eq!(s.snapshot(100_000, 0).stream.unwrap().buffered_ms, 0.0);
+    }
+
+    #[test]
+    fn each_time_request_and_pong_is_a_sample() {
+        let hub = tas_telemetry::Telemetry::new();
+        let s = LinkStats::with_probe(0, hub.probe("kitchen"));
+        s.time_request(1_000, 6_000);
+        s.pong(&LinkStats::ping_payload(10_000), 11_500);
+        let history = hub.subscribe(20_000).history;
+        let got: Vec<(Series, i64, f64)> = history
+            .iter()
+            .map(|t| (t.series, t.points[0].t_us, t.points[0].value))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Series::ClockOffset, 6_000, 5_000.0),
+                (Series::Rtt, 11_500, 1_500.0)
+            ]
+        );
     }
 
     #[test]
