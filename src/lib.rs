@@ -6,12 +6,15 @@
 //!   writes the config.
 //! - [`supervisor`] runs one shairport-sync per AirPlay target and keeps it
 //!   running.
+//! - [`audio`] reads each receiver's PCM fifo into a live source.
 
+pub mod audio;
 pub mod binary;
 pub mod config;
 pub mod supervisor;
 #[cfg(test)]
 mod testing;
 
+pub use audio::AirplayAudio;
 pub use config::{NameTemplate, ReceiverInfo};
 pub use supervisor::{ReceiverHandler, ReceiverSupervisor, SupervisorConfig};
