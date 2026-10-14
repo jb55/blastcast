@@ -32,6 +32,7 @@ use axum::response::Response;
 use axum::routing::get;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
 use tas_audio::ServerClock;
+use tas_core::player::DeviceInfo;
 use tas_core::{PlayerFeature, PlayerRegistry, PlayerState};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -507,6 +508,7 @@ impl SendspinServer {
         if conn.has_role("player") {
             // Unavailable until its first client/state says otherwise.
             let mut state = PlayerState::new(client_id, PROVIDER, conn.name());
+            state.device_info = device_info(client_id, conn.hello().device_info.as_ref());
             mirror_status(&mut state, &conn.player_status());
             // Every Sendspin player can sync with every other.
             state.supported_features.insert(PlayerFeature::SetMembers);
@@ -577,6 +579,39 @@ fn mirror_status(p: &mut PlayerState, status: &PlayerStatus) {
             p.supported_features.remove(&feature);
         }
     }
+}
+
+/// What the player said it is, as MA's Sendspin provider shows it, with
+/// its MAC address from `client/hello`, or its client id if that is one.
+fn device_info(client_id: &str, hello: Option<&crate::protocol::DeviceInfo>) -> DeviceInfo {
+    let mut info = DeviceInfo::default();
+    if let Some(hello) = hello {
+        if let Some(model) = &hello.product_name {
+            info.model = model.clone();
+        }
+        if let Some(manufacturer) = &hello.manufacturer {
+            info.manufacturer = manufacturer.clone();
+        }
+        info.software_version = hello.software_version.clone();
+    }
+    let mac = hello
+        .and_then(|h| h.mac_address.as_deref())
+        .or(Some(client_id))
+        .map(|m| m.to_uppercase().replace('-', ":"))
+        .filter(|m| is_mac(m));
+    if let Some(mac) = mac {
+        info.identifiers.insert("mac_address".into(), mac);
+    }
+    info
+}
+
+/// `AA:BB:CC:DD:EE:FF`.
+fn is_mac(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(':').collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Answers a `client/time`. The writer stamps `server_transmitted`.
@@ -669,5 +704,27 @@ mod tests {
         assert!(!ended(Some(GoodbyeReason::AnotherServer), false).should_redial());
         assert!(!ended(Some(GoodbyeReason::UserRequest), false).should_redial());
         assert!(!Disconnect::Refused(HandshakeError::NotHello).should_redial());
+    }
+
+    #[test]
+    fn device_info_is_what_the_player_said() {
+        let hello = crate::protocol::DeviceInfo {
+            product_name: Some("Kitchen Speaker".into()),
+            manufacturer: Some("Acme".into()),
+            software_version: Some("1.2".into()),
+            mac_address: Some("aa-bb-cc-dd-ee-ff".into()),
+        };
+        let info = device_info("kitchen", Some(&hello));
+        assert_eq!(info.model, "Kitchen Speaker");
+        assert_eq!(info.manufacturer, "Acme");
+        assert_eq!(info.software_version.as_deref(), Some("1.2"));
+        assert_eq!(info.identifiers["mac_address"], "AA:BB:CC:DD:EE:FF");
+
+        // Nothing said: MA's defaults, and the client id as the MAC only
+        // if it is one.
+        let info = device_info("kitchen", None);
+        assert_eq!(info, DeviceInfo::default());
+        let info = device_info("02:42:ac:11:00:02", None);
+        assert_eq!(info.identifiers["mac_address"], "02:42:AC:11:00:02");
     }
 }
