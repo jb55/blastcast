@@ -3,16 +3,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tas_core::{CommandError, PlayerControl};
+use bytes::Bytes;
+use tas_audio::LiveSource;
+use tas_core::{CommandError, PlayerControl, SourceMetadata};
 
 use crate::connection::Connection;
-use crate::group::{GroupError, Groups};
+use crate::group::{GroupError, Groups, TrackMetadata};
 use crate::membership::Membership;
-use crate::protocol::{PlayerCommand, PlayerCommandKind, ServerCommand, ServerMessage};
+use crate::protocol::{PlayerCommand, PlayerCommandKind, Progress, ServerCommand, ServerMessage};
 
 /// What the [`tas_core::PlayerRegistry`] holds for a connected player:
 /// volume and mute go out on its connection as `server/command`, and
-/// grouping and stop go to its [`Groups`].
+/// grouping, stop and a live input (its audio, metadata and artwork) go to
+/// its [`Groups`], for the group it is in.
 ///
 /// A volume or mute command only asks. The player answers with a
 /// `client/state` carrying the value it settled on, and that is what the
@@ -126,6 +129,36 @@ impl PlayerControl for SendspinPlayer {
         Ok(())
     }
 
+    /// Plays `source` to the group the player is in: for a follower, its
+    /// leader's whole group.
+    async fn play_source(&self, source: Box<dyn LiveSource>) -> Result<(), CommandError> {
+        let group_id = self.group_id()?;
+        self.groups.play(&group_id, source).await.map_err(failed)?;
+        self.membership.sync();
+        Ok(())
+    }
+
+    /// For the metadata clients in the player's group.
+    async fn set_source_metadata(
+        &self,
+        metadata: Option<SourceMetadata>,
+    ) -> Result<(), CommandError> {
+        let group_id = self.group_id()?;
+        self.groups
+            .set_metadata(&group_id, metadata.map(track_metadata))
+            .await
+            .map_err(failed)
+    }
+
+    /// For the artwork clients in the player's group.
+    async fn set_source_artwork(&self, image: Option<Arc<[u8]>>) -> Result<(), CommandError> {
+        let group_id = self.group_id()?;
+        self.groups
+            .set_artwork(&group_id, image.map(Bytes::from_owner))
+            .await
+            .map_err(failed)
+    }
+
     /// Each removed member leaves this player's group for a stopped one of
     /// its own, and each added one joins it, leaving its old group. When
     /// this player leaves, the group, its stream and its timeline stay with
@@ -138,6 +171,66 @@ impl PlayerControl for SendspinPlayer {
     }
 }
 
+/// What a live input says is playing, as the metadata role sends it: the
+/// position as of now, frozen while paused, and 0 for a length it doesn't
+/// know.
+fn track_metadata(m: SourceMetadata) -> TrackMetadata {
+    let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    TrackMetadata {
+        title: m.title,
+        artist: m.artist,
+        album: m.album,
+        progress: m.elapsed.map(|elapsed| Progress {
+            track_progress: ms(elapsed),
+            track_duration: m.duration.map_or(0, ms),
+            playback_speed: if m.paused { 0 } else { 1000 },
+        }),
+        ..Default::default()
+    }
+}
+
 fn failed(e: GroupError) -> CommandError {
     CommandError::Failed(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn metadata_carries_the_position_as_of_now() {
+        let m = SourceMetadata {
+            title: Some("Teardrop".into()),
+            artist: Some("Massive Attack".into()),
+            album: Some("Mezzanine".into()),
+            duration: Some(Duration::from_secs(330)),
+            elapsed: Some(Duration::from_millis(61_500)),
+            paused: false,
+        };
+        let t = track_metadata(m.clone());
+        assert_eq!(t.title.as_deref(), Some("Teardrop"));
+        assert_eq!(t.album.as_deref(), Some("Mezzanine"));
+        assert_eq!(
+            t.progress,
+            Some(Progress {
+                track_progress: 61_500,
+                track_duration: 330_000,
+                playback_speed: 1000,
+            })
+        );
+
+        // Paused freezes it; a stream with no end has length 0; no
+        // position, no progress.
+        let paused = track_metadata(SourceMetadata {
+            paused: true,
+            duration: None,
+            ..m.clone()
+        });
+        assert_eq!(paused.progress.unwrap().playback_speed, 0);
+        assert_eq!(paused.progress.unwrap().track_duration, 0);
+        let unknown = track_metadata(SourceMetadata { elapsed: None, ..m });
+        assert_eq!(unknown.progress, None);
+    }
 }

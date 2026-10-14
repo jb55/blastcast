@@ -1,6 +1,6 @@
 //! A persistent group player on real Sendspin players: powering it on
-//! syncs its members into one Sendspin group, it reports its leader's
-//! playback, a member that drops out and comes back is synced in again
+//! syncs its members into one Sendspin group, a live source played on it
+//! plays on that group and it reports its leader's playback, a member that drops out and comes back is synced in again
 //! while the group plays, and powering it off stops and dissolves it.
 
 mod harness;
@@ -93,15 +93,22 @@ async fn a_group_player_forms_follows_its_members_and_dissolves() {
     }
     assert_eq!(get("porch").active_group, None);
 
-    // A source playing on the leader shows on the group player.
-    groups
-        .play(&sendspin_group.id, Box::new(NoiseSource::new(1, clock)))
+    // A live source played on the group player plays on its leader's
+    // Sendspin group, and the group player shows it playing.
+    registry
+        .play_source(&gid, Box::new(NoiseSource::new(1, clock)))
         .await
         .unwrap();
+    assert_eq!(
+        groups.get(&sendspin_group.id).unwrap().playback_state,
+        tas_sendspin::protocol::PlaybackState::Playing
+    );
     eventually("the group player is playing", || {
         get(&gid).playback_state == PlaybackState::Playing
     })
     .await;
+    let starts = || den.log().iter().filter(|l| l.starts_with("start")).count();
+    eventually("the den gets the stream", || starts() == 1).await;
 
     // The den's output is taken: it drops out. When it is back, the group
     // takes it in again, into the stream that is still playing.
@@ -126,10 +133,7 @@ async fn a_group_player_forms_follows_its_members_and_dissolves() {
         get("den").playback_state == PlaybackState::Playing
     })
     .await;
-    eventually("the den gets the stream again", || {
-        den.log().iter().filter(|l| l.starts_with("start")).count() == 2
-    })
-    .await;
+    eventually("the den gets the stream again", || starts() == 2).await;
 
     // Stop keeps it formed; power off dissolves it.
     registry.execute(&gid, PlayerCommand::Stop).await.unwrap();
