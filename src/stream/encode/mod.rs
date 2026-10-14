@@ -50,7 +50,7 @@ pub fn can_encode(format: &StreamFormat) -> bool {
 pub enum Encoder {
     Pcm(Box<PcmEncoder>),
     Flac(Box<FlacEncoder>),
-    Opus(OpusEncoder),
+    Opus(Box<OpusEncoder>),
 }
 
 impl Encoder {
@@ -58,7 +58,7 @@ impl Encoder {
         Ok(match format.codec {
             Codec::Pcm => Self::Pcm(Box::new(PcmEncoder::new(format)?)),
             Codec::Flac => Self::Flac(Box::new(FlacEncoder::new(format)?)),
-            Codec::Opus => Self::Opus(OpusEncoder::new(format)?),
+            Codec::Opus => Self::Opus(Box::new(OpusEncoder::new(format)?)),
             Codec::Unknown => {
                 return Err(AudioError::Format("an unknown codec".into()));
             }

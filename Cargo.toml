@@ -22,7 +22,7 @@ futures-util.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
 image.workspace = true
-opus.workspace = true
+opus-pure.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -35,6 +35,7 @@ x25519-dalek.workspace = true
 [dev-dependencies]
 claxon.workspace = true
 futures-channel.workspace = true
+opus.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
