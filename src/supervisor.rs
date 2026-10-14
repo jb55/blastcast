@@ -108,6 +108,20 @@ pub trait ReceiverHandler: Send + Sync + 'static {
 /// Discards everything.
 impl ReceiverHandler for () {}
 
+/// Tells each handler in turn, such as the audio reader and the metadata
+/// parser.
+impl ReceiverHandler for Vec<Arc<dyn ReceiverHandler>> {
+    fn started(&self, receiver: &ReceiverInfo) {
+        self.iter().for_each(|h| h.started(receiver));
+    }
+    fn metadata(&self, receiver: &ReceiverInfo, bytes: &[u8]) {
+        self.iter().for_each(|h| h.metadata(receiver, bytes));
+    }
+    fn stopped(&self, receiver: &ReceiverInfo) {
+        self.iter().for_each(|h| h.stopped(receiver));
+    }
+}
+
 struct Running {
     info: ReceiverInfo,
     stop: watch::Sender<bool>,
@@ -725,6 +739,27 @@ echo "connection from 10.0.0.9" >&2
 
     fn is_fifo(path: &Path) -> bool {
         std::fs::metadata(path).is_ok_and(|m| m.file_type().is_fifo())
+    }
+
+    #[test]
+    fn a_vec_of_handlers_tells_each_one() {
+        let (a, b) = (Arc::new(Recorder::default()), Arc::new(Recorder::default()));
+        let both: Vec<Arc<dyn ReceiverHandler>> = vec![a.clone(), b.clone()];
+        let info = ReceiverInfo::new(Path::new("/run/tas"), "ss-k", "K".into(), 7000, None);
+        both.started(&info);
+        both.metadata(&info, b"x");
+        both.stopped(&info);
+        let id = || "ss-k".to_owned();
+        for r in [a, b] {
+            assert_eq!(
+                r.events(),
+                [
+                    Ev::Started(id()),
+                    Ev::Metadata(id(), b"x".to_vec()),
+                    Ev::Stopped(id())
+                ]
+            );
+        }
     }
 
     #[tokio::test]

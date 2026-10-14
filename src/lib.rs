@@ -7,14 +7,18 @@
 //! - [`supervisor`] runs one shairport-sync per AirPlay target and keeps it
 //!   running.
 //! - [`audio`] reads each receiver's PCM fifo into a live source.
+//! - [`metadata`] parses each receiver's metadata fifo into what its
+//!   sender is playing.
 
 pub mod audio;
 pub mod binary;
 pub mod config;
+pub mod metadata;
 pub mod supervisor;
 #[cfg(test)]
 mod testing;
 
 pub use audio::AirplayAudio;
 pub use config::{NameTemplate, ReceiverInfo};
+pub use metadata::{AirplayEvent, AirplayMetadata, MetadataEvent, NowPlaying};
 pub use supervisor::{ReceiverHandler, ReceiverSupervisor, SupervisorConfig};
