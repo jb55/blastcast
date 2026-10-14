@@ -112,6 +112,10 @@ impl SendspinPlayer {
 
 #[async_trait]
 impl PlayerControl for SendspinPlayer {
+    async fn set_output_delay(&self, ms: u32) -> Result<(), CommandError> {
+        SendspinPlayer::set_output_delay(self, ms)
+    }
+
     async fn volume_set(&self, level: u8) -> Result<(), CommandError> {
         self.send_supported(PlayerCommand::volume(level.into()), "volume_set")
     }

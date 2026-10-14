@@ -469,6 +469,7 @@ impl SendspinServer {
         let change = conn.apply_state(state);
         if change.first {
             tracing::debug!(client_id, "first client/state, ready");
+            self.apply_saved_delay(conn);
         }
         if change.became_unavailable {
             // Its output is taken. The audio gate already holds its stream
@@ -486,6 +487,28 @@ impl SendspinServer {
             let _ = self
                 .registry
                 .update(client_id, |p| mirror_status(p, &status));
+        }
+    }
+
+    /// Sends the player the static delay its saved config has, once its
+    /// first `client/state` has said which commands it takes. A delay of 0
+    /// leaves the player's own.
+    fn apply_saved_delay(&self, conn: &Arc<Connection>) {
+        let client_id = conn.client_id();
+        let Ok(ms) = u32::try_from(self.registry.config(client_id).output_delay_ms) else {
+            return;
+        };
+        if ms == 0 || ms == conn.player_status().timing.output_delay_ms {
+            return;
+        }
+        if !conn.has_role("player") || !self.is_current(conn) {
+            return;
+        }
+        match self.control(conn.clone()).set_output_delay(ms) {
+            Ok(()) => tracing::info!(client_id, ms, "sent the saved output delay"),
+            Err(e) => {
+                tracing::warn!(client_id, ms, error = %e, "can't send the saved output delay")
+            }
         }
     }
 

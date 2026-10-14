@@ -10,9 +10,9 @@ use futures_util::{SinkExt, StreamExt};
 use tas_audio::{SESSION_FORMAT, ServerClock, SineSource};
 use tas_core::{CommandError, PlayerCommand as Cmd, PlayerFeature, PlayerRegistry};
 use tas_sendspin::protocol::{
-    ClientGoodbye, ClientHello, ClientMessage, ClientState, ConnectionReason, GoodbyeReason,
-    PlaybackState, PlayerCommand, PlayerCommandKind, PlayerStateReport, PlayerSupport,
-    PlayerSyncState, ServerCommand, ServerMessage,
+    ClientGoodbye, ClientHello, ClientMessage, ClientState, ClientTime, ConnectionReason,
+    GoodbyeReason, PlaybackState, PlayerCommand, PlayerCommandKind, PlayerStateReport,
+    PlayerSupport, PlayerSyncState, ServerCommand, ServerMessage,
 };
 use tas_sendspin::{Disconnect, Frame, PlayerTiming, SendError, SendspinServer, ServerConfig};
 use tokio::net::{TcpListener, TcpStream};
@@ -623,6 +623,53 @@ async fn timing_and_the_output_delay_command() {
             command: "set_output_delay"
         })
     );
+}
+
+/// A saved static delay goes to the player once its first state lists the
+/// command, and not again when it already has it.
+#[tokio::test]
+async fn a_saved_output_delay_is_sent_on_connect() {
+    let h = start(config()).await;
+    h.registry.configure(
+        "den",
+        tas_core::state::PlayerConfig {
+            output_delay_ms: 150,
+            ..Default::default()
+        },
+    );
+    let report = |ms| PlayerStateReport {
+        output_delay_ms: Some(ms),
+        supported_commands: Some(vec![PlayerCommandKind::SetOutputDelay]),
+        ..Default::default()
+    };
+    let mut ws = connect(&h.url).await;
+    send(&mut ws, &hello_with_commands("den", &[])).await;
+    read_hello(&mut ws).await;
+    send(&mut ws, &state(true, report(40))).await;
+    assert_eq!(
+        expect_command(&mut ws).await,
+        PlayerCommand::set_output_delay(150)
+    );
+    drop(ws);
+    eventually("unregistered", || !h.registry.contains("den")).await;
+
+    // Reconnecting with it already set: nothing to send, so the next
+    // message is the reply to a time request.
+    let mut ws = connect(&h.url).await;
+    send(&mut ws, &hello_with_commands("den", &[])).await;
+    read_hello(&mut ws).await;
+    send(&mut ws, &state(true, report(150))).await;
+    send(
+        &mut ws,
+        &ClientMessage::Time(ClientTime {
+            client_transmitted: 1,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        next_server_message(&mut ws).await,
+        ServerMessage::Time(_)
+    ));
 }
 
 /// A player whose output is taken stops getting audio and commands, and
