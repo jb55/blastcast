@@ -1,0 +1,14 @@
+[package]
+name = "tas-sendspin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+tas-core.workspace = true
+tas-audio.workspace = true
+
+[lints]
+workspace = true
