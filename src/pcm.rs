@@ -1,5 +1,6 @@
 //! Converting between `f32` and the integer PCM formats at the edges:
-//! s16le in from AirPlay, s16le or s24le out to Sendspin speakers.
+//! s16le in from AirPlay, s16le or s24le out to Sendspin speakers, and
+//! plain integers for an encoder (FLAC) that takes them.
 //!
 //! Integer samples map to `f32` by dividing by 2^(bits-1), so full-scale
 //! negative is exactly -1.0 and every integer sample survives a round trip.
@@ -37,6 +38,20 @@ pub fn f32_to_s24le(samples: &[f32], out: &mut Vec<u8>) {
         let v = (s * S24_SCALE).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
         out.extend_from_slice(&v.to_le_bytes()[..3]);
     }
+}
+
+/// Encode samples as `bits`-bit integers (16 or 24), one `i32` each,
+/// onto `out`. The same values [`f32_to_s16le`] and [`f32_to_s24le`]
+/// pack.
+pub fn f32_to_int(samples: &[f32], bits: u32, out: &mut Vec<i32>) {
+    let scale = (1i32 << (bits - 1)) as f32;
+    let (min, max) = (-scale, scale - 1.0);
+    out.reserve(samples.len());
+    out.extend(
+        samples
+            .iter()
+            .map(|&s| (s * scale).round().clamp(min, max) as i32),
+    );
 }
 
 #[cfg(test)]
@@ -78,5 +93,15 @@ mod tests {
                 0x00, 0x00, 0x80, 0x00, 0x00, 0x40, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00
             ]
         );
+    }
+
+    #[test]
+    fn integers_match_the_packed_encodings() {
+        let mut out = Vec::new();
+        f32_to_int(&[-1.0, 0.5, 2.0], 16, &mut out);
+        assert_eq!(out, [-32_768, 16_384, 32_767]);
+        out.clear();
+        f32_to_int(&[-1.0, 0.5, 2.0], 24, &mut out);
+        assert_eq!(out, [-8_388_608, 4_194_304, 8_388_607]);
     }
 }

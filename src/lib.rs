@@ -26,6 +26,8 @@ pub enum AudioError {
     Format(String),
     #[error("resampler: {0}")]
     Resampler(String),
+    #[error("encoder: {0}")]
+    Encoder(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
