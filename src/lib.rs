@@ -6,28 +6,16 @@
 //! sample format, [`Resampled`] for the rate) and outputs encode from it as
 //! they send, so nothing in between handles more than one format.
 
-pub mod clock;
-pub mod format;
 pub mod pcm;
 pub mod resample;
 pub mod source;
-pub mod timeline;
+
+// The clocks, formats and source trait live in blastcast, so protocol
+// crates can share them without depending on the server.
+pub use blastcast::{AudioError, clock, format, timeline};
 
 pub use clock::ServerClock;
 pub use format::{AudioFormat, PcmChunk, SESSION_FORMAT};
 pub use resample::StreamResampler;
 pub use source::{LiveSource, Resampled, SineSource, to_session_format};
 pub use timeline::{Span, Timeline};
-
-/// What can go wrong reading, converting or resampling audio.
-#[derive(Debug, thiserror::Error)]
-pub enum AudioError {
-    #[error("unsupported audio format: {0}")]
-    Format(String),
-    #[error("resampler: {0}")]
-    Resampler(String),
-    #[error("encoder: {0}")]
-    Encoder(String),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-}

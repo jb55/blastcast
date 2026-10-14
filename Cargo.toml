@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+blastcast.workspace = true
 rubato.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
