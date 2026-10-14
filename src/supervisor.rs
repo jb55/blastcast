@@ -11,8 +11,11 @@
 //!   that disconnected is removed from the registry), so the phone keeps
 //!   seeing the same AirPlay device with the same name and port.
 //! - A rename, or a port change, restarts it with the new config.
-//! - A target that is no longer configured is stopped. Nothing watches the
-//!   state file, so whoever changes `airplay_target` calls
+//! - A target that is no longer configured is stopped. A config saved
+//!   through the registry ([`PlayerRegistry::configure`], which the API's
+//!   `config/players/save` calls) publishes `PlayerConfigUpdated`, and the
+//!   supervisor reconciles on it. Nothing watches the state file, so
+//!   anything else that changes `airplay_target` calls
 //!   [`ReceiverSupervisor::reconcile`].
 //!
 //! Each run creates the audio and metadata fifos and the config file in the
@@ -180,6 +183,12 @@ impl ReceiverSupervisor {
                         if self.is_target(&p.player_id) {
                             self.reconcile().await;
                         }
+                    }
+                    // Targeted, untargeted or renamed. A reconfigured
+                    // target that was given up gets a fresh start.
+                    Ok(Event::PlayerConfigUpdated { player_id }) => {
+                        self.lock_failed().remove(&player_id);
+                        self.reconcile().await;
                     }
                     Ok(_) => {}
                     Err(RecvError::Lagged(_)) => self.reconcile().await,
@@ -876,6 +885,23 @@ echo "connection from 10.0.0.9" >&2
         for path in [&r.audio_pipe, &r.metadata_pipe, &r.config_file] {
             assert!(!path.exists(), "{} left behind", path.display());
         }
+    }
+
+    /// A config saved through the registry, as `config/players/save`
+    /// saves one, reconciles without anyone calling it.
+    #[tokio::test]
+    async fn a_config_saved_through_the_registry_reconciles() {
+        let rig = Rig::new(RUNS, |_| {});
+        rig.add("ss-kitchen", "Kitchen");
+        let save = |on| {
+            rig.target("ss-kitchen", on);
+            let config = rig.state.read(|s| s.player("ss-kitchen"));
+            rig.registry.configure("ss-kitchen", config);
+        };
+        save(true);
+        until("the receiver", async || rig.running().await.len() == 1).await;
+        save(false);
+        until("it stops", async || rig.running().await.is_empty()).await;
     }
 
     #[tokio::test]
