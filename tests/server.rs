@@ -13,9 +13,7 @@ use tas_sendspin::protocol::{
     PlaybackState, PlayerCommand, PlayerCommandKind, PlayerStateReport, PlayerSupport,
     PlayerSyncState, ServerCommand, ServerMessage,
 };
-use tas_sendspin::{
-    Disconnect, Frame, PlayerTiming, SendError, SendspinPlayer, SendspinServer, ServerConfig,
-};
+use tas_sendspin::{Disconnect, Frame, PlayerTiming, SendError, SendspinServer, ServerConfig};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -534,7 +532,7 @@ async fn timing_and_the_output_delay_command() {
         }
     );
 
-    let player = SendspinPlayer::new(conn.clone());
+    let player = h.server.player("den").unwrap();
     player.set_output_delay(9000).unwrap();
     assert_eq!(
         expect_command(&mut ws).await,

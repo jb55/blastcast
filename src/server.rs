@@ -38,6 +38,7 @@ use tokio::time::timeout;
 
 use crate::connection::{Connection, Frame, write_loop};
 use crate::group::Groups;
+use crate::membership::Membership;
 use crate::player::SendspinPlayer;
 use crate::protocol::{
     ClientHello, ClientMessage, ClientState, ClientTime, ConnectionReason, DecodeError,
@@ -155,6 +156,7 @@ pub struct SendspinServer {
     registry: Arc<PlayerRegistry>,
     connections: Mutex<HashMap<String, Arc<Connection>>>,
     groups: Groups,
+    membership: Arc<Membership>,
 }
 
 impl fmt::Debug for SendspinServer {
@@ -167,10 +169,15 @@ impl fmt::Debug for SendspinServer {
 }
 
 impl SendspinServer {
-    /// Call it inside a Tokio runtime: the groups run on a task of their own.
+    /// Call it inside a Tokio runtime: the groups run on a task of their
+    /// own, and so does the mirror of their membership into the registry.
     pub fn new(config: ServerConfig, registry: Arc<PlayerRegistry>) -> Arc<Self> {
+        let groups = Groups::new(config.clock);
+        let membership = Membership::new(&groups, &registry);
+        tokio::spawn(membership.clone().run());
         Arc::new(Self {
-            groups: Groups::new(config.clock),
+            groups,
+            membership,
             config,
             registry,
             connections: Mutex::new(HashMap::new()),
@@ -193,6 +200,17 @@ impl SendspinServer {
             .with_state(self)
             .into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
+    }
+
+    /// The registry's control for `client_id`'s player, if it is connected
+    /// with the player role.
+    pub fn player(&self, client_id: &str) -> Option<SendspinPlayer> {
+        let conn = self.connection(client_id)?;
+        conn.has_role("player").then(|| self.control(conn))
+    }
+
+    fn control(&self, conn: Arc<Connection>) -> SendspinPlayer {
+        SendspinPlayer::new(conn, self.groups.clone(), self.membership.clone())
     }
 
     /// The live connection of `client_id`.
@@ -486,10 +504,15 @@ impl SendspinServer {
             // Unavailable until its first client/state says otherwise.
             let mut state = PlayerState::new(client_id, PROVIDER, conn.name());
             mirror_status(&mut state, &conn.player_status());
-            let control = Arc::new(SendspinPlayer::new(conn.clone()));
+            // Every Sendspin player can sync with every other.
+            state.supported_features.insert(PlayerFeature::SetMembers);
+            state.can_group_with.insert(PROVIDER.to_owned());
+            let control = Arc::new(self.control(conn.clone()));
             if let Err(e) = self.registry.add(state, control) {
                 tracing::warn!(client_id, error = %e, "can't register the player");
             }
+            // A reconnect keeps its place in a group.
+            self.membership.sync();
         }
     }
 

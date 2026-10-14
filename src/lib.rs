@@ -5,6 +5,7 @@ pub mod artwork;
 pub mod connection;
 pub mod dialer;
 pub mod group;
+mod membership;
 pub mod player;
 pub mod protocol;
 pub mod server;

@@ -29,9 +29,11 @@
 //! member what its roles show and forward a controller's commands.
 //!
 //! The groups are run by one task, so a change is applied whole before the
-//! next starts; queries read a snapshot it publishes after each one. After
-//! every change the task brings each member's controller, metadata and
-//! artwork state up to date with its group, sending only what differs.
+//! next starts; queries read a snapshot it publishes after each one, and a
+//! call returns only once that snapshot has its change, so a caller's next
+//! query sees it. [`Groups::watch`] follows the snapshot. After every
+//! change the task brings each member's controller, metadata and artwork
+//! state up to date with its group, sending only what differs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, RandomState};
@@ -39,7 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 use tas_audio::{AudioError, LiveSource, ServerClock};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::connection::Connection;
 use crate::protocol::{
@@ -136,6 +138,7 @@ pub enum GroupError {
 pub struct Groups {
     ops: mpsc::UnboundedSender<Op>,
     view: Arc<Mutex<View>>,
+    watch: watch::Receiver<Vec<GroupInfo>>,
 }
 
 impl std::fmt::Debug for Groups {
@@ -233,10 +236,13 @@ impl Groups {
     pub fn new(clock: ServerClock) -> Self {
         let (ops, rx) = mpsc::unbounded_channel();
         let view = Arc::new(Mutex::new(View::default()));
+        let (changes, watch) = watch::channel(Vec::new());
         let actor = Actor {
             clock,
             ops: ops.downgrade(),
             view: view.clone(),
+            changes,
+            replies: Vec::new(),
             groups: BTreeMap::new(),
             member_of: HashMap::new(),
             previous: HashMap::new(),
@@ -247,7 +253,7 @@ impl Groups {
             next_generation: 0,
         };
         tokio::spawn(actor.run(rx));
-        Self { ops, view }
+        Self { ops, view, watch }
     }
 
     /// Every group, by id.
@@ -264,6 +270,13 @@ impl Groups {
         let view = self.view();
         let group_id = view.member_of.get(client_id)?;
         view.groups.get(group_id).cloned()
+    }
+
+    /// Every group, by id, as of each change to any group's members, name
+    /// or playback state. Its sender goes with the groups' task, so it
+    /// doesn't keep the groups alive.
+    pub fn watch(&self) -> watch::Receiver<Vec<GroupInfo>> {
+        self.watch.clone()
     }
 
     /// The group a client was in before going unavailable moved it out,
@@ -527,6 +540,10 @@ struct Actor {
     /// stops once every [`Groups`] is dropped.
     ops: mpsc::WeakUnboundedSender<Op>,
     view: Arc<Mutex<View>>,
+    /// What [`Groups::watch`] follows.
+    changes: watch::Sender<Vec<GroupInfo>>,
+    /// Replies to the op being handled, sent once its change is published.
+    replies: Vec<Box<dyn FnOnce() + Send>>,
     groups: BTreeMap<String, Group>,
     member_of: HashMap<String, String>,
     previous: HashMap<String, String>,
@@ -545,6 +562,9 @@ impl Actor {
         while let Some(op) = ops.recv().await {
             self.handle(op).await;
             self.publish();
+            for reply in self.replies.drain(..) {
+                reply();
+            }
             self.sync_roles().await;
         }
         for (_, group) in std::mem::take(&mut self.groups) {
@@ -570,10 +590,12 @@ impl Actor {
                 group_id,
                 reply,
             } => {
-                let _ = reply.send(self.join(&client_id, &group_id).await);
+                let r = self.join(&client_id, &group_id).await;
+                self.reply(reply, r);
             }
             Op::Leave { client_id, reply } => {
-                let _ = reply.send(self.leave(&client_id).await);
+                let r = self.leave(&client_id).await;
+                self.reply(reply, r);
             }
             Op::Rename {
                 group_id,
@@ -584,14 +606,15 @@ impl Actor {
                     g.name = name;
                     g.update_all();
                 });
-                let _ = reply.send(r);
+                self.reply(reply, r);
             }
             Op::Play {
                 group_id,
                 source,
                 reply,
             } => {
-                let _ = reply.send(self.play(&group_id, source));
+                let r = self.play(&group_id, source);
+                self.reply(reply, r);
             }
             Op::QueueNext {
                 group_id,
@@ -602,7 +625,7 @@ impl Actor {
                     Some(playing) => Ok(playing.stream.queue_next(source)?),
                     None => Err(GroupError::NotPlaying(group_id.clone())),
                 });
-                let _ = reply.send(r);
+                self.reply(reply, r);
             }
             Op::Stop { group_id, reply } => {
                 let r = match self.group_mut(&group_id) {
@@ -612,7 +635,7 @@ impl Actor {
                     }
                     Err(e) => Err(e),
                 };
-                let _ = reply.send(r);
+                self.reply(reply, r);
             }
             Op::Volume {
                 group_id,
@@ -622,7 +645,7 @@ impl Actor {
                 let r = self
                     .group_mut(&group_id)
                     .map(|g| g.command(PlayerCommand::volume(volume)));
-                let _ = reply.send(r);
+                self.reply(reply, r);
             }
             Op::Mute {
                 group_id,
@@ -632,7 +655,7 @@ impl Actor {
                 let r = self
                     .group_mut(&group_id)
                     .map(|g| g.command(PlayerCommand::mute(mute)));
-                let _ = reply.send(r);
+                self.reply(reply, r);
             }
             Op::SetTransport {
                 group_id,
@@ -640,7 +663,7 @@ impl Actor {
                 reply,
             } => {
                 let r = self.group_mut(&group_id).map(|g| g.transport = transport);
-                let _ = reply.send(r);
+                self.reply(reply, r);
             }
             Op::SetMetadata {
                 group_id,
@@ -652,7 +675,7 @@ impl Actor {
                 let r = self.group_mut(&group_id).map(|g| {
                     g.metadata = metadata.map(|m| Metadata::new(id, now, m));
                 });
-                let _ = reply.send(r);
+                self.reply(reply, r);
             }
             Op::SetArtwork {
                 group_id,
@@ -663,7 +686,7 @@ impl Actor {
                 let r = self.group_mut(&group_id).map(|g| {
                     g.artwork = image.map(|image| Artwork::new(id, image));
                 });
-                let _ = reply.send(r);
+                self.reply(reply, r);
             }
             Op::Command { conn, command } => self.controller_command(conn, command).await,
             Op::Refresh => {}
@@ -688,6 +711,13 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// Answers a call once this op's change is published.
+    fn reply<T: Send + 'static>(&mut self, reply: Reply<T>, r: Result<T, GroupError>) {
+        self.replies.push(Box::new(move || {
+            let _ = reply.send(r);
+        }));
     }
 
     fn connect(&mut self, conn: Arc<Connection>) {
@@ -892,6 +922,13 @@ impl Actor {
             .collect();
         view.member_of.clone_from(&self.member_of);
         view.previous.clone_from(&self.previous);
+        self.changes.send_if_modified(|groups| {
+            if groups.iter().eq(view.groups.values()) {
+                return false;
+            }
+            *groups = view.groups.values().cloned().collect();
+            true
+        });
     }
 }
 
