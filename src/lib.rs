@@ -203,6 +203,17 @@ pub fn host_label(server_id: &str) -> String {
     }
 }
 
+/// The name of the interface `wanted` names, by name or by one of its
+/// addresses, for tools that only take a name. `None` if there is none.
+pub fn interface_name(wanted: &str) -> Option<String> {
+    let interfaces = if_addrs::get_if_addrs().ok()?;
+    let found = match wanted.parse::<IpAddr>() {
+        Ok(ip) => interfaces.into_iter().find(|i| i.ip() == ip),
+        Err(_) => interfaces.into_iter().find(|i| i.name == wanted),
+    };
+    found.map(|i| i.name)
+}
+
 /// Map the configured interface to what mdns-sd matches on, checking it
 /// exists so a typo fails at startup instead of advertising nowhere.
 fn resolve_interface(wanted: &str) -> Result<IfKind> {
@@ -231,6 +242,13 @@ fn resolve_interface(wanted: &str) -> Result<IfKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_name_from_a_name_or_an_address() {
+        assert_eq!(interface_name("lo").as_deref(), Some("lo"));
+        assert_eq!(interface_name("127.0.0.1").as_deref(), Some("lo"));
+        assert_eq!(interface_name("no-such-if0"), None);
+    }
 
     #[test]
     fn host_label_is_a_dns_label() {
