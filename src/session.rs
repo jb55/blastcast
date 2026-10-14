@@ -304,6 +304,14 @@ impl RaopSession {
         self.lock().anchor
     }
 
+    /// When everything pushed so far has played, in server-clock µs, if
+    /// the session is anchored.
+    pub fn played_out_us(&self) -> Option<i64> {
+        let anchor = self.current_anchor()?;
+        let frames = i64::from(self.next_rtp().wrapping_sub(anchor.rtp) as i32);
+        Some(anchor.at_us + frames * 1_000_000 / i64::from(SAMPLE_RATE))
+    }
+
     /// The next frame pushed plays at server-clock `at_us`. Sends a sync
     /// packet now, so the speaker knows before the first audio arrives.
     pub async fn anchor(&mut self, at_us: i64) -> Result<(), SessionError> {
@@ -451,6 +459,11 @@ async fn pace(
     shared: Arc<Mutex<Shared>>,
 ) {
     while let Some(out) = queued.recv().await {
+        // Checked before the wait too, so a flushed queue doesn't hold up
+        // what comes after it.
+        if out.epoch != epoch.load(Ordering::Acquire) {
+            continue;
+        }
         if out.due_us != i64::MIN {
             tokio::time::sleep_until(clock.instant_at(out.due_us)).await;
         }

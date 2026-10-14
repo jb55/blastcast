@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use tas_airplay_out::testing::FakeSpeaker;
 use tas_airplay_out::{AirplayOutputs, RaopDevice};
 use tas_audio::{SESSION_FORMAT, SineSource};
+use tas_core::player::PlaybackState;
 use tas_core::{PlayerCommand, PlayerRegistry};
 use tas_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, ConnectionReason, HeaderLayout,
@@ -213,6 +214,8 @@ async fn plays_a_stream_and_lingers_after_it() {
     s.speaker
         .wait_for("a teardown", WAIT, |l| l.methods().contains(&"TEARDOWN"))
         .await;
+    // It ran out rather than stopped, so there was nothing to flush.
+    assert!(!s.speaker.log().methods().contains(&"FLUSH"));
 }
 
 #[tokio::test]
@@ -294,4 +297,94 @@ async fn leaves_its_group_when_another_sender_takes_the_speaker() {
     .await;
     let p = s.registry.get(AP).unwrap();
     assert!(p.available, "and is free to be picked again");
+}
+
+/// Thirty seconds of a 48 kHz sine, read as far ahead as the speaker's
+/// buffer takes, so the pacer has seconds queued when the stream stops.
+fn half_a_minute_of_sine() -> Box<SineSource> {
+    Box::new(SineSource::new(SESSION_FORMAT, 440.0).limit_frames(30 * 48_000))
+}
+
+impl Setup {
+    /// Asserts that the stream just stopped on the airplay speaker goes
+    /// quiet at once: a FLUSH, no audio after it, and a teardown once the
+    /// session has lingered.
+    async fn goes_quiet(&self, stopped: tokio::time::Instant) {
+        self.speaker
+            .wait_for("a flush", WAIT, |l| l.methods().contains(&"FLUSH"))
+            .await;
+        let flushed = stopped.elapsed();
+        assert!(
+            flushed < Duration::from_millis(500),
+            "flushed {flushed:?} after the stop"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_flush = self.speaker.log().packets.len();
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let later = self.speaker.log().packets.len();
+        assert_eq!(later, after_flush, "audio kept coming after the stop");
+        self.speaker
+            .wait_for("a teardown", WAIT, |l| l.methods().contains(&"TEARDOWN"))
+            .await;
+        let log = self.speaker.log();
+        assert_eq!(
+            log.methods().iter().filter(|m| **m == "FLUSH").count(),
+            1,
+            "{:?}",
+            log.methods()
+        );
+        assert_eq!(log.packets.len(), after_flush, "nothing while it lingered");
+    }
+}
+
+#[tokio::test]
+async fn a_stop_mid_stream_goes_quiet_at_once() {
+    let s = setup().await;
+    s.registry
+        .play_source(AP, half_a_minute_of_sine())
+        .await
+        .unwrap();
+    s.speaker
+        .wait_for("half a second of audio", WAIT, |l| {
+            l.samples().len() / 2 >= 22_050
+        })
+        .await;
+    let stopped = tokio::time::Instant::now();
+    s.registry.execute(AP, PlayerCommand::Stop).await.unwrap();
+    s.goes_quiet(stopped).await;
+}
+
+#[tokio::test]
+async fn ungrouping_mid_stream_goes_quiet_at_once() {
+    let s = setup().await;
+    let sendspin = sendspin_speaker(&s.server, "den").await;
+    s.eventually("den is available", |s| {
+        s.registry.get("den").is_some_and(|p| p.available)
+    })
+    .await;
+    s.registry
+        .set_members("den", &[AP.to_owned()], &[])
+        .await
+        .unwrap();
+    s.registry
+        .play_source("den", half_a_minute_of_sine())
+        .await
+        .unwrap();
+    s.speaker
+        .wait_for("half a second of audio", WAIT, |l| {
+            l.samples().len() / 2 >= 22_050
+        })
+        .await;
+    let stopped = tokio::time::Instant::now();
+    s.registry
+        .set_members("den", &[], &[AP.to_owned()])
+        .await
+        .unwrap();
+    s.goes_quiet(stopped).await;
+    // Den plays on without it.
+    assert!(!sendspin.chunks.lock().unwrap().is_empty());
+    assert_eq!(
+        s.registry.get("den").unwrap().playback_state,
+        PlaybackState::Playing
+    );
 }

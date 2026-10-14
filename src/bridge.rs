@@ -19,6 +19,9 @@
 //! - **The RAOP session** opens on the first chunk and closes
 //!   [`LINGER`] after the stream ends, so a seek or the next track
 //!   doesn't reconnect. Chunks that arrive while it connects are held.
+//! - **A stop** (`stream/end` with audio still ahead) flushes: the queued
+//!   packets are dropped and the speaker clears its buffer, so it goes
+//!   quiet with the Sendspin speakers rather than seconds after them.
 //! - **The output delay** is subtracted from each chunk's timestamp, as
 //!   Sendspin players do: it is how long the speaker itself takes.
 //! - **Another sender** taking the speaker closes our session. The bridge
@@ -330,17 +333,32 @@ impl Bridge {
         }
     }
 
-    /// The stream ended: what is queued goes out, and the session lingers.
+    /// The stream ended, which in Sendspin is a stop: the speaker drops
+    /// what it holds and the session lingers. A stream that ran out ends
+    /// only once it has played, so then there is nothing left to drop.
     async fn end(&mut self) {
         match std::mem::replace(&mut self.output, Output::Idle) {
             Output::Playing(mut session) => {
-                if let Err(e) = session.finish().await {
+                let now = self.ntp.server_clock().now_us();
+                let ahead = session
+                    .played_out_us()
+                    .is_some_and(|at| at > now + MIN_LEAD_US);
+                let r = if ahead {
+                    tracing::debug!("stopped; flushing the airplay speaker");
+                    session.flush().await
+                } else {
+                    session.finish().await
+                };
+                if let Err(e) = r {
                     self.failed(&e);
                     return;
                 }
                 self.output = Output::Lingering(session, Instant::now() + LINGER);
             }
-            // What it holds still plays once it is up.
+            Output::Connecting { task, mut held } => {
+                held.clear();
+                self.output = Output::Connecting { task, held };
+            }
             other => self.output = other,
         }
     }
@@ -449,14 +467,13 @@ impl Bridge {
                 return;
             }
         }
-        if self.streaming {
-            self.output = Output::Playing(session);
-        } else if let Err(e) = session.finish().await {
-            self.failed(&e);
+        self.output = if self.streaming {
+            Output::Playing(session)
         } else {
-            // The stream ended while it connected.
-            self.output = Output::Lingering(session, Instant::now() + LINGER);
-        }
+            // The stream ended while it connected: `end` dropped what it
+            // held, and nothing was sent.
+            Output::Lingering(session, Instant::now() + LINGER)
+        };
     }
 
     /// The speaker closed our session: another sender has it.
