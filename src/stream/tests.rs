@@ -115,7 +115,7 @@ fn audio(q: &mut Queues) -> Vec<(i64, usize)> {
 /// Audio chunks queued so far: (timestamp, payload).
 fn payloads(q: &mut Queues) -> Vec<(i64, Vec<u8>)> {
     let mut out = Vec::new();
-    while let Ok(frame) = q.audio.try_recv() {
+    while let Ok((_, frame)) = q.audio.try_recv() {
         let f = BinaryFrame::decode(&frame, HeaderLayout::Legacy).unwrap();
         assert_eq!(f.kind, binary::AUDIO_CHUNK);
         out.push((f.timestamp_us, f.payload.to_vec()));
@@ -588,4 +588,123 @@ async fn a_request_made_before_the_stream_picks_the_first_format() {
     assert_eq!(stream_start(&mut q).format(), opus(48_000));
     assert!(control(&mut q).is_empty(), "one stream/start, not two");
     stream.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_joiner_is_sent_the_chunks_still_ahead() {
+    let clock = ServerClock::new();
+    let capacity = 20 * CHUNK_BYTES as u64;
+    let (kitchen, mut kq) = named_player(clock, "kitchen", vec![pcm(48_000, 16)], capacity);
+    let (den, mut dq) = named_player(clock, "den", vec![pcm(48_000, 16)], capacity);
+    available(&kitchen, true);
+    available(&den, true);
+    let sine = SineSource::new(SESSION_FORMAT, 440.0);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    stream.add_player(kitchen.clone());
+    sleep_ms(100).await;
+    stream.add_player(den.clone());
+    sleep_ms(1).await;
+
+    // The kitchen's buffer was filled at once, 250 to 650 ms. At 100 ms
+    // the den is sent the part of it at least its 250 ms send-ahead out.
+    assert_eq!(control(&mut dq), ["start"]);
+    let k = payloads(&mut kq);
+    let d = payloads(&mut dq);
+    assert_eq!((k[0].0, k.len()), (250_000, 20));
+    assert_eq!(d[0].0, 350_000);
+    assert_eq!(d[..], k[5..], "the same chunks, to the byte and the µs");
+
+    // Then both are sent the rest together.
+    sleep_ms(200).await;
+    let k = payloads(&mut kq);
+    assert_eq!(k[0].0, 650_000);
+    assert_eq!(payloads(&mut dq), k);
+    stream.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_joiner_takes_only_the_latest_chunks_its_buffer_holds() {
+    let clock = ServerClock::new();
+    let (kitchen, mut kq) = named_player(
+        clock,
+        "kitchen",
+        vec![pcm(48_000, 16)],
+        20 * CHUNK_BYTES as u64,
+    );
+    let (den, mut dq) = named_player(clock, "den", vec![pcm(48_000, 16)], 4 * CHUNK_BYTES as u64);
+    available(&kitchen, true);
+    available(&den, true);
+    let sine = SineSource::new(SESSION_FORMAT, 440.0);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    stream.add_player(kitchen.clone());
+    sleep_ms(100).await;
+    stream.add_player(den.clone());
+    sleep_ms(1).await;
+
+    // Four chunks fit, so the four that end where the stream's cursor is:
+    // what comes next follows them without a gap.
+    let k = payloads(&mut kq);
+    let d = payloads(&mut dq);
+    assert_eq!(d[..], k[16..]);
+    assert_eq!(d[0].0, 570_000);
+    stream.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_joiner_on_a_new_format_is_encoded_from_kept_audio() {
+    let clock = ServerClock::new();
+    let (kitchen, mut kq) = named_player(
+        clock,
+        "kitchen",
+        vec![pcm(48_000, 16)],
+        20 * CHUNK_BYTES as u64,
+    );
+    let (attic, mut aq) = named_player(clock, "attic", vec![flac(16)], 0);
+    available(&kitchen, true);
+    available(&attic, true);
+    let sine = SineSource::new(SESSION_FORMAT, 440.0);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    stream.add_player(kitchen.clone());
+    sleep_ms(100).await;
+    stream.add_player(attic.clone());
+    sleep_ms(1).await;
+
+    let start = stream_start(&mut aq);
+    let k = payloads(&mut kq);
+    let a = payloads(&mut aq);
+    assert_eq!(a[0].0, 350_000);
+    let ts: Vec<i64> = a.iter().map(|c| c.0).collect();
+    assert_eq!(ts, k[5..].iter().map(|c| c.0).collect::<Vec<_>>());
+    // Lossless: the same samples the kitchen plays over the same span.
+    let pcm: Vec<i32> = k[5..]
+        .iter()
+        .flat_map(|(_, p)| {
+            p.chunks(2)
+                .map(|s| i32::from(i16::from_le_bytes([s[0], s[1]])))
+        })
+        .collect();
+    assert_eq!(decode_flac(&start, &a), pcm);
+    stream.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_removed_player_gets_stream_end_even_while_paused() {
+    let clock = ServerClock::new();
+    let (conn, mut q) = player(clock, vec![pcm(48_000, 16)], 0);
+    available(&conn, true);
+    let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    stream.add_player(conn.clone());
+    sleep_ms(30).await;
+    available(&conn, false);
+    sleep_ms(30).await;
+    // Awaiting the removal means the stream has queued all it will.
+    stream.remove_player("kitchen").await;
+    assert_eq!(control(&mut q), ["start", "end"]);
+
+    let ended = stream.ended();
+    stream.stop().await;
+    tokio::time::timeout(Duration::from_secs(1), ended)
+        .await
+        .expect("ended() resolves once the task is gone");
 }

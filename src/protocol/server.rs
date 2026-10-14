@@ -47,6 +47,22 @@ impl ServerMessage {
         })
     }
 
+    /// Whether this starts, clears or ends the player's audio stream, so
+    /// audio queued before it belongs to what it replaces.
+    pub fn restarts_player_stream(&self) -> bool {
+        let names_player = |roles: &Option<Vec<String>>| {
+            roles
+                .as_ref()
+                .is_none_or(|r| r.iter().any(|r| r == "player"))
+        };
+        match self {
+            Self::StreamStart(s) => s.player.is_some(),
+            Self::StreamClear(c) => names_player(&c.roles),
+            Self::StreamEnd(e) => names_player(&e.roles),
+            _ => false,
+        }
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("server messages always serialize")
     }

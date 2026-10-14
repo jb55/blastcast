@@ -35,6 +35,16 @@
 //! [`AudioStream::stop`], removing a player, or the last source running out
 //! once its audio has played.
 //!
+//! **Late joiners.** A player that starts while the stream runs is not
+//! made to wait for the cursor, which a source that isn't live may have
+//! read seconds ahead. It is sent again the chunks already sent to others
+//! that start at least its send-ahead from now, and never less than
+//! [`LATE_JOIN_MIN_LEAD_US`]: as many of the latest as its buffer takes,
+//! then the rest of the stream with everyone. The chunks come from its
+//! format's [`Encoding`], or, for a format nobody was on, are encoded
+//! afresh from the session audio kept for that. This is aiosendspin's
+//! catch-up (`push_stream.py`, `LATE_JOINER_MIN_LEAD_US`).
+//!
 //! **Formats.** Each player is sent the first format in its hello's list
 //! that the server encodes, preferring one at the session rate (see
 //! [`pick_format`]): PCM, FLAC or Opus. Players on the same format share
@@ -55,7 +65,7 @@ use bytes::Bytes;
 use tas_audio::{
     AudioError, LiveSource, SESSION_FORMAT, ServerClock, Span, Timeline, to_session_format,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 pub use buffer::{BufferTracker, DEFAULT_CAPACITY_BYTES, MAX_BUFFERED_US};
@@ -96,6 +106,12 @@ pub fn send_ahead_us(timing: &PlayerTiming, live: bool) -> i64 {
     (buffer_ms + i64::from(timing.output_delay_ms)) * 1000
 }
 
+/// The least lead a late joiner's first chunk is sent with:
+/// aiosendspin's `LATE_JOINER_MIN_LEAD_US`. It is below
+/// [`DEFAULT_SEND_AHEAD_US`] so a stream running at that send-ahead always
+/// has a chunk this far ahead to replay.
+pub const LATE_JOIN_MIN_LEAD_US: i64 = 100_000;
+
 const PLAYER_ROLE: &str = "player";
 
 /// A running stream. Commands are queued to its task; dropping the handle
@@ -103,11 +119,13 @@ const PLAYER_ROLE: &str = "player";
 pub struct AudioStream {
     commands: mpsc::UnboundedSender<Command>,
     task: JoinHandle<()>,
+    /// Closed when the task ends.
+    ended: watch::Receiver<()>,
 }
 
 enum Command {
     Add(Arc<Connection>),
-    Remove(String),
+    Remove(String, oneshot::Sender<()>),
     Seek(Box<dyn LiveSource>),
     Queue(Box<dyn LiveSource>),
     Stop,
@@ -119,7 +137,10 @@ impl AudioStream {
     pub fn start(clock: ServerClock, source: Box<dyn LiveSource>) -> Result<Self, AudioError> {
         let source = to_session_format(source)?;
         let (commands, rx) = mpsc::unbounded_channel();
+        let (ended_tx, ended) = watch::channel(());
         let streamer = Streamer {
+            _ended: ended_tx,
+            history: VecDeque::new(),
             clock,
             live: source.is_live(),
             feed: Some(Feed::spawn(source)),
@@ -131,7 +152,11 @@ impl AudioStream {
             wake_us: None,
         };
         let task = tokio::spawn(streamer.run(rx));
-        Ok(Self { commands, task })
+        Ok(Self {
+            commands,
+            task,
+            ended,
+        })
     }
 
     /// Streams to `conn` from the next chunk on. A player already in the
@@ -140,9 +165,13 @@ impl AudioStream {
         let _ = self.commands.send(Command::Add(conn));
     }
 
-    /// Stops streaming to a player, sending it `stream/end`.
-    pub fn remove_player(&self, client_id: impl Into<String>) {
-        let _ = self.commands.send(Command::Remove(client_id.into()));
+    /// Stops streaming to a player, sending it `stream/end` if it had a
+    /// `stream/start`. Await the result to know the stream will queue
+    /// nothing more for it, before another stream starts on it.
+    pub fn remove_player(&self, client_id: impl Into<String>) -> Removed {
+        let (done, rx) = oneshot::channel();
+        let _ = self.commands.send(Command::Remove(client_id.into(), done));
+        Removed(rx)
     }
 
     /// Jumps to `source`: the players drop what they hold (`stream/clear`)
@@ -172,10 +201,32 @@ impl AudioStream {
         let _ = (&mut self.task).await;
     }
 
+    /// Resolves once the stream has ended, however it ended, without
+    /// holding the stream.
+    pub fn ended(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut ended = self.ended.clone();
+        async move { while ended.changed().await.is_ok() {} }
+    }
+
     /// Stops now: every player gets `stream/end` and drops what it holds.
     pub async fn stop(mut self) {
         let _ = self.commands.send(Command::Stop);
         self.finished().await;
+    }
+}
+
+/// What [`AudioStream::remove_player`] returns: resolves once the stream
+/// has let go of the player, or has ended.
+pub struct Removed(oneshot::Receiver<()>);
+
+impl Future for Removed {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        std::pin::Pin::new(&mut self.0).poll(cx).map(|_| ())
     }
 }
 
@@ -189,6 +240,9 @@ struct Output {
     requests: watch::Receiver<Option<RequestFormatPlayer>>,
     /// It has had `stream/start` and is being sent audio.
     started: bool,
+    /// It has had `stream/start` and no `stream/end` since. A player that
+    /// went unavailable is paused, not started, but still open.
+    open: bool,
 }
 
 impl Output {
@@ -210,6 +264,7 @@ impl Output {
         }));
         self.tracker = BufferTracker::new(self.conn.player_status().timing.buffer_capacity);
         self.started = true;
+        self.open = true;
         tracing::info!(
             client_id = self.conn.client_id(),
             format = ?encoder.format(),
@@ -218,13 +273,14 @@ impl Output {
     }
 
     fn end(&mut self) {
-        if self.started {
+        if self.open {
             self.send_control(ServerMessage::StreamEnd(StreamEnd {
                 server_transmitted: None,
                 roles: Some(vec![PLAYER_ROLE.into()]),
             }));
-            self.started = false;
         }
+        self.started = false;
+        self.open = false;
     }
 
     /// Answers a `stream/request-format` that came since the last look.
@@ -268,6 +324,9 @@ struct Encoding {
     /// It has a started player and is being encoded. One that stops is
     /// reset and placed afresh when a player starts on it again.
     running: bool,
+    /// The chunks encoded that start at least [`LATE_JOIN_MIN_LEAD_US`]
+    /// from now, oldest first, for late joiners.
+    sent: VecDeque<(Span, Bytes)>,
 }
 
 impl Encoding {
@@ -284,6 +343,7 @@ impl Encoding {
             encoder: Encoder::new(format)?,
             timeline: Timeline::new(0, format.sample_rate),
             running: false,
+            sent: VecDeque::new(),
         });
         Ok(encodings.len() - 1)
     }
@@ -293,7 +353,45 @@ impl Encoding {
         self.encoder.reset();
         self.timeline = Timeline::new(at_us - self.encoder.delay_us(), self.format().sample_rate);
         self.running = true;
+        self.sent.clear();
     }
+
+    /// Encodes a chunk of session audio and keeps it for late joiners.
+    /// `None` when the encoder had nothing whole to give yet, or failed.
+    fn encode(&mut self, samples: &[f32]) -> Option<(Bytes, Span)> {
+        let (bytes, frames) = match self.encoder.encode(samples) {
+            Ok(encoded) => encoded,
+            Err(e) => {
+                tracing::warn!(format = ?self.format(), error = %e, "encoding failed, chunk dropped");
+                return None;
+            }
+        };
+        if frames == 0 {
+            return None;
+        }
+        let span = self.timeline.advance(frames as u64);
+        let bytes = Bytes::from(bytes);
+        self.sent.push_back((span, bytes.clone()));
+        Some((bytes, span))
+    }
+}
+
+/// How many of the newest of `chunks` (bytes, span), given oldest first,
+/// fit together into an empty buffer of `capacity_bytes`.
+fn fitting_tail<'a>(
+    chunks: impl DoubleEndedIterator<Item = (u64, &'a Span)>,
+    capacity_bytes: u64,
+) -> usize {
+    let mut room = BufferTracker::new(capacity_bytes);
+    let mut n = 0;
+    for (bytes, span) in chunks.rev() {
+        if !room.can_send(bytes, span.duration_us) {
+            break;
+        }
+        room.register(span.end_us(), bytes, span.duration_us);
+        n += 1;
+    }
+    n
 }
 
 enum Event {
@@ -304,6 +402,12 @@ enum Event {
 
 /// The stream task's state.
 struct Streamer {
+    /// Dropped with the task, which is how [`AudioStream::ended`] hears.
+    _ended: watch::Sender<()>,
+    /// The session audio sent that starts at least
+    /// [`LATE_JOIN_MIN_LEAD_US`] from now, oldest first, for a late joiner
+    /// on a format no other player is on.
+    history: VecDeque<(Span, Vec<f32>)>,
     clock: ServerClock,
     /// Whether the source being read is live, from its latest chunk.
     live: bool,
@@ -364,11 +468,19 @@ impl Streamer {
 
     fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Add(conn) => self.add(conn),
-            Command::Remove(client_id) => {
+            Command::Add(conn) => {
+                self.add(conn);
+                // A chunk waiting for room may wait a while; the new player
+                // starts and catches up now.
+                if self.pending.is_some() {
+                    self.pump();
+                }
+            }
+            Command::Remove(client_id, done) => {
                 if let Some(i) = self.position(&client_id) {
                     self.outputs.remove(i).end();
                 }
+                let _ = done.send(());
             }
             Command::Seek(source) => {
                 self.queued.clear();
@@ -376,6 +488,7 @@ impl Streamer {
                 self.pending = None;
                 self.wake_us = None;
                 self.timeline = None;
+                self.history.clear();
                 for out in self.outputs.iter_mut().filter(|o| o.started) {
                     out.send_control(ServerMessage::StreamClear(StreamClear {
                         server_transmitted: None,
@@ -385,6 +498,7 @@ impl Streamer {
                 }
                 for encoding in &mut self.encodings {
                     encoding.encoder.reset();
+                    encoding.sent.clear();
                 }
             }
             Command::Queue(source) => {
@@ -458,6 +572,7 @@ impl Streamer {
             requests,
             conn,
             started: false,
+            open: false,
         };
         match self.position(&client_id) {
             Some(i) => {
@@ -502,24 +617,17 @@ impl Streamer {
         }
         self.wake_us = None;
         let samples = self.pending.take().expect("checked above");
-        self.timeline
+        let session_span = self
+            .timeline
             .as_mut()
             .expect("placed above")
             .advance(frames as u64);
         let live = self.live;
         for encoding in self.encodings.iter_mut().filter(|e| e.running) {
             let format = encoding.format();
-            let (bytes, frames) = match encoding.encoder.encode(&samples) {
-                Ok(encoded) => encoded,
-                Err(e) => {
-                    tracing::warn!(?format, error = %e, "encoding failed, chunk dropped");
-                    continue;
-                }
-            };
-            if frames == 0 {
+            let Some((bytes, span)) = encoding.encode(&samples) else {
                 continue;
-            }
-            let span = encoding.timeline.advance(frames as u64);
+            };
             for out in self
                 .outputs
                 .iter_mut()
@@ -528,6 +636,7 @@ impl Streamer {
                 send_chunk(out, &bytes, span, now, live);
             }
         }
+        self.history.push_back((session_span, samples));
     }
 
     /// Starts the timeline at `floor`, or shifts it, and every running
@@ -563,22 +672,33 @@ impl Streamer {
     /// once no player has its format.
     fn sync_outputs(&mut self, now: i64) {
         self.outputs.retain(|o| !o.conn.is_closed());
+        // Nothing older can be replayed: a late joiner's lead is at least this.
+        let replayable = now + LATE_JOIN_MIN_LEAD_US;
+        while self
+            .history
+            .front()
+            .is_some_and(|(span, _)| span.start_us < replayable)
+        {
+            self.history.pop_front();
+        }
+        for encoding in &mut self.encodings {
+            while encoding
+                .sent
+                .front()
+                .is_some_and(|(span, _)| span.start_us < replayable)
+            {
+                encoding.sent.pop_front();
+            }
+        }
         let cursor = self.timeline.as_ref().map_or(now, Timeline::cursor_us);
-        for out in &mut self.outputs {
+        for i in 0..self.outputs.len() {
+            let out = &mut self.outputs[i];
             out.take_request(&mut self.encodings);
             let available = out.conn.is_available();
             if available && !out.started {
-                let i = self
-                    .encodings
-                    .iter()
-                    .position(|e| e.format() == out.format)
-                    .expect("added with its output");
-                let encoding = &mut self.encodings[i];
-                if !encoding.running {
-                    encoding.run(cursor);
-                }
-                out.start(encoding);
+                self.start_output(i, cursor, now);
             } else if !available && out.started {
+                let out = &mut self.outputs[i];
                 // Its output was taken by something else; the client
                 // stopped on its own. It gets stream/start if it returns.
                 tracing::info!(
@@ -587,7 +707,7 @@ impl Streamer {
                 );
                 out.started = false;
             }
-            out.tracker.prune(now);
+            self.outputs[i].tracker.prune(now);
         }
         let outputs = &self.outputs;
         self.encodings
@@ -596,6 +716,76 @@ impl Streamer {
             encoding.running &= outputs
                 .iter()
                 .any(|o| o.started && o.format == encoding.format());
+        }
+    }
+
+    /// Sends `stream/start` to output `i` and catches it up: the chunks
+    /// already encoded in its format that start at least its send-ahead
+    /// from now, as many of the latest as its buffer holds. A format that
+    /// isn't running starts at the first such chunk of session audio kept,
+    /// or at the shared `cursor` when there is none, and encodes the kept
+    /// audio from there.
+    fn start_output(&mut self, i: usize, cursor: i64, now: i64) {
+        let Self {
+            outputs,
+            encodings,
+            history,
+            live,
+            ..
+        } = self;
+        let live = *live;
+        let out = &mut outputs[i];
+        let encoding = encodings
+            .iter_mut()
+            .find(|e| e.format() == out.format)
+            .expect("added with its output");
+        let lead = send_ahead_us(&out.conn.player_status().timing, live);
+        let target = now + lead.max(LATE_JOIN_MIN_LEAD_US);
+
+        if encoding.running {
+            out.start(encoding);
+            let first = encoding.sent.partition_point(|(s, _)| s.start_us < target);
+            let chunks = encoding.sent.range(first..);
+            let n = fitting_tail(
+                chunks.map(|(span, bytes)| (bytes.len() as u64, span)),
+                out.tracker.capacity_bytes(),
+            );
+            for (span, bytes) in encoding.sent.range(encoding.sent.len() - n..) {
+                send_chunk(out, bytes, *span, now, live);
+            }
+            return;
+        }
+
+        let first = history.partition_point(|(s, _)| s.start_us < target);
+        let capacity = out.conn.player_status().timing.buffer_capacity;
+        let n = fitting_tail(
+            history.range(first..).map(|(span, samples)| {
+                let frames = samples.len() / usize::from(SESSION_FORMAT.channels);
+                (encoding.encoder.estimate_bytes(frames) as u64, span)
+            }),
+            capacity,
+        );
+        let replay = history.range(history.len() - n..);
+        let mut at = history
+            .get(history.len() - n)
+            .map_or(cursor, |(s, _)| s.start_us);
+        encoding.run(at);
+        out.start(encoding);
+        for (span, samples) in replay {
+            // A shift left a gap in the kept audio; the format's timeline
+            // takes the same gap.
+            if span.start_us != at {
+                let cursor = encoding.timeline.cursor_us();
+                encoding.timeline.rebase(cursor + span.start_us - at);
+            }
+            at = span.end_us();
+            if let Some((bytes, span)) = encoding.encode(samples) {
+                send_chunk(out, &bytes, span, now, live);
+            }
+        }
+        if at != cursor {
+            let c = encoding.timeline.cursor_us();
+            encoding.timeline.rebase(c + cursor - at);
         }
     }
 

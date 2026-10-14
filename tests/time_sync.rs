@@ -188,6 +188,13 @@ async fn handshake(url: &str) -> Client {
         ServerMessage::decode(&text).unwrap(),
         ServerMessage::Hello(_)
     ));
+    let Some(Ok(Message::Text(text))) = ws.next().await else {
+        panic!("expected group/update");
+    };
+    assert!(matches!(
+        ServerMessage::decode(&text).unwrap(),
+        ServerMessage::GroupUpdate(_)
+    ));
     ws
 }
 

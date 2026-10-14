@@ -7,7 +7,7 @@
 //! `client/goodbye`, closes, or goes quiet for two ping intervals. A client
 //! with the player role is a player in the [`PlayerRegistry`] for as long as
 //! it is connected; a second connection with the same `client_id` replaces
-//! the first.
+//! the first. Every client is in one [`Groups`] group from its hello on.
 //!
 //! Clock sync is the server's half of NTP: each `client/time` is answered
 //! with `server/time`, `server_received` read as the frame arrives and
@@ -34,6 +34,7 @@ use tokio::net::TcpListener;
 use tokio::time::timeout;
 
 use crate::connection::{Connection, Frame, write_loop};
+use crate::group::Groups;
 use crate::player::SendspinPlayer;
 use crate::protocol::{
     ClientHello, ClientMessage, ClientState, ClientTime, ConnectionReason, DecodeError,
@@ -142,6 +143,7 @@ pub struct SendspinServer {
     config: ServerConfig,
     registry: Arc<PlayerRegistry>,
     connections: Mutex<HashMap<String, Arc<Connection>>>,
+    groups: Groups,
 }
 
 impl fmt::Debug for SendspinServer {
@@ -154,8 +156,10 @@ impl fmt::Debug for SendspinServer {
 }
 
 impl SendspinServer {
+    /// Call it inside a Tokio runtime: the groups run on a task of their own.
     pub fn new(config: ServerConfig, registry: Arc<PlayerRegistry>) -> Arc<Self> {
         Arc::new(Self {
+            groups: Groups::new(config.clock),
             config,
             registry,
             connections: Mutex::new(HashMap::new()),
@@ -164,6 +168,11 @@ impl SendspinServer {
 
     pub fn config(&self) -> &ServerConfig {
         &self.config
+    }
+
+    /// The groups every connected client is in.
+    pub fn groups(&self) -> &Groups {
+        &self.groups
     }
 
     /// Accepts websocket connections on [`PATH`] until the listener fails.
@@ -244,6 +253,7 @@ impl SendspinServer {
 
         self.read_loop(&conn, &mut stream).await;
         conn.close();
+        self.groups.disconnect(conn.clone());
         let _ = writer.await;
         let replaced = !self.unregister(&conn);
         tracing::info!(
@@ -412,10 +422,10 @@ impl SendspinServer {
         }
         if change.became_unavailable {
             // Its output is taken. The audio gate already holds its stream
-            // back; leaving its group to a stopped solo group is the group
-            // layer's, which watches the status for this edge. It is never
-            // rejoined automatically when it comes back.
+            // back; the groups move it to a stopped group of its own, and
+            // never back when it returns.
             tracing::info!(client_id, "client became unavailable");
+            self.groups.unavailable(conn.clone());
         }
         if change.changed && conn.has_role("player") && self.is_current(conn) {
             let status = conn.player_status();
@@ -435,6 +445,8 @@ impl SendspinServer {
             old.close();
             self.remove_player(client_id);
         }
+        // After server/hello, which is already queued.
+        self.groups.connect(conn.clone());
         if conn.has_role("player") {
             // Unavailable until its first client/state says otherwise.
             let mut state = PlayerState::new(client_id, PROVIDER, conn.name());
@@ -560,8 +572,8 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    #[test]
-    fn activates_the_first_supported_version_of_each_family() {
+    #[tokio::test]
+    async fn activates_the_first_supported_version_of_each_family() {
         let s = server(&["player@v1", "metadata@v1"]);
         let got = s.activate_roles(&strings(&[
             "player@v2",
@@ -574,8 +586,8 @@ mod tests {
         assert_eq!(got, ["player@v1", "metadata@v1"]);
     }
 
-    #[test]
-    fn a_bare_legacy_role_is_echoed_as_written() {
+    #[tokio::test]
+    async fn a_bare_legacy_role_is_echoed_as_written() {
         let s = server(&["player@v1"]);
         assert_eq!(s.activate_roles(&strings(&["player"])), ["player"]);
         assert!(s.activate_roles(&strings(&["artwork@v1"])).is_empty());

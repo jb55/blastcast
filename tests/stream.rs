@@ -104,6 +104,10 @@ async fn player_with(url: &str, supported_formats: Vec<StreamFormat>) -> Client 
     }));
     send(&mut ws, &hello).await;
     assert!(matches!(next_text(&mut ws).await, ServerMessage::Hello(_)));
+    assert!(matches!(
+        next_text(&mut ws).await,
+        ServerMessage::GroupUpdate(_)
+    ));
     let state = ClientState {
         available: Some(true),
         ..Default::default()

@@ -3,6 +3,7 @@
 
 pub mod connection;
 pub mod dialer;
+pub mod group;
 pub mod player;
 pub mod protocol;
 pub mod server;
@@ -11,6 +12,7 @@ pub mod stream;
 
 pub use connection::{Connection, Frame, SendError};
 pub use dialer::{Dialer, DialerConfig};
+pub use group::{GroupError, GroupInfo, Groups};
 pub use player::SendspinPlayer;
 pub use server::{Disconnect, HandshakeError, SendspinServer, ServerConfig};
 pub use status::{PlayerStatus, PlayerTiming, StatusChange};

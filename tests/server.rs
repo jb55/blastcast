@@ -10,8 +10,8 @@ use futures_util::{SinkExt, StreamExt};
 use tas_core::{CommandError, PlayerCommand as Cmd, PlayerFeature, PlayerRegistry};
 use tas_sendspin::protocol::{
     ClientGoodbye, ClientHello, ClientMessage, ClientState, ConnectionReason, GoodbyeReason,
-    PlayerCommand, PlayerCommandKind, PlayerStateReport, PlayerSupport, PlayerSyncState,
-    ServerCommand, ServerMessage,
+    PlaybackState, PlayerCommand, PlayerCommandKind, PlayerStateReport, PlayerSupport,
+    PlayerSyncState, ServerCommand, ServerMessage,
 };
 use tas_sendspin::{
     Disconnect, Frame, PlayerTiming, SendError, SendspinPlayer, SendspinServer, ServerConfig,
@@ -100,12 +100,38 @@ async fn next_server_message(ws: &mut Client) -> ServerMessage {
 }
 
 /// Connects and completes the hello, returning the client and its
-/// `server/hello`.
+/// `server/hello`. The `group/update` of the client's own group, which
+/// follows it, is checked and read.
 async fn handshake(url: &str, client_id: &str, roles: &[&str]) -> (Client, ServerMessage) {
     let mut ws = connect(url).await;
     send(&mut ws, &hello(client_id, roles)).await;
     let reply = next_server_message(&mut ws).await;
+    if matches!(reply, ServerMessage::Hello(_)) {
+        read_group_update(&mut ws, client_id).await;
+    }
     (ws, reply)
+}
+
+/// Reads `server/hello` and the `group/update` after it.
+async fn read_hello(ws: &mut Client) {
+    let ServerMessage::Hello(_) = next_server_message(ws).await else {
+        panic!("expected server/hello");
+    };
+    let ServerMessage::GroupUpdate(_) = next_server_message(ws).await else {
+        panic!("expected group/update after server/hello");
+    };
+}
+
+/// Reads the `group/update` of a client's own group, sent on connect.
+async fn read_group_update(ws: &mut Client, client_id: &str) {
+    let ServerMessage::GroupUpdate(update) = next_server_message(ws).await else {
+        panic!("expected group/update after server/hello");
+    };
+    assert_eq!(update.playback_state, Some(PlaybackState::Stopped));
+    assert_eq!(
+        update.group_name.as_deref(),
+        Some(&*format!("{client_id} name"))
+    );
 }
 
 async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
@@ -303,6 +329,13 @@ async fn run_connection_reports_the_goodbye() {
         panic!("expected server/hello");
     };
     assert_eq!(reply.connection_reason, ConnectionReason::Discovery);
+    let Some(Frame::Text(update)) = from_server.next().await else {
+        panic!("expected group/update");
+    };
+    assert!(matches!(
+        ServerMessage::decode(&update).unwrap(),
+        ServerMessage::GroupUpdate(_)
+    ));
 
     to_server
         .unbounded_send(text(ClientMessage::Goodbye(ClientGoodbye {
@@ -396,7 +429,7 @@ async fn volume_and_mute_follow_the_players_reports() {
         ),
     )
     .await;
-    next_server_message(&mut ws).await;
+    read_hello(&mut ws).await;
     let p = h.registry.get("kitchen").unwrap();
     assert!(p.supports(PlayerFeature::VolumeSet) && p.supports(PlayerFeature::VolumeMute));
 
@@ -469,7 +502,7 @@ async fn timing_and_the_output_delay_command() {
     let h = start(config()).await;
     let mut ws = connect(&h.url).await;
     send(&mut ws, &hello_with_commands("den", &[])).await;
-    next_server_message(&mut ws).await;
+    read_hello(&mut ws).await;
     let conn = h.server.connection("den").unwrap();
     let mut watch = conn.watch_player_status();
 
@@ -561,7 +594,7 @@ async fn an_unavailable_player_gets_no_audio_or_commands() {
         &hello_with_commands("kitchen", &[PlayerCommandKind::Volume]),
     )
     .await;
-    next_server_message(&mut ws).await;
+    read_hello(&mut ws).await;
     let conn = h.server.connection("kitchen").unwrap();
     send(&mut ws, &state(true, volume(50, false))).await;
     eventually("available", || conn.is_available()).await;

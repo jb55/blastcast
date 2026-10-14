@@ -8,9 +8,15 @@
 //! until the socket can take a frame, then stamps `server_transmitted` from
 //! the server clock and writes it, as the spec's transmit-timestamp rule
 //! asks.
+//!
+//! Because control overtakes audio, a `stream/start`, `stream/clear` or
+//! `stream/end` for the player would otherwise be followed by chunks queued
+//! before it, from the stream it replaces. Each of those messages starts a
+//! new audio epoch when it is queued, and the writer drops chunks queued in
+//! an older one.
 
 use std::fmt::Display;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -65,7 +71,10 @@ pub struct Connection {
     clock: ServerClock,
     layout: Mutex<HeaderLayout>,
     control: mpsc::Sender<ServerMessage>,
-    audio: mpsc::Sender<Bytes>,
+    audio: mpsc::Sender<(u64, Bytes)>,
+    /// Bumped by each player `stream/start`, `stream/clear` and
+    /// `stream/end`; audio is queued tagged with it.
+    audio_epoch: AtomicU64,
     /// Set by the first `client/state`. Audio waits for it.
     ready: AtomicBool,
     status: watch::Sender<PlayerStatus>,
@@ -79,7 +88,7 @@ pub struct Connection {
 /// The receiving ends of a connection's queues, for its writer.
 pub(crate) struct Queues {
     pub(crate) control: mpsc::Receiver<ServerMessage>,
-    pub(crate) audio: mpsc::Receiver<Bytes>,
+    pub(crate) audio: mpsc::Receiver<(u64, Bytes)>,
 }
 
 impl Connection {
@@ -102,6 +111,7 @@ impl Connection {
             layout: Mutex::new(HeaderLayout::Legacy),
             control,
             audio,
+            audio_epoch: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             status,
             format_request: watch::channel(None).0,
@@ -234,6 +244,9 @@ impl Connection {
     /// Queues a control message. A client too far behind to take it is
     /// disconnected.
     pub fn send(&self, msg: ServerMessage) -> Result<(), SendError> {
+        if msg.restarts_player_stream() {
+            self.audio_epoch.fetch_add(1, Ordering::AcqRel);
+        }
         match self.control.try_send(msg) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(SendError::Closed),
@@ -261,10 +274,18 @@ impl Connection {
         if !self.is_available() {
             return Err(SendError::Unavailable);
         }
-        self.audio.try_send(frame).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => SendError::Full,
-            mpsc::error::TrySendError::Closed(_) => SendError::Closed,
-        })
+        self.audio
+            .try_send((self.audio_epoch(), frame))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => SendError::Full,
+                mpsc::error::TrySendError::Closed(_) => SendError::Closed,
+            })
+    }
+
+    /// The epoch audio queued now is tagged with; the writer drops frames
+    /// of an older one.
+    pub(crate) fn audio_epoch(&self) -> u64 {
+        self.audio_epoch.load(Ordering::Acquire)
     }
 
     /// How many more binary frames the audio queue takes before
@@ -313,7 +334,12 @@ pub(crate) async fn write_loop<Si>(
             biased;
             _ = closed.wait_for(|c| *c) => break,
             Some(msg) = queues.control.recv() => Next::Control(msg),
-            Some(chunk) = queues.audio.recv() => Next::Frame(Frame::Binary(chunk)),
+            Some((epoch, chunk)) = queues.audio.recv() => {
+                if epoch != conn.audio_epoch() {
+                    continue;
+                }
+                Next::Frame(Frame::Binary(chunk))
+            }
             _ = ping.tick() => Next::Frame(Frame::Ping(Bytes::new())),
         };
         let write = async {
@@ -362,7 +388,7 @@ enum Next {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ServerHello, ServerTime, StreamClear};
+    use crate::protocol::{ServerHello, ServerTime, StreamClear, StreamEnd};
     use futures_util::StreamExt;
 
     fn conn(roles: &[&str]) -> (Connection, Queues) {
@@ -480,6 +506,42 @@ mod tests {
         assert!(text_at <= 2, "control written at {text_at}: {frames:?}");
         c.close();
         assert_eq!(socket.next().await, Some(Frame::Close));
+        writer.await.unwrap();
+    }
+
+    /// Audio queued before a `stream/end` belongs to the stream it ends,
+    /// so it is dropped rather than written after it. Audio queued after
+    /// it goes out.
+    #[tokio::test]
+    async fn a_stream_end_drops_the_audio_queued_before_it() {
+        let (c, q) = conn(&["player@v1"]);
+        c.apply_state(&state(true));
+        c.send_audio(Bytes::from_static(b"old")).unwrap();
+        c.send(ServerMessage::StreamEnd(StreamEnd::default()))
+            .unwrap();
+        c.send_audio(Bytes::from_static(b"new")).unwrap();
+        // Not the player's stream: the epoch stays.
+        c.send(ServerMessage::StreamClear(StreamClear {
+            server_transmitted: None,
+            roles: Some(vec!["visualizer".into()]),
+        }))
+        .unwrap();
+        let (sink, mut socket) = futures_channel::mpsc::unbounded::<Frame>();
+        let c = std::sync::Arc::new(c);
+        let writer = {
+            let c = c.clone();
+            tokio::spawn(async move {
+                write_loop(&c, sink, q, Duration::from_secs(60), Duration::from_secs(5)).await
+            })
+        };
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            frames.push(socket.next().await.unwrap());
+        }
+        assert!(matches!(&frames[0], Frame::Text(t) if t.contains("stream/end")));
+        assert!(matches!(&frames[1], Frame::Text(t) if t.contains("stream/clear")));
+        assert_eq!(frames[2], Frame::Binary(Bytes::from_static(b"new")));
+        c.close();
         writer.await.unwrap();
     }
 
