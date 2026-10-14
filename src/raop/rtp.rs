@@ -90,17 +90,6 @@ pub fn timing_reply(request: &[u8], now: u64) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// The wall clock as NTP time: 32 bits of seconds since 1900, 32 of
-/// fraction.
-pub fn ntp_now() -> u64 {
-    const NTP_UNIX_OFFSET_S: u64 = 2_208_988_800;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let frac = (u64::from(now.subsec_nanos()) << 32) / 1_000_000_000;
-    ((now.as_secs() + NTP_UNIX_OFFSET_S) << 32) | frac
-}
-
 #[cfg(test)]
 mod tests {
     use tas_airplay_out::rtp as sender;

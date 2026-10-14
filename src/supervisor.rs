@@ -135,8 +135,10 @@ pub trait ReceiverHandler: Send + Sync + 'static {
     /// What a native receiver's sender said, already parsed.
     fn event(&self, _receiver: &ReceiverInfo, _event: &MetadataEvent) {}
     /// A native receiver's audio, in real time: s16 44.1 kHz stereo, as
-    /// shairport-sync writes its fifo.
-    fn audio(&self, _receiver: &ReceiverInfo, _chunk: &PcmChunk) {}
+    /// shairport-sync writes its fifo. `play_at_us` is when the sender
+    /// means its first frame to play, on the server clock, once the
+    /// receiver knows ([`crate::raop::clock`]).
+    fn audio(&self, _receiver: &ReceiverInfo, _chunk: &PcmChunk, _play_at_us: Option<i64>) {}
     /// The run ended; its fifos are about to be removed.
     fn stopped(&self, _receiver: &ReceiverInfo) {}
 }
@@ -156,8 +158,9 @@ impl ReceiverHandler for Vec<Arc<dyn ReceiverHandler>> {
     fn event(&self, receiver: &ReceiverInfo, event: &MetadataEvent) {
         self.iter().for_each(|h| h.event(receiver, event));
     }
-    fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk) {
-        self.iter().for_each(|h| h.audio(receiver, chunk));
+    fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, play_at_us: Option<i64>) {
+        self.iter()
+            .for_each(|h| h.audio(receiver, chunk, play_at_us));
     }
     fn stopped(&self, receiver: &ReceiverInfo) {
         self.iter().for_each(|h| h.stopped(receiver));
@@ -1037,7 +1040,11 @@ echo "connection from 10.0.0.9" >&2
         let state = Arc::new(StateStore::open(dir.path()).unwrap());
         let registry = Arc::new(PlayerRegistry::default());
         let recorder = Arc::new(Recorder::default());
-        let config = SupervisorConfig::native(NativeConfig::new(state.server_id(), None));
+        let config = SupervisorConfig::native(NativeConfig::new(
+            state.server_id(),
+            tas_audio::ServerClock::new(),
+            None,
+        ));
         let sup =
             ReceiverSupervisor::new(config, registry.clone(), state.clone(), recorder.clone())
                 .unwrap();

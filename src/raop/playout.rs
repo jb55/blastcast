@@ -6,8 +6,9 @@
 //! the window a lost packet has to be sent again, and what reordering and
 //! Wi-Fi jitter may cost. It is not the sender's two seconds: a sender
 //! sends each packet as it plays on its own clock, so the audio comes out
-//! the latency after it was sent, not two seconds after. (The sender's
-//! own timeline, which video lip sync needs, is not followed.)
+//! the latency after it was sent, not two seconds after. The sender's own
+//! timeline, which video lip sync needs, is kept beside this: each
+//! [`Played`] carries its RTP time for [`crate::raop::clock`] to place.
 //!
 //! **What is played.** Packets are placed by RTP time, unwrapped across
 //! 2^32, so order and duplicates don't matter. When a frame's time comes:
@@ -67,6 +68,14 @@ pub enum Inserted {
 
 /// Interleaved stereo s16 frames, ready to play.
 pub type Frames = Vec<i16>;
+
+/// Frames played, and the sender's RTP time of the first, by which the
+/// sender's timeline places them ([`crate::raop::clock`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Played {
+    pub rtp: u32,
+    pub frames: Frames,
+}
 
 #[derive(Debug)]
 pub struct Playout {
@@ -232,7 +241,7 @@ impl Playout {
     }
 
     /// Everything due by `now`, in order.
-    pub fn pop_due(&mut self, now: Instant) -> Vec<Frames> {
+    pub fn pop_due(&mut self, now: Instant) -> Vec<Played> {
         let mut out = Vec::new();
         while let Some(head) = self.playhead {
             let due = head.due();
@@ -255,17 +264,21 @@ impl Playout {
                     continue;
                 }
                 let n = gap.min(SILENCE_FRAMES);
+                out.push(Played {
+                    rtp: head.rtp as u32,
+                    frames: vec![0; n as usize * CHANNELS],
+                });
                 head.rtp += n;
                 head.played += n as u64;
-                out.push(vec![0; n as usize * CHANNELS]);
                 continue;
             }
             let (_, mut frames) = self.packets.pop_first().expect("checked above");
             let n = (frames.len() / CHANNELS) as i64;
             self.drift.correct(&mut frames);
+            let rtp = head.rtp as u32;
             head.rtp += n;
             head.played += (frames.len() / CHANNELS) as u64;
-            out.push(frames);
+            out.push(Played { rtp, frames });
         }
         out
     }
@@ -287,8 +300,11 @@ mod tests {
     }
 
     /// The first sample of each chunk, and its frame count.
-    fn summary(chunks: &[Frames]) -> Vec<(i16, usize)> {
-        chunks.iter().map(|c| (c[0], c.len() / CHANNELS)).collect()
+    fn summary(chunks: &[Played]) -> Vec<(i16, usize)> {
+        chunks
+            .iter()
+            .map(|c| (c.frames[0], c.frames.len() / CHANNELS))
+            .collect()
     }
 
     #[test]
@@ -331,10 +347,11 @@ mod tests {
         let mut p = Playout::new(LATENCY);
         p.insert(t0, 0, packet(PACKET, 1));
         p.insert(t0, 2 * PACKET, packet(PACKET, 3));
-        assert_eq!(
-            summary(&p.pop_due(t0 + ms(300))),
-            [(1, 352), (0, 352), (3, 352)]
-        );
+        let played = p.pop_due(t0 + ms(300));
+        assert_eq!(summary(&played), [(1, 352), (0, 352), (3, 352)]);
+        // Each keeps its place on the sender's timeline.
+        let rtps: Vec<u32> = played.iter().map(|c| c.rtp).collect();
+        assert_eq!(rtps, [0, PACKET, 2 * PACKET]);
     }
 
     #[test]
@@ -395,10 +412,9 @@ mod tests {
         p.insert(t0, first, packet(PACKET, 1));
         p.insert(t0, first.wrapping_add(PACKET), packet(PACKET, 2));
         p.insert(t0, first.wrapping_add(2 * PACKET), packet(PACKET, 3));
-        assert_eq!(
-            summary(&p.pop_due(t0 + ms(300))),
-            [(1, 352), (2, 352), (3, 352)]
-        );
+        let played = p.pop_due(t0 + ms(300));
+        assert_eq!(summary(&played), [(1, 352), (2, 352), (3, 352)]);
+        assert_eq!(played[1].rtp, 0, "wrapped");
     }
 
     #[test]

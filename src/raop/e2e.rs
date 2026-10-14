@@ -28,17 +28,21 @@ use crate::metadata::{SenderVolume, TrackInfo};
 struct Recorder {
     events: Mutex<Vec<MetadataEvent>>,
     samples: Mutex<Vec<f32>>,
+    /// Each chunk's frame count and play time.
+    stamps: Mutex<Vec<(usize, Option<i64>)>>,
 }
 
 impl ReceiverHandler for Recorder {
     fn event(&self, _: &ReceiverInfo, event: &MetadataEvent) {
         self.events.lock().unwrap().push(event.clone());
     }
-    fn audio(&self, _: &ReceiverInfo, chunk: &PcmChunk) {
+    fn audio(&self, _: &ReceiverInfo, chunk: &PcmChunk, play_at_us: Option<i64>) {
         self.samples
             .lock()
             .unwrap()
             .extend_from_slice(&chunk.samples);
+        let stamp = (chunk.frames(), play_at_us);
+        self.stamps.lock().unwrap().push(stamp);
     }
 }
 
@@ -53,6 +57,7 @@ impl Recorder {
 
 struct Rig {
     addr: SocketAddr,
+    clock: ServerClock,
     recorder: Arc<Recorder>,
     stop: watch::Sender<bool>,
     task: JoinHandle<io::Result<()>>,
@@ -65,7 +70,8 @@ impl Rig {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let recorder = Arc::new(Recorder::default());
-        let mut config = NativeConfig::new("server", None);
+        let clock = ServerClock::new();
+        let mut config = NativeConfig::new("server", clock, None);
         config.latency = Duration::from_millis(100);
         config.end_after = Duration::from_millis(300);
         // Tests run side by side; any port will do.
@@ -78,6 +84,7 @@ impl Rig {
         });
         Self {
             addr,
+            clock,
             recorder,
             stop,
             task,
@@ -141,6 +148,44 @@ async fn our_own_sender_plays_through_it() {
         r.events().last() == Some(&MetadataEvent::PlayEnd)
     })
     .await;
+    rig.shutdown().await;
+}
+
+/// The sender's timeline comes through: it anchors frame r0 at server-clock
+/// time t (its NTP clock is the server clock, as tas-airplay-out's is), and
+/// the chunk the receiver hands over for r0 is stamped t.
+#[tokio::test]
+async fn chunks_carry_the_senders_play_time() {
+    let rig = Rig::start().await;
+    let ntp = NtpClock::new(rig.clock);
+    let mut sender = RaopSession::connect(rig.addr, ntp, -15.0).await.unwrap();
+    // Two seconds and a bit: the sender sends each packet 2 s early, by
+    // when the receiver's opening burst of timing requests is done.
+    let t = rig.clock.now_us() + 2_500_000;
+    sender.anchor(t).await.unwrap();
+    let sent = tone(44_100 / 2, 0);
+    sender.push(&sent).await.unwrap();
+    sender.finish().await.unwrap();
+
+    rig.until("the audio", |r| r.samples().len() >= sent.len())
+        .await;
+    let stamps = rig.recorder.stamps.lock().unwrap().clone();
+    let mut frames = 0;
+    for (n, stamp) in stamps {
+        let want = t + frames * 1_000_000 / 44_100;
+        let got = stamp.expect("every chunk is stamped");
+        // The clock map's error on localhost, and a µs of rounding.
+        assert!(
+            (got - want).abs() < 500,
+            "frame {frames}: stamped {got}, sent for {want}"
+        );
+        frames += n as i64;
+    }
+    // Handed over the receiver's latency after arriving, well ahead of
+    // when the sender means it to play: that lead is the budget.
+    let lead = t - rig.clock.now_us();
+    assert!(lead > 1_000_000, "{lead} µs");
+    sender.teardown().await;
     rig.shutdown().await;
 }
 

@@ -10,11 +10,12 @@
 //!   [`Playout`]. A sequence number that skips ahead asks the sender, on
 //!   its control port, for the ones skipped.
 //! - **control**: the packets sent again come back here and are queued the
-//!   same way. Sync packets are read and ignored: we play on our clock.
+//!   same way. Each sync packet is the sender timeline's new anchor.
 //! - **timing**: asks the sender's clock every few seconds, as a receiver
-//!   does, and answers if it asks ours.
+//!   does, feeding the timeline's clock map, and answers if it asks ours.
 //! - **playout**: wakes when the next frame is due and hands what is due
-//!   to the receiver's handler as PCM.
+//!   to the receiver's handler as PCM, stamped with the sender's play
+//!   time for it.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -29,6 +30,7 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use super::announce::{Announce, Decoder};
+use super::clock::{self, Anchor, Timeline};
 use super::crypto::{self, AudioCipher};
 use super::playout::{Inserted, Playout};
 use super::rtsp::{self, Request, Response};
@@ -40,6 +42,13 @@ const PUBLIC: &str =
     "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER, POST";
 /// How often we ask the sender's clock.
 const TIMING_INTERVAL: Duration = Duration::from_secs(3);
+/// Asked this many times, [`TIMING_BURST_INTERVAL`] apart, as a stream
+/// starts: the first request can wait in the sender's queue while it sets
+/// up, which skews that sample, and the map should be good at once.
+const TIMING_BURST: u32 = 4;
+const TIMING_BURST_INTERVAL: Duration = Duration::from_millis(100);
+/// How often the sender's lead is logged.
+const LEAD_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// The most packets one resend request asks for. More missing than this
 /// is an outage, not a loss, and asking won't save it.
 const MAX_RESEND: u16 = 128;
@@ -323,6 +332,8 @@ struct Ingest {
     paused: bool,
     /// Packets that wouldn't decode, for one warning.
     undecodable: u64,
+    /// When the sender means each frame to play.
+    timeline: Timeline,
 }
 
 impl Ingest {
@@ -393,6 +404,7 @@ impl Stream {
             timing.local_addr()?.port(),
         ];
         let latency = receiver.config.latency;
+        let clock = receiver.config.clock;
         let shared = Arc::new(Shared {
             receiver,
             ingest: Mutex::new(Ingest {
@@ -403,6 +415,7 @@ impl Stream {
                 resend_seq: 0,
                 paused: false,
                 undecodable: 0,
+                timeline: Timeline::new(clock),
             }),
             queued: Notify::new(),
         });
@@ -415,7 +428,7 @@ impl Stream {
                     .in_current_span(),
             ),
             tokio::spawn(receive_control(shared.clone(), control, peer).in_current_span()),
-            tokio::spawn(keep_time(timing, peer, timing_to).in_current_span()),
+            tokio::spawn(keep_time(shared.clone(), timing, peer, timing_to).in_current_span()),
             tokio::spawn(play_out(shared.clone()).in_current_span()),
         ];
         Ok(Self {
@@ -520,21 +533,38 @@ async fn receive_control(shared: Arc<Shared>, socket: Arc<UdpSocket>, peer: IpAd
                     queue(&shared, audio, true, &socket, None).await;
                 }
             }
-            // We play on our own clock.
-            Some(rtp::PAYLOAD_SYNC) => {}
+            Some(rtp::PAYLOAD_SYNC) => {
+                if let Some(anchor) = Anchor::parse(packet) {
+                    let mut ingest = shared.lock();
+                    if ingest.timeline.anchor.is_none() {
+                        tracing::debug!(?anchor, "the AirPlay sender's first sync");
+                    }
+                    ingest.timeline.anchor = Some(anchor);
+                }
+            }
             other => tracing::trace!(?other, "unknown AirPlay control packet"),
         }
     }
 }
 
-async fn keep_time(socket: UdpSocket, peer: IpAddr, timing_to: Option<SocketAddr>) {
+async fn keep_time(
+    shared: Arc<Shared>,
+    socket: UdpSocket,
+    peer: IpAddr,
+    timing_to: Option<SocketAddr>,
+) {
+    let clock = shared.receiver.config.clock;
     let mut buf = [0u8; 128];
-    let mut ask = tokio::time::interval(TIMING_INTERVAL);
+    let mut asked = 0u32;
+    let mut next = Instant::now();
     loop {
         tokio::select! {
-            _ = ask.tick() => {
+            () = tokio::time::sleep_until(next) => {
+                asked += 1;
+                next += if asked < TIMING_BURST { TIMING_BURST_INTERVAL } else { TIMING_INTERVAL };
                 if let Some(to) = timing_to {
-                    let _ = socket.send_to(&rtp::timing_request(rtp::ntp_now()), to).await;
+                    let request = shared.lock().timeline.request();
+                    let _ = socket.send_to(&request, to).await;
                 }
             }
             r = socket.recv_from(&mut buf) => {
@@ -542,7 +572,13 @@ async fn keep_time(socket: UdpSocket, peer: IpAddr, timing_to: Option<SocketAddr
                 if from.ip().to_canonical() != peer {
                     continue;
                 }
-                if let Some(reply) = rtp::timing_reply(&buf[..n], rtp::ntp_now()) {
+                let packet = &buf[..n];
+                let now = clock.now_us();
+                if shared.lock().timeline.map.reply(packet, now) {
+                    continue;
+                }
+                // It asks ours: the server clock, as NTP.
+                if let Some(reply) = rtp::timing_reply(packet, clock::us_ntp(now)) {
                     let _ = socket.send_to(&reply, from).await;
                 }
             }
@@ -551,6 +587,8 @@ async fn keep_time(socket: UdpSocket, peer: IpAddr, timing_to: Option<SocketAddr
 }
 
 async fn play_out(shared: Arc<Shared>) {
+    let clock = shared.receiver.config.clock;
+    let mut lead_logged: Option<Instant> = None;
     loop {
         let wake = shared.lock().playout.wake_at();
         match wake {
@@ -562,12 +600,27 @@ async fn play_out(shared: Arc<Shared>) {
             }
             None => shared.queued.notified().await,
         }
-        let due = shared.lock().playout.pop_due(Instant::now());
-        for frames in due {
+        let due: Vec<_> = {
+            let mut ingest = shared.lock();
+            let due = ingest.playout.pop_due(Instant::now());
+            due.into_iter()
+                .map(|p| (ingest.timeline.play_at_us(p.rtp), p.frames))
+                .collect()
+        };
+        for (play_at_us, frames) in due {
+            if let Some(at) = play_at_us
+                && lead_logged.is_none_or(|t| t.elapsed() >= LEAD_LOG_INTERVAL)
+            {
+                lead_logged = Some(Instant::now());
+                tracing::debug!(
+                    lead_ms = (at - clock.now_us()) / 1000,
+                    "the AirPlay sender means the audio played now to play this far ahead"
+                );
+            }
             let samples = frames.iter().map(|&s| f32::from(s) / 32_768.0).collect();
             shared
                 .receiver
-                .audio(&PcmChunk::new(AIRPLAY_FORMAT, samples));
+                .audio(&PcmChunk::new(AIRPLAY_FORMAT, samples), play_at_us);
         }
     }
 }

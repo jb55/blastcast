@@ -178,7 +178,10 @@ impl ReceiverHandler for AirplayAudio {
         lock(&self.receivers).insert(id.clone(), Reader { slot, task });
     }
 
-    fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk) {
+    /// The play time is dropped here: [`LiveSource`] has no timestamps,
+    /// so the stream plays the audio as it arrives (taking it is
+    /// headway:tune-assistant/pact-jeans-tube).
+    fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, _play_at_us: Option<i64>) {
         let slot = lock(&self.receivers)
             .get(&receiver.target_id)
             .map(|r| r.slot.clone());
@@ -436,13 +439,13 @@ mod tests {
         let audio = AirplayAudio::new();
         let chunk = |v: f32| PcmChunk::new(AIRPLAY_FORMAT, vec![v; 352 * 2]);
         // Not running: nowhere to go.
-        audio.audio(&info, &chunk(0.1));
+        audio.audio(&info, &chunk(0.1), None);
         audio.started(&info);
         assert!(audio.is_reading("ss-kitchen"));
         // Nobody listening yet: dropped.
-        audio.audio(&info, &chunk(0.2));
+        audio.audio(&info, &chunk(0.2), None);
         let mut source = audio.subscribe("ss-kitchen").unwrap();
-        audio.audio(&info, &chunk(0.3));
+        audio.audio(&info, &chunk(0.3), Some(1));
         assert_eq!(samples(&mut source, 704).await, vec![0.3; 704]);
         assert!(audio.end_stream("ss-kitchen"));
         assert!(ended(&mut source).await);

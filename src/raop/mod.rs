@@ -16,6 +16,13 @@
 //! packets ([`rtp`]) are decrypted, decoded and played out on our clock by
 //! the jitter buffer ([`playout`]), which asks for lost packets again.
 //!
+//! **The sender's timeline is kept** ([`clock`]): its NTP clock mapped onto
+//! the server clock and its latest sync packet, so each chunk handed over
+//! carries the server-clock time the sender means it to play. The handler
+//! downstream can't use that yet (`LiveSource` is untimed), so the audio
+//! is still handed over as it plays out here, the latency after it
+//! arrived; taking the stamp is headway:tune-assistant/pact-jeans-tube.
+//!
 //! **A session** is what shairport-sync's active state was, and what
 //! [`MetadataEvent::PlayBegin`] and [`MetadataEvent::PlayEnd`] bracket: it
 //! begins at the first `RECORD` and ends [`NativeConfig::end_after`] after
@@ -31,6 +38,7 @@
 //! written anywhere.
 
 pub mod announce;
+pub mod clock;
 pub mod connection;
 pub mod crypto;
 #[cfg(test)]
@@ -48,7 +56,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
-use tas_audio::PcmChunk;
+use tas_audio::{PcmChunk, ServerClock};
 use tas_mdns::service::{Service, TxtEntry};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -69,6 +77,9 @@ pub const AIRTUNES_VERSION: &str = "105.1";
 pub struct NativeConfig {
     /// Makes each target's device id, which the sender's challenge signs.
     pub server_id: String,
+    /// The clock the sender's timeline is mapped onto: the one the
+    /// Sendspin server stamps chunks with.
+    pub clock: ServerClock,
     /// Where `_raop._tcp` is advertised; nowhere when `None`, as in tests.
     pub mdns: Option<tas_mdns::Mdns>,
     /// How long after its packet arrives a frame plays: the window for a
@@ -87,9 +98,14 @@ pub struct NativeConfig {
 pub const UDP_PORTS: RangeInclusive<u16> = 6001..=6030;
 
 impl NativeConfig {
-    pub fn new(server_id: impl Into<String>, mdns: Option<tas_mdns::Mdns>) -> Self {
+    pub fn new(
+        server_id: impl Into<String>,
+        clock: ServerClock,
+        mdns: Option<tas_mdns::Mdns>,
+    ) -> Self {
         Self {
             server_id: server_id.into(),
+            clock,
             mdns,
             latency: Duration::from_millis(250),
             end_after: Duration::from_secs(10),
@@ -268,8 +284,8 @@ impl Receiver {
         self.handler.event(&self.info, &event);
     }
 
-    pub(crate) fn audio(&self, chunk: &PcmChunk) {
-        self.handler.audio(&self.info, chunk);
+    pub(crate) fn audio(&self, chunk: &PcmChunk, play_at_us: Option<i64>) {
+        self.handler.audio(&self.info, chunk, play_at_us);
     }
 
     /// `conn` announced a stream: it plays from now, and the connection
