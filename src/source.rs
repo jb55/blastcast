@@ -19,6 +19,12 @@ pub trait LiveSource: Send {
     /// Whether audio arrives in real time. A live source gets no extra lead.
     fn is_live(&self) -> bool;
 
+    /// Where the audio comes from, for whoever watches the stream:
+    /// `airplay`, `tone`. Only shown, never matched on.
+    fn kind(&self) -> &'static str {
+        "unknown"
+    }
+
     /// The next chunk, or `None` when the stream has ended. Chunks may be
     /// any size, but never empty.
     async fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError>;
@@ -32,6 +38,10 @@ impl<S: LiveSource + ?Sized> LiveSource for Box<S> {
 
     fn is_live(&self) -> bool {
         (**self).is_live()
+    }
+
+    fn kind(&self) -> &'static str {
+        (**self).kind()
     }
 
     async fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError> {
