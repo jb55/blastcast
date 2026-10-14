@@ -15,15 +15,17 @@
 //!   own.
 //!
 //! Our NTP clock is the server clock, offset to the Unix time it started
-//! at. A Sendspin chunk's timestamp is server-clock time, so the time it
-//! plays at is also an NTP time the receiver can follow: that is what
-//! puts AirPlay speakers on a Sendspin group's timeline.
+//! at: its clock map is [`ClockMap::identity`], and only the epoch differs.
+//! A Sendspin chunk's timestamp is server-clock time, so the time it plays
+//! at is also an NTP time the receiver can follow: that is what puts
+//! AirPlay speakers on a Sendspin group's timeline.
 //!
 //! The layouts are libraop's (`raop_client.c`), which Music Assistant's
 //! AirPlay CLI is built on.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use blastcast::ClockMap;
 use tas_audio::ServerClock;
 
 /// Seconds from the NTP epoch (1900) to the Unix one.
@@ -42,9 +44,15 @@ const MARKER: u8 = 0x80;
 const FIRST_SYNC: u8 = 0x10;
 
 /// NTP time on the server clock: 32 bits of seconds and 32 of fraction.
+///
+/// It isn't an estimate of a remote clock but ours, written on another
+/// epoch: the map is the identity, and every RAOP speaker we send to
+/// follows the server clock itself.
 #[derive(Debug, Clone, Copy)]
 pub struct NtpClock {
     clock: ServerClock,
+    /// Always [`ClockMap::identity`]: this clock is the server clock.
+    map: ClockMap,
     /// Unix microseconds at server-clock zero.
     unix_at_zero_us: i64,
 }
@@ -56,6 +64,7 @@ impl NtpClock {
             .map_or(0, |d| d.as_micros() as i64);
         Self {
             clock,
+            map: ClockMap::identity(),
             unix_at_zero_us: unix_us - clock.now_us(),
         }
     }
@@ -70,7 +79,7 @@ impl NtpClock {
 
     /// The NTP time of server-clock microsecond `us`.
     pub fn at_us(&self, us: i64) -> u64 {
-        let t = us + self.unix_at_zero_us + NTP_UNIX_OFFSET_S * 1_000_000;
+        let t = self.map.to_remote_us(us) + self.epoch_us();
         let secs = t.div_euclid(1_000_000) as u64;
         let micros = t.rem_euclid(1_000_000) as u64;
         (secs << 32) | ((micros << 32) / 1_000_000)
@@ -80,7 +89,13 @@ impl NtpClock {
     pub fn us_at(&self, ntp: u64) -> i64 {
         let secs = (ntp >> 32) as i64;
         let micros = (((ntp & 0xffff_ffff) * 1_000_000 + (1 << 31)) >> 32) as i64;
-        secs * 1_000_000 + micros - NTP_UNIX_OFFSET_S * 1_000_000 - self.unix_at_zero_us
+        self.map
+            .to_server_us(secs * 1_000_000 + micros - self.epoch_us())
+    }
+
+    /// NTP microseconds at server-clock zero.
+    fn epoch_us(&self) -> i64 {
+        self.unix_at_zero_us + NTP_UNIX_OFFSET_S * 1_000_000
     }
 }
 

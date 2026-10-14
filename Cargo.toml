@@ -12,6 +12,7 @@ tas-audio.workspace = true
 tas-mdns.workspace = true
 tas-sendspin.workspace = true
 
+blastcast.workspace = true
 bytes.workspace = true
 futures-channel.workspace = true
 futures-util.workspace = true
