@@ -387,7 +387,14 @@ impl SendspinServer {
                 return ControlFlow::Break(());
             }
             ClientMessage::Time(time) => on_client_time(conn, time, received_us),
-            ClientMessage::Command(_) | ClientMessage::RequestFormat(_) => {
+            ClientMessage::RequestFormat(request) => match request.player {
+                Some(player) if conn.has_role("player") => {
+                    tracing::info!(client_id, ?player, "player asked for another format");
+                    conn.request_format(player);
+                }
+                _ => tracing::debug!(client_id, text, "format request not handled"),
+            },
+            ClientMessage::Command(_) => {
                 tracing::debug!(client_id, text, "not handled yet");
             }
         }

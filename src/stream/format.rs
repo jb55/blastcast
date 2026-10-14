@@ -1,32 +1,22 @@
-//! Picking a player's PCM format from its hello, and encoding session audio
-//! into it.
+//! Choosing the format a player is sent: from its hello's list, and again
+//! when it asks for another with `stream/request-format`.
 
-use tas_audio::{AudioError, SESSION_FORMAT, StreamResampler, pcm};
+use tas_audio::SESSION_FORMAT;
 
-use crate::protocol::{Codec, PlayerSupport, StreamFormat};
+use super::encode::can_encode;
+use crate::protocol::{Codec, PlayerSupport, RequestFormatPlayer, StreamFormat};
 
-/// The PCM bit depths this server encodes. 24-bit samples are packed into
-/// three bytes, as the spec has it.
-const PCM_BIT_DEPTHS: [u32; 2] = [16, 24];
-
-/// The PCM format to send a player: the first in its preference order at
-/// the session's rate, so nothing is resampled, and failing that the first
-/// at any rate. Only the session's channel count and 16- or 24-bit depths
-/// are considered. `None` when the player lists no such format.
+/// The format to send a player: the first in its preference order that
+/// this server encodes at the session's rate, so nothing is resampled,
+/// and failing that the first it encodes at any rate. `None` when the
+/// player lists nothing this server can send.
 ///
-/// sendspin-go lists 192 kHz first, so taking its first PCM entry outright
-/// would upsample every chunk fourfold for nothing.
-pub fn pick_pcm_format(support: &PlayerSupport) -> Option<StreamFormat> {
-    let candidates: Vec<StreamFormat> = support
-        .formats()
-        .into_iter()
-        .filter(|f| {
-            f.codec == Codec::Pcm
-                && f.channels == u32::from(SESSION_FORMAT.channels)
-                && PCM_BIT_DEPTHS.contains(&f.bit_depth)
-                && f.sample_rate > 0
-        })
-        .collect();
+/// The spec has the server take the highest-priority entry it can
+/// produce, and allows a lower one to avoid resampling. sendspin-go lists
+/// 192 kHz PCM first, and taking that outright would upsample every
+/// chunk fourfold for nothing.
+pub fn pick_format(support: &PlayerSupport) -> Option<StreamFormat> {
+    let candidates: Vec<StreamFormat> = support.formats().into_iter().filter(can_encode).collect();
     candidates
         .iter()
         .find(|f| f.sample_rate == SESSION_FORMAT.sample_rate)
@@ -34,94 +24,67 @@ pub fn pick_pcm_format(support: &PlayerSupport) -> Option<StreamFormat> {
         .copied()
 }
 
-/// Turns session-format audio into one player's wire bytes: resampled to
-/// its rate if that differs, then packed as s16le or s24le.
-pub struct PcmEncoder {
-    format: StreamFormat,
-    resampler: Option<StreamResampler>,
-    scratch: Vec<f32>,
+/// The format a `stream/request-format` asks for. A field the request
+/// leaves out keeps its `current` value, as the spec has it.
+///
+/// The answer is an entry of the player's list that has every field the
+/// request names: the one that also keeps the current values if listed,
+/// else the first. A request naming a codec alone can thus move from
+/// 44.1 kHz PCM to 48 kHz Opus, where the current rate can't be kept. A
+/// player that lists nothing matching still gets what it asked for if it
+/// can be sent. `None` when it can't, and the player keeps its format.
+pub fn requested_format(
+    support: &PlayerSupport,
+    current: Option<StreamFormat>,
+    request: &RequestFormatPlayer,
+) -> Option<StreamFormat> {
+    let target = current
+        .or_else(|| pick_format(support))
+        .map(|base| StreamFormat {
+            codec: request.codec.unwrap_or(base.codec),
+            channels: request.channels.unwrap_or(base.channels),
+            sample_rate: request.sample_rate.unwrap_or(base.sample_rate),
+            bit_depth: request.bit_depth.unwrap_or(base.bit_depth),
+        });
+    let candidates: Vec<StreamFormat> = support
+        .formats()
+        .into_iter()
+        .filter(|f| names(request, f) && can_encode(f))
+        .collect();
+    if let Some(listed) = target.and_then(|t| candidates.iter().find(|f| same(f, &t))) {
+        return Some(*listed);
+    }
+    candidates
+        .first()
+        .copied()
+        .or(target.filter(|t| names(request, t) && can_encode(t)))
 }
 
-impl PcmEncoder {
-    pub fn new(format: StreamFormat) -> Result<Self, AudioError> {
-        if format.codec != Codec::Pcm || !PCM_BIT_DEPTHS.contains(&format.bit_depth) {
-            return Err(AudioError::Format(format!(
-                "{:?} at {} bits is not a PCM format this server encodes",
-                format.codec, format.bit_depth
-            )));
-        }
-        let resampler = (format.sample_rate != SESSION_FORMAT.sample_rate)
-            .then(|| {
-                StreamResampler::new(
-                    SESSION_FORMAT.sample_rate,
-                    format.sample_rate,
-                    SESSION_FORMAT.channels,
-                )
-            })
-            .transpose()?;
-        Ok(Self {
-            format,
-            resampler,
-            scratch: Vec::new(),
-        })
-    }
+/// Whether `format` has every field `request` names.
+fn names(request: &RequestFormatPlayer, format: &StreamFormat) -> bool {
+    request.codec.is_none_or(|c| c == format.codec)
+        && request.channels.is_none_or(|c| c == format.channels)
+        && request.sample_rate.is_none_or(|r| r == format.sample_rate)
+        && request
+            .bit_depth
+            .is_none_or(|b| b == format.bit_depth || format.codec == Codec::Opus)
+}
 
-    pub fn format(&self) -> StreamFormat {
-        self.format
-    }
-
-    /// Bytes per frame on the wire.
-    pub fn frame_bytes(&self) -> usize {
-        self.format.channels as usize * (self.format.bit_depth as usize / 8)
-    }
-
-    /// About how many bytes `session_frames` of session audio encode to,
-    /// for checking buffer room before encoding.
-    pub fn estimate_bytes(&self, session_frames: usize) -> usize {
-        let frames = (session_frames as u64 * u64::from(self.format.sample_rate))
-            .div_ceil(u64::from(SESSION_FORMAT.sample_rate));
-        frames as usize * self.frame_bytes()
-    }
-
-    /// Encode interleaved session-format samples, returning the bytes and
-    /// how many wire frames they hold. A resampler may hold input back, so
-    /// a chunk can encode to nothing; the frames come out with a later one.
-    pub fn encode(&mut self, samples: &[f32]) -> Result<(Vec<u8>, usize), AudioError> {
-        let samples = match &mut self.resampler {
-            Some(resampler) => {
-                self.scratch.clear();
-                resampler.process(samples, &mut self.scratch)?;
-                &self.scratch[..]
-            }
-            None => samples,
-        };
-        let mut out = Vec::new();
-        match self.format.bit_depth {
-            16 => pcm::f32_to_s16le(samples, &mut out),
-            _ => pcm::f32_to_s24le(samples, &mut out),
-        }
-        Ok((out, samples.len() / self.format.channels as usize))
-    }
-
-    /// Forget held-back input, after the stream jumps.
-    pub fn reset(&mut self) {
-        if let Some(resampler) = &mut self.resampler {
-            resampler.reset();
-        }
-    }
+/// The same format, but for an Opus bit depth, which means nothing.
+fn same(a: &StreamFormat, b: &StreamFormat) -> bool {
+    a.codec == b.codec
+        && a.channels == b.channels
+        && a.sample_rate == b.sample_rate
+        && (a.bit_depth == b.bit_depth || a.codec == Codec::Opus)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::encode::tests::fmt;
 
     fn pcm(sample_rate: u32, bit_depth: u32) -> StreamFormat {
-        StreamFormat {
-            codec: Codec::Pcm,
-            channels: 2,
-            sample_rate,
-            bit_depth,
-        }
+        fmt(Codec::Pcm, sample_rate, bit_depth)
     }
 
     fn support(formats: Vec<StreamFormat>) -> PlayerSupport {
@@ -139,27 +102,37 @@ mod tests {
             pcm(96_000, 24),
             pcm(48_000, 16),
             pcm(44_100, 16),
-            StreamFormat {
-                codec: Codec::Flac,
-                ..pcm(48_000, 24)
-            },
+            fmt(Codec::Flac, 48_000, 24),
         ]);
-        assert_eq!(pick_pcm_format(&s), Some(pcm(48_000, 16)));
+        assert_eq!(pick_format(&s), Some(pcm(48_000, 16)));
         let s = support(vec![pcm(48_000, 24), pcm(48_000, 16)]);
-        assert_eq!(pick_pcm_format(&s), Some(pcm(48_000, 24)));
+        assert_eq!(pick_format(&s), Some(pcm(48_000, 24)));
+    }
+
+    #[test]
+    fn takes_a_compressed_codec_the_player_lists_first() {
+        let s = support(vec![
+            fmt(Codec::Opus, 48_000, 16),
+            fmt(Codec::Flac, 48_000, 24),
+            pcm(48_000, 16),
+        ]);
+        assert_eq!(pick_format(&s), Some(fmt(Codec::Opus, 48_000, 16)));
+        // FLAC at 44.1 kHz would need resampling in variable blocks, so
+        // it's skipped, and PCM at the same rate is resampled instead.
+        let s = support(vec![fmt(Codec::Flac, 44_100, 16), pcm(44_100, 16)]);
+        assert_eq!(pick_format(&s), Some(pcm(44_100, 16)));
     }
 
     #[test]
     fn falls_back_to_another_rate() {
         let s = support(vec![
-            StreamFormat {
-                codec: Codec::Opus,
-                ..pcm(48_000, 16)
-            },
+            fmt(Codec::Opus, 44_100, 16),
             pcm(44_100, 32),
             pcm(44_100, 16),
         ]);
-        assert_eq!(pick_pcm_format(&s), Some(pcm(44_100, 16)));
+        assert_eq!(pick_format(&s), Some(pcm(44_100, 16)));
+        let s = support(vec![pcm(44_100, 16), fmt(Codec::Opus, 24_000, 16)]);
+        assert_eq!(pick_format(&s), Some(pcm(44_100, 16)));
     }
 
     #[test]
@@ -168,8 +141,8 @@ mod tests {
             channels: 1,
             ..pcm(48_000, 16)
         };
-        assert_eq!(pick_pcm_format(&support(vec![mono, pcm(48_000, 8)])), None);
-        assert_eq!(pick_pcm_format(&support(vec![])), None);
+        assert_eq!(pick_format(&support(vec![mono, pcm(48_000, 8)])), None);
+        assert_eq!(pick_format(&support(vec![])), None);
     }
 
     #[test]
@@ -181,43 +154,80 @@ mod tests {
             support_bit_depth: vec![16],
             ..Default::default()
         };
-        assert_eq!(pick_pcm_format(&s), Some(pcm(48_000, 16)));
+        assert_eq!(pick_format(&s), Some(pcm(48_000, 16)));
     }
 
-    #[test]
-    fn packs_24_bit_into_three_bytes() {
-        let mut enc = PcmEncoder::new(pcm(48_000, 24)).unwrap();
-        assert_eq!(enc.frame_bytes(), 6);
-        let (bytes, frames) = enc.encode(&[0.5, -1.0, 0.0, 0.0]).unwrap();
-        assert_eq!(frames, 2);
-        assert_eq!(
-            bytes,
-            [0x00, 0x00, 0x40, 0x00, 0x00, 0x80, 0, 0, 0, 0, 0, 0]
-        );
-        assert_eq!(enc.estimate_bytes(960), 960 * 6);
-    }
-
-    #[test]
-    fn resamples_to_the_players_rate() {
-        let mut enc = PcmEncoder::new(pcm(44_100, 16)).unwrap();
-        assert_eq!(enc.estimate_bytes(960), 882 * 4);
-        let chunk = vec![0.0; 960 * 2];
-        let mut frames = 0;
-        for _ in 0..50 {
-            let (bytes, n) = enc.encode(&chunk).unwrap();
-            assert_eq!(bytes.len(), n * 4);
-            frames += n;
+    fn request(codec: Option<Codec>, sample_rate: Option<u32>) -> RequestFormatPlayer {
+        RequestFormatPlayer {
+            codec,
+            sample_rate,
+            ..Default::default()
         }
-        // One second in; the resampler holds back at most a block.
-        assert!((44_100 - 1100..=44_100).contains(&frames), "{frames}");
     }
 
     #[test]
-    fn only_pcm_encodes() {
-        let flac = StreamFormat {
-            codec: Codec::Flac,
-            ..pcm(48_000, 16)
-        };
-        assert!(PcmEncoder::new(flac).is_err());
+    fn a_request_keeps_what_it_leaves_out() {
+        let s = support(vec![
+            pcm(48_000, 24),
+            fmt(Codec::Flac, 48_000, 16),
+            fmt(Codec::Flac, 48_000, 24),
+            fmt(Codec::Opus, 48_000, 16),
+        ]);
+        let now = Some(pcm(48_000, 24));
+        // Keeps 24 bits, though the 16-bit FLAC entry comes first.
+        assert_eq!(
+            requested_format(&s, now, &request(Some(Codec::Flac), None)),
+            Some(fmt(Codec::Flac, 48_000, 24))
+        );
+        // Opus's bit depth is the listed entry's, not the current 24.
+        assert_eq!(
+            requested_format(&s, now, &request(Some(Codec::Opus), None)),
+            Some(fmt(Codec::Opus, 48_000, 16))
+        );
+    }
+
+    #[test]
+    fn a_request_that_cannot_keep_the_rate_takes_the_first_match() {
+        let s = support(vec![
+            pcm(44_100, 16),
+            fmt(Codec::Opus, 24_000, 16),
+            fmt(Codec::Opus, 48_000, 16),
+        ]);
+        let now = Some(pcm(44_100, 16));
+        assert_eq!(
+            requested_format(&s, now, &request(Some(Codec::Opus), None)),
+            Some(fmt(Codec::Opus, 24_000, 16))
+        );
+        assert_eq!(
+            requested_format(&s, now, &request(Some(Codec::Opus), Some(48_000))),
+            Some(fmt(Codec::Opus, 48_000, 16))
+        );
+    }
+
+    #[test]
+    fn an_unlisted_request_is_sent_if_it_can_be() {
+        let s = support(vec![pcm(48_000, 16)]);
+        let now = Some(pcm(48_000, 16));
+        assert_eq!(
+            requested_format(&s, now, &request(Some(Codec::Flac), None)),
+            Some(fmt(Codec::Flac, 48_000, 16))
+        );
+        assert_eq!(
+            requested_format(&s, now, &request(Some(Codec::Flac), Some(44_100))),
+            None
+        );
+        assert_eq!(
+            requested_format(&s, now, &request(Some(Codec::Unknown), None)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_request_before_any_stream_starts_from_the_default() {
+        let s = support(vec![pcm(48_000, 16), fmt(Codec::Opus, 48_000, 16)]);
+        assert_eq!(
+            requested_format(&s, None, &request(Some(Codec::Opus), None)),
+            Some(fmt(Codec::Opus, 48_000, 16))
+        );
     }
 }

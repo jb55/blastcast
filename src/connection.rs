@@ -21,7 +21,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 
 use crate::protocol::{
-    ClientHello, ClientState, ConnectionReason, GoodbyeReason, HeaderLayout, Role, ServerMessage,
+    ClientHello, ClientState, ConnectionReason, GoodbyeReason, HeaderLayout, RequestFormatPlayer,
+    Role, ServerMessage,
 };
 use crate::status::{PlayerStatus, StatusChange};
 
@@ -68,6 +69,9 @@ pub struct Connection {
     /// Set by the first `client/state`. Audio waits for it.
     ready: AtomicBool,
     status: watch::Sender<PlayerStatus>,
+    /// Every `stream/request-format` the client sent, merged: a later
+    /// request's fields override an earlier one's.
+    format_request: watch::Sender<Option<RequestFormatPlayer>>,
     goodbye: Mutex<Option<GoodbyeReason>>,
     closed: watch::Sender<bool>,
 }
@@ -100,6 +104,7 @@ impl Connection {
             audio,
             ready: AtomicBool::new(false),
             status,
+            format_request: watch::channel(None).0,
             goodbye: Mutex::new(None),
             closed: watch::channel(false).0,
         };
@@ -188,6 +193,33 @@ impl Connection {
             change.changed
         });
         change
+    }
+
+    /// The player format the client asked for with
+    /// `stream/request-format`, if it has. Fields it never named are
+    /// `None`, meaning whatever it is being sent now.
+    pub fn format_request(&self) -> Option<RequestFormatPlayer> {
+        *self.format_request.borrow()
+    }
+
+    /// Sees every `stream/request-format`, for the stream to answer.
+    pub fn watch_format_request(&self) -> watch::Receiver<Option<RequestFormatPlayer>> {
+        self.format_request.subscribe()
+    }
+
+    /// Records a `stream/request-format`. Watchers are woken even when it
+    /// asks for nothing new, since the spec answers every request with a
+    /// `stream/start`.
+    pub(crate) fn request_format(&self, request: RequestFormatPlayer) {
+        self.format_request.send_modify(|current| {
+            let old = current.unwrap_or_default();
+            *current = Some(RequestFormatPlayer {
+                codec: request.codec.or(old.codec),
+                channels: request.channels.or(old.channels),
+                sample_rate: request.sample_rate.or(old.sample_rate),
+                bit_depth: request.bit_depth.or(old.bit_depth),
+            });
+        });
     }
 
     /// The reason the client gave in `client/goodbye`, once it has.

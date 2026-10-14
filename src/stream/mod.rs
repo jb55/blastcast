@@ -34,8 +34,17 @@
 //! is a gapless track change. `stream/end` goes out only on a real stop:
 //! [`AudioStream::stop`], removing a player, or the last source running out
 //! once its audio has played.
+//!
+//! **Formats.** Each player is sent the first format in its hello's list
+//! that the server encodes, preferring one at the session rate (see
+//! [`pick_format`]): PCM, FLAC or Opus. Players on the same format share
+//! one [`Encoder`], so a chunk is encoded once per format, not per player,
+//! and a player joining mid-stream gets the same timestamps as the rest.
+//! A `stream/request-format` moves the player to the format it asks for,
+//! answered with a fresh `stream/start`.
 
 mod buffer;
+mod encode;
 mod feed;
 mod format;
 
@@ -43,16 +52,20 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tas_audio::{AudioError, LiveSource, SESSION_FORMAT, ServerClock, Timeline, to_session_format};
-use tokio::sync::mpsc;
+use tas_audio::{
+    AudioError, LiveSource, SESSION_FORMAT, ServerClock, Span, Timeline, to_session_format,
+};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 pub use buffer::{BufferTracker, DEFAULT_CAPACITY_BYTES, MAX_BUFFERED_US};
-pub use format::{PcmEncoder, pick_pcm_format};
+pub use encode::{Encoder, FlacEncoder, OpusEncoder, PcmEncoder, can_encode};
+pub use format::{pick_format, requested_format};
 
 use crate::connection::{Connection, SendError};
 use crate::protocol::{
-    ServerMessage, StreamClear, StreamEnd, StreamStart, StreamStartPlayer, binary,
+    RequestFormatPlayer, ServerMessage, StreamClear, StreamEnd, StreamFormat, StreamStart,
+    StreamStartPlayer, binary,
 };
 use crate::status::PlayerTiming;
 use feed::{Feed, FeedItem};
@@ -113,6 +126,7 @@ impl AudioStream {
             queued: VecDeque::new(),
             timeline: None,
             outputs: Vec::new(),
+            encodings: Vec::new(),
             pending: None,
             wake_us: None,
         };
@@ -168,12 +182,11 @@ impl AudioStream {
 /// One player in the stream.
 struct Output {
     conn: Arc<Connection>,
-    encoder: PcmEncoder,
+    /// The format it negotiated, which names the [`Encoding`] it is sent.
+    format: StreamFormat,
     tracker: BufferTracker,
-    /// The player's own timeline, at its wire rate, which a resampled
-    /// player needs since its chunks hold a different number of frames.
-    /// It starts where the shared one is and shifts with it.
-    timeline: Timeline,
+    /// Its `stream/request-format`s, answered as they come.
+    requests: watch::Receiver<Option<RequestFormatPlayer>>,
     /// It has had `stream/start` and is being sent audio.
     started: bool,
 }
@@ -185,19 +198,21 @@ impl Output {
         }
     }
 
-    fn start(&mut self, at_us: i64) {
+    fn start(&mut self, encoding: &Encoding) {
+        let encoder = &encoding.encoder;
         self.send_control(ServerMessage::StreamStart(StreamStart {
             server_transmitted: None,
-            player: Some(StreamStartPlayer::new(self.encoder.format(), None)),
+            player: Some(StreamStartPlayer::new(
+                encoder.format(),
+                encoder.codec_header(),
+            )),
             artwork: None,
         }));
         self.tracker = BufferTracker::new(self.conn.player_status().timing.buffer_capacity);
-        self.encoder.reset();
-        self.timeline = Timeline::new(at_us, self.encoder.format().sample_rate);
         self.started = true;
         tracing::info!(
             client_id = self.conn.client_id(),
-            format = ?self.encoder.format(),
+            format = ?encoder.format(),
             "stream started"
         );
     }
@@ -210,6 +225,74 @@ impl Output {
             }));
             self.started = false;
         }
+    }
+
+    /// Answers a `stream/request-format` that came since the last look.
+    /// A started player is stopped so the caller restarts it, which sends
+    /// the `stream/start` the spec answers with.
+    fn take_request(&mut self, encodings: &mut Vec<Encoding>) {
+        if !self.requests.has_changed().unwrap_or(false) {
+            return;
+        }
+        let Some(request) = *self.requests.borrow_and_update() else {
+            return;
+        };
+        let client_id = self.conn.client_id();
+        let support = self.conn.hello().player();
+        let Some(format) = support.and_then(|s| requested_format(s, Some(self.format), &request))
+        else {
+            tracing::warn!(
+                client_id,
+                ?request,
+                "can't send the format the player asked for"
+            );
+            return;
+        };
+        if let Err(e) = Encoding::find_or_add(encodings, format) {
+            tracing::warn!(client_id, error = %e, "can't encode the format the player asked for");
+            return;
+        }
+        self.format = format;
+        self.started = false;
+    }
+}
+
+/// The stream in one format, encoded once a chunk and sent to every
+/// player that negotiated it.
+struct Encoding {
+    encoder: Encoder,
+    /// The timeline at the format's rate, which a resampled format needs
+    /// since its chunks hold a different number of frames. It starts where
+    /// the shared one is, less the encoder's delay, and shifts with it.
+    timeline: Timeline,
+    /// It has a started player and is being encoded. One that stops is
+    /// reset and placed afresh when a player starts on it again.
+    running: bool,
+}
+
+impl Encoding {
+    fn format(&self) -> StreamFormat {
+        self.encoder.format()
+    }
+
+    /// The index of `format`'s encoding, made if there is none yet.
+    fn find_or_add(encodings: &mut Vec<Self>, format: StreamFormat) -> Result<usize, AudioError> {
+        if let Some(i) = encodings.iter().position(|e| e.format() == format) {
+            return Ok(i);
+        }
+        encodings.push(Self {
+            encoder: Encoder::new(format)?,
+            timeline: Timeline::new(0, format.sample_rate),
+            running: false,
+        });
+        Ok(encodings.len() - 1)
+    }
+
+    /// Starts encoding with the shared timeline at `at_us`.
+    fn run(&mut self, at_us: i64) {
+        self.encoder.reset();
+        self.timeline = Timeline::new(at_us - self.encoder.delay_us(), self.format().sample_rate);
+        self.running = true;
     }
 }
 
@@ -232,6 +315,8 @@ struct Streamer {
     /// chunk after a start or a seek, which places it.
     timeline: Option<Timeline>,
     outputs: Vec<Output>,
+    /// One per format some player negotiated.
+    encodings: Vec<Encoding>,
     /// A chunk read but not yet sent: a source that isn't live waits here
     /// until every player has room for it.
     pending: Option<Vec<f32>>,
@@ -297,7 +382,9 @@ impl Streamer {
                         roles: Some(vec![PLAYER_ROLE.into()]),
                     }));
                     out.tracker.clear();
-                    out.encoder.reset();
+                }
+                for encoding in &mut self.encodings {
+                    encoding.encoder.reset();
                 }
             }
             Command::Queue(source) => {
@@ -350,21 +437,25 @@ impl Streamer {
             );
             return;
         }
-        let Some(format) = conn.hello().player().and_then(pick_pcm_format) else {
-            tracing::warn!(client_id, "player lists no PCM format this server sends");
+        // A request sent before the stream began counts from the start.
+        let requests = conn.watch_format_request();
+        let request = *requests.borrow();
+        let Some(format) = conn.hello().player().and_then(|support| {
+            request
+                .and_then(|r| requested_format(support, None, &r))
+                .or_else(|| pick_format(support))
+        }) else {
+            tracing::warn!(client_id, "player lists no format this server sends");
             return;
         };
-        let encoder = match PcmEncoder::new(format) {
-            Ok(encoder) => encoder,
-            Err(e) => {
-                tracing::warn!(client_id, error = %e, "can't encode for player");
-                return;
-            }
-        };
+        if let Err(e) = Encoding::find_or_add(&mut self.encodings, format) {
+            tracing::warn!(client_id, error = %e, "can't encode for player");
+            return;
+        }
         let output = Output {
             tracker: BufferTracker::new(0),
-            timeline: Timeline::new(0, format.sample_rate),
-            encoder,
+            format,
+            requests,
             conn,
             started: false,
         };
@@ -416,19 +507,39 @@ impl Streamer {
             .expect("placed above")
             .advance(frames as u64);
         let live = self.live;
-        for out in self.outputs.iter_mut().filter(|o| o.started) {
-            send_chunk(out, &samples, now, live);
+        for encoding in self.encodings.iter_mut().filter(|e| e.running) {
+            let format = encoding.format();
+            let (bytes, frames) = match encoding.encoder.encode(&samples) {
+                Ok(encoded) => encoded,
+                Err(e) => {
+                    tracing::warn!(?format, error = %e, "encoding failed, chunk dropped");
+                    continue;
+                }
+            };
+            if frames == 0 {
+                continue;
+            }
+            let span = encoding.timeline.advance(frames as u64);
+            for out in self
+                .outputs
+                .iter_mut()
+                .filter(|o| o.started && o.format == format)
+            {
+                send_chunk(out, &bytes, span, now, live);
+            }
         }
     }
 
-    /// Starts the timeline at `floor`, or shifts it, and every started
-    /// player's with it, forward to `floor` if the source fell more than
+    /// Starts the timeline at `floor`, or shifts it, and every running
+    /// encoding's with it, forward to `floor` if the source fell more than
     /// [`SHIFT_TOLERANCE_US`] behind.
     fn place_timeline(&mut self, floor: i64) {
         let Some(timeline) = &mut self.timeline else {
             self.timeline = Some(Timeline::new(floor, SESSION_FORMAT.sample_rate));
-            for out in self.outputs.iter_mut().filter(|o| o.started) {
-                out.timeline.rebase(floor);
+            for encoding in self.encodings.iter_mut().filter(|e| e.running) {
+                encoding
+                    .timeline
+                    .rebase(floor - encoding.encoder.delay_us());
             }
             return;
         };
@@ -439,22 +550,34 @@ impl Streamer {
                 "source fell behind, shifting the timeline"
             );
             timeline.rebase(floor);
-            for out in self.outputs.iter_mut().filter(|o| o.started) {
-                let cursor = out.timeline.cursor_us();
-                out.timeline.rebase(cursor + shift);
+            for encoding in self.encodings.iter_mut().filter(|e| e.running) {
+                let cursor = encoding.timeline.cursor_us();
+                encoding.timeline.rebase(cursor + shift);
             }
         }
     }
 
-    /// Drops closed players, starts ones that can now play, and stops
-    /// sending to ones that can't.
+    /// Drops closed players, answers format requests, starts players that
+    /// can now play, and stops sending to ones that can't. Encodings follow
+    /// their players: one runs while a player on it is started, and goes
+    /// once no player has its format.
     fn sync_outputs(&mut self, now: i64) {
         self.outputs.retain(|o| !o.conn.is_closed());
         let cursor = self.timeline.as_ref().map_or(now, Timeline::cursor_us);
         for out in &mut self.outputs {
+            out.take_request(&mut self.encodings);
             let available = out.conn.is_available();
             if available && !out.started {
-                out.start(cursor);
+                let i = self
+                    .encodings
+                    .iter()
+                    .position(|e| e.format() == out.format)
+                    .expect("added with its output");
+                let encoding = &mut self.encodings[i];
+                if !encoding.running {
+                    encoding.run(cursor);
+                }
+                out.start(encoding);
             } else if !available && out.started {
                 // Its output was taken by something else; the client
                 // stopped on its own. It gets stream/start if it returns.
@@ -465,6 +588,14 @@ impl Streamer {
                 out.started = false;
             }
             out.tracker.prune(now);
+        }
+        let outputs = &self.outputs;
+        self.encodings
+            .retain(|e| outputs.iter().any(|o| o.format == e.format()));
+        for encoding in &mut self.encodings {
+            encoding.running &= outputs
+                .iter()
+                .any(|o| o.started && o.format == encoding.format());
         }
     }
 
@@ -484,7 +615,11 @@ impl Streamer {
                 if o.conn.audio_queue_room() == 0 {
                     return Some(now + duration);
                 }
-                let bytes = o.encoder.estimate_bytes(frames) as u64;
+                let bytes =
+                    self.encodings
+                        .iter()
+                        .find(|e| e.format() == o.format)
+                        .map_or(0, |e| e.encoder.estimate_bytes(frames)) as u64;
                 (!o.tracker.can_send(bytes, duration))
                     .then(|| o.tracker.next_release_us().unwrap_or(now + duration))
             })
@@ -492,20 +627,9 @@ impl Streamer {
     }
 }
 
-/// Encodes one chunk for `out` and queues it.
-fn send_chunk(out: &mut Output, samples: &[f32], now: i64, live: bool) {
+/// Queues one encoded chunk for `out`, playing over `span`.
+fn send_chunk(out: &mut Output, bytes: &[u8], span: Span, now: i64, live: bool) {
     let client_id = out.conn.client_id();
-    let (bytes, frames) = match out.encoder.encode(samples) {
-        Ok(encoded) => encoded,
-        Err(e) => {
-            tracing::warn!(client_id, error = %e, "encoding failed, chunk dropped");
-            return;
-        }
-    };
-    if frames == 0 {
-        return;
-    }
-    let span = out.timeline.advance(frames as u64);
     let len = bytes.len() as u64;
     if live && !out.tracker.can_send(len, span.duration_us) {
         tracing::debug!(client_id, "player buffer full, chunk dropped");
@@ -515,7 +639,7 @@ fn send_chunk(out: &mut Output, samples: &[f32], now: i64, live: bool) {
         out.conn.header_layout(),
         span.start_us,
         binary::send_ahead(now, span.start_us),
-        &bytes,
+        bytes,
     );
     match out.conn.send_audio(Bytes::from(frame)) {
         Ok(()) => out.tracker.register(span.end_us(), len, span.duration_us),

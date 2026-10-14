@@ -1,6 +1,7 @@
 //! A test tone streamed to a websocket player on a real socket, through the
 //! server's own connection, writer and wire encoding: `stream/start`, then
-//! 20 ms PCM chunks on one timeline a send-ahead early, then `stream/end`.
+//! 20 ms PCM chunks on one timeline a send-ahead early, then `stream/end`;
+//! and a `stream/request-format` for FLAC answered on the same socket.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use tas_audio::{SESSION_FORMAT, ServerClock, SineSource};
 use tas_core::PlayerRegistry;
 use tas_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, HeaderLayout, PlayerSupport,
-    ServerMessage, StreamFormat,
+    RequestFormatPlayer, ServerMessage, StreamFormat, StreamRequestFormat,
 };
 use tas_sendspin::stream::DEFAULT_SEND_AHEAD_US;
 use tas_sendspin::{AudioStream, SendspinServer, ServerConfig};
@@ -65,9 +66,29 @@ async fn next_text(ws: &mut Client) -> ServerMessage {
     }
 }
 
+const FLAC_48K_16: StreamFormat = StreamFormat {
+    codec: Codec::Flac,
+    ..PCM_48K_16
+};
+
 /// Says hello as a player listing sendspin-go's PCM formats, and reports
 /// itself available.
 async fn player(url: &str) -> Client {
+    player_with(
+        url,
+        vec![
+            StreamFormat {
+                sample_rate: 192_000,
+                bit_depth: 24,
+                ..PCM_48K_16
+            },
+            PCM_48K_16,
+        ],
+    )
+    .await
+}
+
+async fn player_with(url: &str, supported_formats: Vec<StreamFormat>) -> Client {
     let mut ws = tokio_tungstenite::connect_async(url).await.unwrap().0;
     let hello = ClientMessage::Hello(Box::new(ClientHello {
         client_id: "ear".into(),
@@ -75,14 +96,7 @@ async fn player(url: &str) -> Client {
         version: 1,
         supported_roles: vec!["player@v1".into()],
         player_v1_support: Some(PlayerSupport {
-            supported_formats: vec![
-                StreamFormat {
-                    sample_rate: 192_000,
-                    bit_depth: 24,
-                    ..PCM_48K_16
-                },
-                PCM_48K_16,
-            ],
+            supported_formats,
             buffer_capacity: 1 << 20,
             ..Default::default()
         }),
@@ -98,17 +112,21 @@ async fn player(url: &str) -> Client {
     ws
 }
 
+async fn available(server: &SendspinServer) -> Arc<tas_sendspin::Connection> {
+    loop {
+        match server.connection("ear") {
+            Some(conn) if conn.is_available() => break conn,
+            _ => tokio::time::sleep(Duration::from_millis(5)).await,
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_player_gets_a_timed_test_tone() {
     let clock = ServerClock::new();
     let (server, url) = start(clock).await;
     let mut ws = player(&url).await;
-    let conn = loop {
-        match server.connection("ear") {
-            Some(conn) if conn.is_available() => break conn,
-            _ => tokio::time::sleep(Duration::from_millis(5)).await,
-        }
-    };
+    let conn = available(&server).await;
 
     let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
     let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
@@ -167,4 +185,56 @@ async fn a_player_gets_a_timed_test_tone() {
             other => panic!("unexpected {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn a_player_switches_to_flac_on_request() {
+    let clock = ServerClock::new();
+    let (server, url) = start(clock).await;
+    let mut ws = player_with(&url, vec![PCM_48K_16, FLAC_48K_16]).await;
+    let conn = available(&server).await;
+    let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    stream.add_player(conn);
+
+    let ServerMessage::StreamStart(start) = next_text(&mut ws).await else {
+        panic!("expected stream/start first");
+    };
+    assert_eq!(start.player.unwrap().format(), PCM_48K_16);
+    let request = StreamRequestFormat {
+        player: Some(RequestFormatPlayer {
+            codec: Some(Codec::Flac),
+            ..Default::default()
+        }),
+        artwork: None,
+    };
+    send(&mut ws, &ClientMessage::RequestFormat(request)).await;
+
+    // PCM until the answer, then FLAC frames behind its header.
+    let start = loop {
+        match next(&mut ws).await {
+            Message::Binary(_) => {}
+            Message::Text(text) => match ServerMessage::decode(&text).unwrap() {
+                ServerMessage::StreamStart(start) => break start.player.unwrap(),
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    assert_eq!(start.format(), FLAC_48K_16);
+    let header = start.codec_header.expect("FLAC has a codec header");
+    use base64::Engine;
+    let mut flac = base64::engine::general_purpose::STANDARD
+        .decode(header)
+        .unwrap();
+    for _ in 0..5 {
+        let Message::Binary(frame) = next(&mut ws).await else {
+            panic!("expected audio");
+        };
+        let f = BinaryFrame::decode(&frame, HeaderLayout::Legacy).unwrap();
+        flac.extend_from_slice(f.payload);
+    }
+    let mut reader = claxon::FlacReader::new(&flac[..]).unwrap();
+    assert_eq!(reader.samples().count(), 5 * 960 * 2);
+    stream.stop().await;
 }

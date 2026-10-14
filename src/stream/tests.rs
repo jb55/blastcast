@@ -11,7 +11,7 @@ use super::*;
 use crate::connection::Queues;
 use crate::protocol::{
     BinaryFrame, ClientHello, ClientState, Codec, ConnectionReason, HeaderLayout, PlayerSupport,
-    StreamFormat,
+    RequestFormatPlayer, StreamFormat,
 };
 
 /// Bytes in a 20 ms chunk of 48 kHz stereo s16le.
@@ -26,14 +26,37 @@ fn pcm(sample_rate: u32, bit_depth: u32) -> StreamFormat {
     }
 }
 
+fn flac(bit_depth: u32) -> StreamFormat {
+    StreamFormat {
+        codec: Codec::Flac,
+        ..pcm(48_000, bit_depth)
+    }
+}
+
+fn opus(sample_rate: u32) -> StreamFormat {
+    StreamFormat {
+        codec: Codec::Opus,
+        ..pcm(sample_rate, 16)
+    }
+}
+
 fn player(
     clock: ServerClock,
     formats: Vec<StreamFormat>,
     capacity: u64,
 ) -> (Arc<Connection>, Queues) {
+    named_player(clock, "kitchen", formats, capacity)
+}
+
+fn named_player(
+    clock: ServerClock,
+    client_id: &str,
+    formats: Vec<StreamFormat>,
+    capacity: u64,
+) -> (Arc<Connection>, Queues) {
     let hello = ClientHello {
-        client_id: "kitchen".into(),
-        name: "Kitchen".into(),
+        client_id: client_id.into(),
+        name: client_id.into(),
         player_v1_support: Some(PlayerSupport {
             supported_formats: formats,
             buffer_capacity: capacity,
@@ -83,13 +106,47 @@ fn control(q: &mut Queues) -> Vec<&'static str> {
 
 /// Audio chunks queued so far: (timestamp, payload bytes).
 fn audio(q: &mut Queues) -> Vec<(i64, usize)> {
+    payloads(q)
+        .into_iter()
+        .map(|(ts, payload)| (ts, payload.len()))
+        .collect()
+}
+
+/// Audio chunks queued so far: (timestamp, payload).
+fn payloads(q: &mut Queues) -> Vec<(i64, Vec<u8>)> {
     let mut out = Vec::new();
     while let Ok(frame) = q.audio.try_recv() {
         let f = BinaryFrame::decode(&frame, HeaderLayout::Legacy).unwrap();
         assert_eq!(f.kind, binary::AUDIO_CHUNK);
-        out.push((f.timestamp_us, f.payload.len()));
+        out.push((f.timestamp_us, f.payload.to_vec()));
     }
     out
+}
+
+/// The player object of the next control message, a `stream/start`.
+fn stream_start(q: &mut Queues) -> StreamStartPlayer {
+    match q.control.try_recv() {
+        Ok(ServerMessage::StreamStart(start)) => start.player.unwrap(),
+        other => panic!("expected stream/start, got {other:?}"),
+    }
+}
+
+/// Decodes FLAC chunks with claxon, behind the `stream/start` header.
+fn decode_flac(start: &StreamStartPlayer, chunks: &[(i64, Vec<u8>)]) -> Vec<i32> {
+    use base64::Engine;
+    let mut bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            start
+                .codec_header
+                .as_ref()
+                .expect("FLAC has a codec header"),
+        )
+        .unwrap();
+    for (_, payload) in chunks {
+        bytes.extend_from_slice(payload);
+    }
+    let mut reader = claxon::FlacReader::new(&bytes[..]).unwrap();
+    reader.samples().map(Result::unwrap).collect()
 }
 
 /// Each chunk starts where the frames before it end, to the microsecond.
@@ -382,14 +439,11 @@ async fn a_player_without_the_session_rate_is_resampled() {
 #[tokio::test(start_paused = true)]
 async fn players_it_cannot_serve_are_skipped() {
     let clock = ServerClock::new();
-    let (conn, mut q) = player(
-        clock,
-        vec![StreamFormat {
-            codec: Codec::Opus,
-            ..pcm(48_000, 16)
-        }],
-        0,
-    );
+    let mono = StreamFormat {
+        channels: 1,
+        ..pcm(48_000, 16)
+    };
+    let (conn, mut q) = player(clock, vec![opus(44_100), flac(32), mono], 0);
     available(&conn, true);
     let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
     let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
@@ -397,5 +451,141 @@ async fn players_it_cannot_serve_are_skipped() {
     sleep_ms(50).await;
     assert!(control(&mut q).is_empty());
     assert!(audio(&mut q).is_empty());
+    stream.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_flac_player_gets_its_header_and_a_frame_a_chunk() {
+    let clock = ServerClock::new();
+    let (conn, mut q) = player(clock, vec![flac(24), pcm(48_000, 16)], 0);
+    available(&conn, true);
+    let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    stream.add_player(conn.clone());
+    sleep_ms(105).await;
+
+    let start = stream_start(&mut q);
+    assert_eq!(start.format(), flac(24));
+    let chunks = payloads(&mut q);
+    let ts: Vec<i64> = chunks.iter().map(|c| c.0).collect();
+    assert_eq!(ts, [270_000, 290_000, 310_000, 330_000, 350_000]);
+    // Compressed, and lossless: the sine from phase zero, at 24 bits.
+    assert!(chunks.iter().all(|c| c.1.len() < 960 * 6 / 2));
+    let samples = decode_flac(&start, &chunks);
+    assert_eq!(samples.len(), 5 * 960 * 2);
+    assert_eq!(&samples[..2], [0, 0]);
+    assert!(samples.iter().any(|s| s.unsigned_abs() > 4_000_000));
+    stream.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn opus_chunks_are_stamped_early_by_the_encoders_lookahead() {
+    let clock = ServerClock::new();
+    let (conn, mut q) = player(clock, vec![opus(48_000)], 0);
+    available(&conn, true);
+    let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    stream.add_player(conn.clone());
+    sleep_ms(65).await;
+
+    let start = stream_start(&mut q);
+    assert_eq!((start.format(), start.codec_header), (opus(48_000), None));
+    let delay = OpusEncoder::new(opus(48_000)).unwrap().delay_us();
+    let chunks = payloads(&mut q);
+    let ts: Vec<i64> = chunks.iter().map(|c| c.0).collect();
+    assert_eq!(ts, [270_000 - delay, 290_000 - delay, 310_000 - delay]);
+    let mut decoder = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
+    for (_, packet) in &chunks {
+        let mut out = vec![0.0; 960 * 2];
+        assert_eq!(decoder.decode_float(packet, &mut out, false).unwrap(), 960);
+    }
+    stream.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn players_on_one_format_share_its_encoder() {
+    let clock = ServerClock::new();
+    // Resampled, so an encoder of its own would hold back different
+    // frames, and stamp them differently, from the one already running.
+    let (kitchen, mut kq) = named_player(clock, "kitchen", vec![pcm(44_100, 16)], 0);
+    let (den, mut dq) = named_player(clock, "den", vec![pcm(44_100, 16)], 0);
+    let (attic, mut aq) = named_player(clock, "attic", vec![flac(16)], 0);
+    available(&kitchen, true);
+    available(&attic, true);
+    let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    for conn in [&kitchen, &den, &attic] {
+        stream.add_player((*conn).clone());
+    }
+    sleep_ms(65).await;
+    available(&den, true);
+    sleep_ms(100).await;
+
+    let k = payloads(&mut kq);
+    let d = payloads(&mut dq);
+    assert!(d.len() >= 4, "{}", d.len());
+    // The den's chunks are the kitchen's latest, to the byte and the µs.
+    assert_eq!(d[..], k[k.len() - d.len()..]);
+    assert_eq!(stream_start(&mut dq).format(), pcm(44_100, 16));
+    assert_eq!(payloads(&mut aq).len(), 8, "FLAC encoded beside it");
+    stream.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_format_request_gets_a_fresh_stream_start() {
+    let clock = ServerClock::new();
+    let (conn, mut q) = player(clock, vec![pcm(48_000, 16), flac(16), opus(48_000)], 0);
+    available(&conn, true);
+    let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    stream.add_player(conn.clone());
+    sleep_ms(45).await;
+    assert_eq!(stream_start(&mut q).format(), pcm(48_000, 16));
+    assert_eq!(
+        audio(&mut q),
+        [(270_000, CHUNK_BYTES), (290_000, CHUNK_BYTES)]
+    );
+
+    conn.request_format(RequestFormatPlayer {
+        codec: Some(Codec::Flac),
+        ..Default::default()
+    });
+    sleep_ms(40).await;
+    let start = stream_start(&mut q);
+    assert_eq!(start.format(), flac(16));
+    // FLAC from the next chunk on, on the same timeline.
+    let chunks = payloads(&mut q);
+    assert_eq!(
+        chunks.iter().map(|c| c.0).collect::<Vec<_>>(),
+        [310_000, 330_000]
+    );
+    assert_eq!(decode_flac(&start, &chunks).len(), 2 * 960 * 2);
+
+    // One it can't send changes nothing.
+    conn.request_format(RequestFormatPlayer {
+        sample_rate: Some(44_100),
+        ..Default::default()
+    });
+    sleep_ms(20).await;
+    assert!(control(&mut q).is_empty());
+    assert_eq!(payloads(&mut q).len(), 1);
+    stream.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_made_before_the_stream_picks_the_first_format() {
+    let clock = ServerClock::new();
+    let (conn, mut q) = player(clock, vec![pcm(48_000, 16), opus(48_000)], 0);
+    available(&conn, true);
+    conn.request_format(RequestFormatPlayer {
+        codec: Some(Codec::Opus),
+        ..Default::default()
+    });
+    let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
+    let stream = AudioStream::start(clock, Box::new(sine)).unwrap();
+    stream.add_player(conn.clone());
+    sleep_ms(25).await;
+    assert_eq!(stream_start(&mut q).format(), opus(48_000));
+    assert!(control(&mut q).is_empty(), "one stream/start, not two");
     stream.stop().await;
 }
