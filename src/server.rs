@@ -36,6 +36,7 @@ use tas_core::player::DeviceInfo;
 use tas_core::{PlayerFeature, PlayerRegistry, PlayerState};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
+use tracing::Instrument;
 
 use crate::connection::{Connection, Frame, write_loop};
 use crate::group::Groups;
@@ -46,6 +47,7 @@ use crate::protocol::{
     GoodbyeReason, PROTOCOL_VERSION, PlayerCommandKind, Role, ServerHello, ServerMessage,
     ServerTime, roles,
 };
+use crate::stats::LastError;
 use crate::status::PlayerStatus;
 
 /// Where clients connect, as advertised in the mDNS TXT `path`.
@@ -54,6 +56,8 @@ pub const PATH: &str = "/sendspin";
 pub const PROVIDER: &str = "sendspin";
 /// The largest frame a client may send; hellos and states are small.
 pub(crate) const MAX_MESSAGE: usize = 1 << 20;
+/// The departed clients whose last error `/debug` keeps.
+const MAX_DEPARTED: usize = 64;
 /// sendspin-go's limits on a hello.
 const MAX_ID_LEN: usize = 256;
 const MAX_ROLES: usize = 20;
@@ -158,6 +162,18 @@ pub struct SendspinServer {
     connections: Mutex<HashMap<String, Arc<Connection>>>,
     groups: Groups,
     membership: Arc<Membership>,
+    /// Clients that disconnected, by `client_id`, for `/debug`.
+    departed: Mutex<HashMap<String, Departed>>,
+}
+
+/// How a client's last connection ended.
+#[derive(Debug, Clone)]
+pub(crate) struct Departed {
+    pub(crate) name: String,
+    /// On the server clock.
+    pub(crate) at_us: i64,
+    pub(crate) goodbye: Option<GoodbyeReason>,
+    pub(crate) last_error: Option<LastError>,
 }
 
 impl fmt::Debug for SendspinServer {
@@ -182,6 +198,7 @@ impl SendspinServer {
             config,
             registry,
             connections: Mutex::new(HashMap::new()),
+            departed: Mutex::new(HashMap::new()),
         })
     }
 
@@ -255,13 +272,32 @@ impl SendspinServer {
                 return Disconnect::Refused(e);
             }
         };
-        let active_roles = self.activate_roles(&hello.supported_roles);
-        tracing::info!(
-            client_id = hello.client_id,
-            name = hello.name,
-            ?active_roles,
-            "sendspin client connected"
+        // Every log line of the connection, and of its writer, says whose.
+        let span = tracing::info_span!(
+            "sendspin",
+            client_id = %hello.client_id,
+            name = %hello.name,
         );
+        self.serve_client(hello, stream, sink, reason)
+            .instrument(span)
+            .await
+    }
+
+    async fn serve_client<St, Si, E>(
+        self: &Arc<Self>,
+        hello: ClientHello,
+        mut stream: St,
+        sink: Si,
+        reason: ConnectionReason,
+    ) -> Disconnect
+    where
+        St: Stream<Item = Result<Frame, E>> + Unpin,
+        E: Display,
+        Si: Sink<Frame> + Unpin + Send + 'static,
+        Si::Error: Display,
+    {
+        let active_roles = self.activate_roles(&hello.supported_roles);
+        tracing::info!(?active_roles, ?reason, "sendspin client connected");
         let (conn, queues) = Connection::new(hello, active_roles, reason, self.config.clock);
         let conn = Arc::new(conn);
         // Queued before anything else can be, so it is the first message.
@@ -278,7 +314,9 @@ impl SendspinServer {
         let writer = {
             let conn = conn.clone();
             let (ping, write) = (self.config.ping_interval, self.config.write_timeout);
-            tokio::spawn(async move { write_loop(&conn, sink, queues, ping, write).await })
+            tokio::spawn(
+                async move { write_loop(&conn, sink, queues, ping, write).await }.in_current_span(),
+            )
         };
 
         self.read_loop(&conn, &mut stream).await;
@@ -286,12 +324,7 @@ impl SendspinServer {
         self.groups.disconnect(conn.clone());
         let _ = writer.await;
         let replaced = !self.unregister(&conn);
-        tracing::info!(
-            client_id = conn.client_id(),
-            goodbye = ?conn.goodbye(),
-            replaced,
-            "sendspin client disconnected"
-        );
+        tracing::info!(goodbye = ?conn.goodbye(), replaced, "sendspin client disconnected");
         Disconnect::Ended {
             client_id: conn.client_id().to_owned(),
             goodbye: conn.goodbye(),
@@ -374,11 +407,13 @@ impl SendspinServer {
             let frame = match next {
                 Err(_) => {
                     tracing::warn!(client_id = conn.client_id(), ?idle, "client went quiet");
+                    conn.record_error(format!("went quiet for {idle:?}"));
                     return;
                 }
                 Ok(None | Some(Ok(Frame::Close))) => return,
                 Ok(Some(Err(e))) => {
                     tracing::debug!(client_id = conn.client_id(), error = %e, "read failed");
+                    conn.record_error(format!("read failed: {e}"));
                     return;
                 }
                 Ok(Some(Ok(frame))) => frame,
@@ -394,7 +429,8 @@ impl SendspinServer {
                 Frame::Binary(_) => {
                     tracing::debug!(client_id = conn.client_id(), "ignoring a binary frame");
                 }
-                Frame::Ping(_) | Frame::Pong(_) | Frame::Close => {}
+                Frame::Pong(payload) => conn.stats().pong(&payload, received_us),
+                Frame::Ping(_) | Frame::Close => {}
             }
         }
     }
@@ -411,6 +447,7 @@ impl SendspinServer {
             }
             Err(e) => {
                 tracing::warn!(client_id, error = %e, "ignoring a bad message");
+                conn.record_error(format!("bad message: {e}"));
                 return ControlFlow::Continue(());
             }
         };
@@ -557,8 +594,37 @@ impl SendspinServer {
             return false;
         }
         connections.remove(client_id);
+        drop(connections);
         self.remove_player(client_id);
+        self.depart(conn);
         true
+    }
+
+    /// Remembers how `conn`, the client's current connection, ended.
+    fn depart(&self, conn: &Connection) {
+        let mut departed = self.departed();
+        if departed.len() >= MAX_DEPARTED
+            && !departed.contains_key(conn.client_id())
+            && let Some(oldest) = departed
+                .iter()
+                .min_by_key(|(_, d)| d.at_us)
+                .map(|(id, _)| id.clone())
+        {
+            departed.remove(&oldest);
+        }
+        departed.insert(
+            conn.client_id().to_owned(),
+            Departed {
+                name: conn.name().to_owned(),
+                at_us: self.config.clock.now_us(),
+                goodbye: conn.goodbye(),
+                last_error: conn.stats().last_error(),
+            },
+        );
+    }
+
+    pub(crate) fn departed(&self) -> MutexGuard<'_, HashMap<String, Departed>> {
+        self.departed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Unregisters a player of ours. Another provider's player with the
@@ -639,6 +705,8 @@ fn is_mac(s: &str) -> bool {
 
 /// Answers a `client/time`. The writer stamps `server_transmitted`.
 fn on_client_time(conn: &Connection, time: ClientTime, received_us: i64) {
+    conn.stats()
+        .time_request(time.client_transmitted, received_us);
     let _ = conn.send(ServerMessage::Time(ServerTime {
         client_transmitted: time.client_transmitted,
         server_received: received_us,

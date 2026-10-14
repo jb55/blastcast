@@ -67,6 +67,7 @@ use tas_audio::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 pub use buffer::{BufferTracker, DEFAULT_CAPACITY_BYTES, MAX_BUFFERED_US};
 pub use encode::{Encoder, FlacEncoder, OpusEncoder, PcmEncoder, can_encode};
@@ -151,7 +152,8 @@ impl AudioStream {
             pending: None,
             wake_us: None,
         };
-        let task = tokio::spawn(streamer.run(rx));
+        // Under the span of whoever started it: a group's session.
+        let task = tokio::spawn(streamer.run(rx).in_current_span());
         Ok(Self {
             commands,
             task,
@@ -252,7 +254,9 @@ impl Output {
         }
     }
 
-    fn start(&mut self, encoding: &Encoding) {
+    /// `live` is whether the stream's source is, which the send-ahead
+    /// `/debug` shows for it depends on.
+    fn start(&mut self, encoding: &Encoding, live: bool) {
         let encoder = &encoding.encoder;
         self.send_control(ServerMessage::StreamStart(StreamStart {
             server_transmitted: None,
@@ -265,6 +269,10 @@ impl Output {
         self.tracker = BufferTracker::new(self.conn.player_status().timing.buffer_capacity);
         self.started = true;
         self.open = true;
+        let timing = self.conn.player_status().timing;
+        self.conn
+            .stats()
+            .stream_started(encoder.format(), send_ahead_us(&timing, live));
         tracing::info!(
             client_id = self.conn.client_id(),
             format = ?encoder.format(),
@@ -281,6 +289,7 @@ impl Output {
         }
         self.started = false;
         self.open = false;
+        self.conn.stats().stream_stopped();
     }
 
     /// Answers a `stream/request-format` that came since the last look.
@@ -706,6 +715,7 @@ impl Streamer {
                     "player unavailable, pausing its stream"
                 );
                 out.started = false;
+                out.conn.stats().stream_stopped();
             }
             self.outputs[i].tracker.prune(now);
         }
@@ -743,7 +753,7 @@ impl Streamer {
         let target = now + lead.max(LATE_JOIN_MIN_LEAD_US);
 
         if encoding.running {
-            out.start(encoding);
+            out.start(encoding, live);
             let first = encoding.sent.partition_point(|(s, _)| s.start_us < target);
             let chunks = encoding.sent.range(first..);
             let n = fitting_tail(
@@ -770,7 +780,7 @@ impl Streamer {
             .get(history.len() - n)
             .map_or(cursor, |(s, _)| s.start_us);
         encoding.run(at);
-        out.start(encoding);
+        out.start(encoding, live);
         for (span, samples) in replay {
             // A shift left a gap in the kept audio; the format's timeline
             // takes the same gap.
@@ -823,6 +833,8 @@ fn send_chunk(out: &mut Output, bytes: &[u8], span: Span, now: i64, live: bool) 
     let len = bytes.len() as u64;
     if live && !out.tracker.can_send(len, span.duration_us) {
         tracing::debug!(client_id, "player buffer full, chunk dropped");
+        out.conn.stats().chunk_dropped();
+        out.conn.record_error("player buffer full, chunk dropped");
         return;
     }
     let frame = binary::audio_chunk(
@@ -832,8 +844,17 @@ fn send_chunk(out: &mut Output, bytes: &[u8], span: Span, now: i64, live: bool) 
         bytes,
     );
     match out.conn.send_audio(Bytes::from(frame)) {
-        Ok(()) => out.tracker.register(span.end_us(), len, span.duration_us),
-        Err(SendError::Full) => tracing::debug!(client_id, "audio queue full, chunk dropped"),
+        Ok(()) => {
+            out.tracker.register(span.end_us(), len, span.duration_us);
+            out.conn
+                .stats()
+                .chunk_sent(span.start_us, span.end_us(), now);
+        }
+        Err(SendError::Full) => {
+            tracing::debug!(client_id, "audio queue full, chunk dropped");
+            out.conn.stats().chunk_dropped();
+            out.conn.record_error("audio queue full, chunk dropped");
+        }
         Err(SendError::NotReady | SendError::Unavailable) => out.started = false,
         Err(SendError::Closed) => {}
     }

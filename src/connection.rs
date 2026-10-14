@@ -31,6 +31,7 @@ use crate::protocol::{
     ArtworkChannelSupport, ClientHello, ClientState, ConnectionReason, GoodbyeReason, HeaderLayout,
     RequestFormatArtwork, RequestFormatPlayer, Role, ServerMessage, binary,
 };
+use crate::stats::LinkStats;
 use crate::status::{PlayerStatus, StatusChange};
 
 /// Control messages that may wait for the writer. A client that lets this
@@ -88,6 +89,7 @@ pub struct Connection {
     artwork: Mutex<Vec<ArtworkChannelSupport>>,
     goodbye: Mutex<Option<GoodbyeReason>>,
     closed: watch::Sender<bool>,
+    stats: LinkStats,
 }
 
 /// The receiving ends of a connection's queues, for its writer.
@@ -128,6 +130,7 @@ impl Connection {
             artwork: Mutex::new(artwork),
             goodbye: Mutex::new(None),
             closed: watch::channel(false).0,
+            stats: LinkStats::new(clock.now_us()),
         };
         let queues = Queues {
             control: control_rx,
@@ -186,6 +189,21 @@ impl Connection {
     /// Marks the client ready; true the first time.
     fn mark_ready(&self) -> bool {
         !self.ready.swap(true, Ordering::AcqRel)
+    }
+
+    /// What the server has measured about this connection, for `/debug`.
+    pub fn stats(&self) -> &LinkStats {
+        &self.stats
+    }
+
+    /// Records what went wrong, for `/debug`, at the current time.
+    pub fn record_error(&self, message: impl ToString) {
+        self.stats.error(message, self.clock.now_us());
+    }
+
+    /// Frames waiting in the audio queue for the socket.
+    pub fn audio_queued(&self) -> usize {
+        AUDIO_QUEUE - self.audio.capacity()
     }
 
     /// What the client last reported about itself.
@@ -293,6 +311,7 @@ impl Connection {
                     client_id = self.client_id(),
                     "control queue full, disconnecting"
                 );
+                self.record_error("control queue full, disconnected");
                 self.close();
                 Err(SendError::Full)
             }
@@ -386,7 +405,10 @@ pub(crate) async fn write_loop<Si>(
                 }
                 Next::Frame(Frame::Binary(chunk))
             }
-            _ = ping.tick() => Next::Frame(Frame::Ping(Bytes::new())),
+            _ = ping.tick() => {
+                let stamp = LinkStats::ping_payload(conn.clock.now_us());
+                Next::Frame(Frame::Ping(Bytes::copy_from_slice(&stamp)))
+            }
         };
         let write = async {
             future::poll_fn(|cx| sink.poll_ready_unpin(cx)).await?;
@@ -404,6 +426,7 @@ pub(crate) async fn write_loop<Si>(
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::debug!(client_id = conn.client_id(), error = %e, "write failed");
+                conn.record_error(format!("write failed: {e}"));
                 conn.close();
                 return;
             }
@@ -413,6 +436,7 @@ pub(crate) async fn write_loop<Si>(
                     ?write_timeout,
                     "write timed out, disconnecting"
                 );
+                conn.record_error(format!("write timed out after {write_timeout:?}"));
                 conn.close();
                 return;
             }
@@ -646,9 +670,15 @@ mod tests {
             })
         };
         let start = Instant::now();
-        assert_eq!(socket.next().await, Some(Frame::Ping(Bytes::new())));
+        // Each carries the server clock as it went out, for the RTT.
+        let stamped = |c: &Connection| {
+            Some(Frame::Ping(Bytes::copy_from_slice(
+                &LinkStats::ping_payload(c.clock().now_us()),
+            )))
+        };
+        assert_eq!(socket.next().await, stamped(&c));
         assert_eq!(start.elapsed(), Duration::from_secs(30));
-        assert_eq!(socket.next().await, Some(Frame::Ping(Bytes::new())));
+        assert_eq!(socket.next().await, stamped(&c));
         assert_eq!(start.elapsed(), Duration::from_secs(60));
         c.close();
         writer.await.unwrap();

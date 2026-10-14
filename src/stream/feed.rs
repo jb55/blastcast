@@ -52,7 +52,11 @@ impl Feed {
     pub(crate) fn spawn(source: Box<dyn LiveSource>) -> Self {
         let (tx, items) = mpsc::channel(READ_AHEAD);
         let queue = Arc::new(Mutex::new(Queue::default()));
-        let task = tokio::spawn(read(source, queue.clone(), tx));
+        let task = tokio::spawn(tracing::Instrument::in_current_span(read(
+            source,
+            queue.clone(),
+            tx,
+        )));
         Self { items, queue, task }
     }
 

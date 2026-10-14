@@ -814,7 +814,10 @@ impl Actor {
             playing.stream.seek(source)?;
             return Ok(());
         }
-        let stream = AudioStream::start(clock, source)?;
+        // The stream's task, and every log line from it, is in this
+        // session's span.
+        let session = tracing::info_span!("session", group_id, generation);
+        let stream = session.in_scope(|| AudioStream::start(clock, source))?;
         let ended = stream.ended();
         let id = group_id.to_owned();
         tokio::spawn(async move {
