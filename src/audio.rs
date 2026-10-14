@@ -244,6 +244,10 @@ impl LiveSource for FifoSource {
         true
     }
 
+    fn kind(&self) -> &'static str {
+        "airplay"
+    }
+
     async fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError> {
         Ok(self.chunks.recv().await)
     }
