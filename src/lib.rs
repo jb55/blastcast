@@ -6,8 +6,10 @@ pub mod dialer;
 pub mod player;
 pub mod protocol;
 pub mod server;
+pub mod status;
 
 pub use connection::{Connection, Frame, SendError};
 pub use dialer::{Dialer, DialerConfig};
 pub use player::SendspinPlayer;
 pub use server::{Disconnect, HandshakeError, SendspinServer, ServerConfig};
+pub use status::{PlayerStatus, PlayerTiming, StatusChange};

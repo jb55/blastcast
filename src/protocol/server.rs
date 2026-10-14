@@ -163,26 +163,53 @@ pub struct PlayerCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mute: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_delay_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_delay_ms: Option<u32>,
 }
 
+/// The largest output delay the spec allows, in milliseconds.
+pub const MAX_OUTPUT_DELAY_MS: u32 = 5000;
+
 impl PlayerCommand {
+    fn new(command: PlayerCommandKind) -> Self {
+        Self {
+            command,
+            volume: None,
+            mute: None,
+            output_delay_ms: None,
+            static_delay_ms: None,
+        }
+    }
+
     /// Set the volume, 0-100; higher values are clamped.
     pub fn volume(volume: u32) -> Self {
         Self {
-            command: PlayerCommandKind::Volume,
             volume: Some(volume.min(100)),
-            mute: None,
-            static_delay_ms: None,
+            ..Self::new(PlayerCommandKind::Volume)
         }
     }
 
     pub fn mute(mute: bool) -> Self {
         Self {
-            command: PlayerCommandKind::Mute,
-            volume: None,
             mute: Some(mute),
-            static_delay_ms: None,
+            ..Self::new(PlayerCommandKind::Mute)
+        }
+    }
+
+    /// Set the output delay, 0-5000 ms, as the current spec names it.
+    pub fn set_output_delay(ms: u32) -> Self {
+        Self {
+            output_delay_ms: Some(ms.min(MAX_OUTPUT_DELAY_MS)),
+            ..Self::new(PlayerCommandKind::SetOutputDelay)
+        }
+    }
+
+    /// The same, as aiosendspin 9.x names it.
+    pub fn set_static_delay(ms: u32) -> Self {
+        Self {
+            static_delay_ms: Some(ms.min(MAX_OUTPUT_DELAY_MS)),
+            ..Self::new(PlayerCommandKind::SetStaticDelay)
         }
     }
 }

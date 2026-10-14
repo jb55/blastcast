@@ -288,4 +288,18 @@ fn player_command_constructors() {
         msg.to_json(),
         r#"{"type":"server/command","payload":{"player":{"command":"mute","mute":false}}}"#
     );
+    let msg = ServerMessage::Command(tas_sendspin::protocol::ServerCommand {
+        player: Some(PlayerCommand::set_output_delay(6000)),
+    });
+    assert_eq!(
+        msg.to_json(),
+        r#"{"type":"server/command","payload":{"player":{"command":"set_output_delay","output_delay_ms":5000}}}"#
+    );
+    let msg = ServerMessage::Command(tas_sendspin::protocol::ServerCommand {
+        player: Some(PlayerCommand::set_static_delay(30)),
+    });
+    assert_eq!(
+        msg.to_json(),
+        r#"{"type":"server/command","payload":{"player":{"command":"set_static_delay","static_delay_ms":30}}}"#
+    );
 }

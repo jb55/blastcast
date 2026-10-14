@@ -31,9 +31,9 @@ pub use client::{
 };
 pub use envelope::DecodeError;
 pub use server::{
-    ArtworkStreamChannel, ControllerState, GroupUpdate, MetadataState, PlayerCommand, Progress,
-    ServerCommand, ServerHello, ServerMessage, ServerState, ServerTime, StreamClear, StreamEnd,
-    StreamStart, StreamStartArtwork, StreamStartPlayer,
+    ArtworkStreamChannel, ControllerState, GroupUpdate, MAX_OUTPUT_DELAY_MS, MetadataState,
+    PlayerCommand, Progress, ServerCommand, ServerHello, ServerMessage, ServerState, ServerTime,
+    StreamClear, StreamEnd, StreamStart, StreamStartArtwork, StreamStartPlayer,
 };
 pub use types::{
     Codec, ConnectionReason, GoodbyeReason, MediaCommand, PlaybackState, PlayerCommandKind,

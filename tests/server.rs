@@ -1,17 +1,21 @@
 //! The Sendspin server against a websocket client on a real socket: the
-//! handshake, registration, the audio gate, goodbye and replacement.
+//! handshake, registration, the audio gate, client state and commands,
+//! goodbye and replacement.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use tas_core::PlayerRegistry;
+use tas_core::{CommandError, PlayerCommand as Cmd, PlayerFeature, PlayerRegistry};
 use tas_sendspin::protocol::{
     ClientGoodbye, ClientHello, ClientMessage, ClientState, ConnectionReason, GoodbyeReason,
-    PlayerStateReport, PlayerSyncState, ServerMessage,
+    PlayerCommand, PlayerCommandKind, PlayerStateReport, PlayerSupport, PlayerSyncState,
+    ServerCommand, ServerMessage,
 };
-use tas_sendspin::{Disconnect, Frame, SendError, SendspinServer, ServerConfig};
+use tas_sendspin::{
+    Disconnect, Frame, PlayerTiming, SendError, SendspinPlayer, SendspinServer, ServerConfig,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -338,5 +342,254 @@ async fn a_silent_connection_is_refused() {
             Disconnect::Refused(tas_sendspin::HandshakeError::Timeout(_))
         ),
         "{end:?}"
+    );
+}
+
+fn hello_with_commands(client_id: &str, commands: &[PlayerCommandKind]) -> ClientMessage {
+    let ClientMessage::Hello(mut hello) = hello(client_id, &["player@v1"]) else {
+        unreachable!()
+    };
+    hello.player_v1_support = Some(PlayerSupport {
+        buffer_capacity: 500_000,
+        supported_commands: commands.to_vec(),
+        ..Default::default()
+    });
+    ClientMessage::Hello(hello)
+}
+
+fn state(available: bool, player: PlayerStateReport) -> ClientMessage {
+    ClientMessage::State(ClientState {
+        available: Some(available),
+        player: Some(player),
+        ..Default::default()
+    })
+}
+
+fn volume(volume: u32, muted: bool) -> PlayerStateReport {
+    PlayerStateReport {
+        volume: Some(volume),
+        muted: Some(muted),
+        ..Default::default()
+    }
+}
+
+async fn expect_command(ws: &mut Client) -> PlayerCommand {
+    match next_server_message(ws).await {
+        ServerMessage::Command(ServerCommand {
+            player: Some(command),
+        }) => command,
+        other => panic!("expected server/command, got {other:?}"),
+    }
+}
+
+/// Volume and mute reach the registry from the player's own reports, and
+/// a command changes nothing until the player echoes the new value.
+#[tokio::test]
+async fn volume_and_mute_follow_the_players_reports() {
+    let h = start(config()).await;
+    let mut ws = connect(&h.url).await;
+    send(
+        &mut ws,
+        &hello_with_commands(
+            "kitchen",
+            &[PlayerCommandKind::Volume, PlayerCommandKind::Mute],
+        ),
+    )
+    .await;
+    next_server_message(&mut ws).await;
+    let p = h.registry.get("kitchen").unwrap();
+    assert!(p.supports(PlayerFeature::VolumeSet) && p.supports(PlayerFeature::VolumeMute));
+
+    send(&mut ws, &state(true, volume(30, false))).await;
+    eventually("volume reported", || {
+        h.registry
+            .get("kitchen")
+            .is_some_and(|p| p.available && p.volume_level == Some(30))
+    })
+    .await;
+    assert_eq!(h.registry.get("kitchen").unwrap().volume_muted, Some(false));
+
+    h.registry
+        .execute("kitchen", Cmd::VolumeSet(55))
+        .await
+        .unwrap();
+    assert_eq!(expect_command(&mut ws).await, PlayerCommand::volume(55));
+    assert_eq!(
+        h.registry.get("kitchen").unwrap().volume_level,
+        Some(30),
+        "unchanged until the player says so"
+    );
+    // The player settles on its own value; that is the truth.
+    send(&mut ws, &state(true, volume(54, false))).await;
+    eventually("echo applied", || {
+        h.registry
+            .get("kitchen")
+            .is_some_and(|p| p.volume_level == Some(54))
+    })
+    .await;
+
+    h.registry
+        .execute("kitchen", Cmd::VolumeMute(true))
+        .await
+        .unwrap();
+    assert_eq!(expect_command(&mut ws).await, PlayerCommand::mute(true));
+    send(&mut ws, &state(true, volume(54, true))).await;
+    eventually("mute applied", || {
+        h.registry
+            .get("kitchen")
+            .is_some_and(|p| p.volume_muted == Some(true) && p.volume_level == Some(54))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_player_without_volume_commands_has_no_volume_features() {
+    let h = start(config()).await;
+    let (mut ws, _) = handshake(&h.url, "fixed", &["player@v1"]).await;
+    send(&mut ws, &synchronized()).await;
+    eventually("available", || {
+        h.registry.get("fixed").is_some_and(|p| p.available)
+    })
+    .await;
+    let p = h.registry.get("fixed").unwrap();
+    assert!(!p.supports(PlayerFeature::VolumeSet));
+    assert_eq!(p.volume_level, Some(80), "still shown as reported");
+    assert_eq!(
+        h.registry.execute("fixed", Cmd::VolumeSet(10)).await,
+        Err(CommandError::Unsupported {
+            command: "volume_set"
+        })
+    );
+}
+
+/// The timing fields land on the connection for the streamer, and the
+/// output delay command goes out under the name the player listed.
+#[tokio::test]
+async fn timing_and_the_output_delay_command() {
+    let h = start(config()).await;
+    let mut ws = connect(&h.url).await;
+    send(&mut ws, &hello_with_commands("den", &[])).await;
+    next_server_message(&mut ws).await;
+    let conn = h.server.connection("den").unwrap();
+    let mut watch = conn.watch_player_status();
+
+    send(
+        &mut ws,
+        &state(
+            true,
+            PlayerStateReport {
+                output_delay_ms: Some(40),
+                required_lead_time_ms: Some(300),
+                min_buffer_ms: Some(120),
+                supported_commands: Some(vec![PlayerCommandKind::SetOutputDelay]),
+                ..Default::default()
+            },
+        ),
+    )
+    .await;
+    tokio::time::timeout(WAIT, watch.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        conn.player_status().timing,
+        PlayerTiming {
+            output_delay_ms: 40,
+            required_lead_time_ms: Some(300),
+            min_buffer_ms: Some(120),
+            buffer_capacity: 500_000,
+        }
+    );
+
+    let player = SendspinPlayer::new(conn.clone());
+    player.set_output_delay(9000).unwrap();
+    assert_eq!(
+        expect_command(&mut ws).await,
+        PlayerCommand::set_output_delay(5000)
+    );
+
+    // An aiosendspin 9.x player names it set_static_delay.
+    send(
+        &mut ws,
+        &state(
+            true,
+            PlayerStateReport {
+                static_delay_ms: Some(5000),
+                supported_commands: Some(vec![PlayerCommandKind::SetStaticDelay]),
+                ..Default::default()
+            },
+        ),
+    )
+    .await;
+    eventually("static delay listed", || {
+        conn.player_status()
+            .supports(PlayerCommandKind::SetStaticDelay)
+    })
+    .await;
+    player.set_output_delay(25).unwrap();
+    assert_eq!(
+        expect_command(&mut ws).await,
+        PlayerCommand::set_static_delay(25)
+    );
+
+    // Each state's list replaces the one before.
+    let no_delay = PlayerStateReport {
+        supported_commands: Some(vec![]),
+        ..Default::default()
+    };
+    send(&mut ws, &state(true, no_delay)).await;
+    eventually("delay command withdrawn", || {
+        conn.player_status().state_commands.is_empty()
+    })
+    .await;
+    assert_eq!(
+        player.set_output_delay(25),
+        Err(CommandError::Unsupported {
+            command: "set_output_delay"
+        })
+    );
+}
+
+/// A player whose output is taken stops getting audio and commands, and
+/// gets them again only once it says it is back.
+#[tokio::test]
+async fn an_unavailable_player_gets_no_audio_or_commands() {
+    let h = start(config()).await;
+    let mut ws = connect(&h.url).await;
+    send(
+        &mut ws,
+        &hello_with_commands("kitchen", &[PlayerCommandKind::Volume]),
+    )
+    .await;
+    next_server_message(&mut ws).await;
+    let conn = h.server.connection("kitchen").unwrap();
+    send(&mut ws, &state(true, volume(50, false))).await;
+    eventually("available", || conn.is_available()).await;
+    conn.send_audio(Bytes::from_static(b"\x04chunk")).unwrap();
+    assert!(matches!(next(&mut ws).await, Some(Message::Binary(_))));
+
+    send(&mut ws, &state(false, volume(50, false))).await;
+    eventually("unavailable in the registry", || {
+        h.registry.get("kitchen").is_some_and(|p| !p.available)
+    })
+    .await;
+    assert_eq!(
+        conn.send_audio(Bytes::from_static(b"\x04chunk")),
+        Err(SendError::Unavailable)
+    );
+    assert_eq!(
+        h.registry.execute("kitchen", Cmd::VolumeSet(10)).await,
+        Err(CommandError::Unavailable("kitchen".into()))
+    );
+
+    send(&mut ws, &state(true, volume(50, false))).await;
+    eventually("back", || {
+        h.registry.get("kitchen").is_some_and(|p| p.available)
+    })
+    .await;
+    conn.send_audio(Bytes::from_static(b"\x04again")).unwrap();
+    assert_eq!(
+        next(&mut ws).await,
+        Some(Message::Binary(Bytes::from_static(b"\x04again")))
     );
 }

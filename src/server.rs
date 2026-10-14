@@ -29,7 +29,7 @@ use axum::response::Response;
 use axum::routing::get;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
 use tas_audio::ServerClock;
-use tas_core::{PlayerRegistry, PlayerState};
+use tas_core::{PlayerFeature, PlayerRegistry, PlayerState};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
@@ -37,8 +37,10 @@ use crate::connection::{Connection, Frame, write_loop};
 use crate::player::SendspinPlayer;
 use crate::protocol::{
     ClientHello, ClientMessage, ClientState, ClientTime, ConnectionReason, DecodeError,
-    GoodbyeReason, PROTOCOL_VERSION, Role, ServerHello, ServerMessage, ServerTime, roles,
+    GoodbyeReason, PROTOCOL_VERSION, PlayerCommandKind, Role, ServerHello, ServerMessage,
+    ServerTime, roles,
 };
+use crate::status::PlayerStatus;
 
 /// Where clients connect, as advertised in the mDNS TXT `path`.
 pub const PATH: &str = "/sendspin";
@@ -392,17 +394,27 @@ impl SendspinServer {
         ControlFlow::Continue(())
     }
 
+    /// Merges a `client/state` into the connection's status and mirrors
+    /// it into the registry. The player's report is the truth: volume and
+    /// mute only change here, never when a command is sent.
     fn on_client_state(&self, conn: &Arc<Connection>, state: &ClientState) {
-        if conn.mark_ready() {
-            tracing::debug!(client_id = conn.client_id(), "first client/state, ready");
+        let client_id = conn.client_id();
+        let change = conn.apply_state(state);
+        if change.first {
+            tracing::debug!(client_id, "first client/state, ready");
         }
-        let Some(available) = state.available() else {
-            return;
-        };
-        if conn.has_role("player") && self.is_current(conn) {
+        if change.became_unavailable {
+            // Its output is taken. The audio gate already holds its stream
+            // back; leaving its group to a stopped solo group is the group
+            // layer's, which watches the status for this edge. It is never
+            // rejoined automatically when it comes back.
+            tracing::info!(client_id, "client became unavailable");
+        }
+        if change.changed && conn.has_role("player") && self.is_current(conn) {
+            let status = conn.player_status();
             let _ = self
                 .registry
-                .update(conn.client_id(), |p| p.available = available);
+                .update(client_id, |p| mirror_status(p, &status));
         }
     }
 
@@ -419,7 +431,7 @@ impl SendspinServer {
         if conn.has_role("player") {
             // Unavailable until its first client/state says otherwise.
             let mut state = PlayerState::new(client_id, PROVIDER, conn.name());
-            state.available = false;
+            mirror_status(&mut state, &conn.player_status());
             let control = Arc::new(SendspinPlayer::new(conn.clone()));
             if let Err(e) = self.registry.add(state, control) {
                 tracing::warn!(client_id, error = %e, "can't register the player");
@@ -465,6 +477,24 @@ impl SendspinServer {
         self.connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Copies what a player reported into its registry state: availability,
+/// volume and mute, and the volume features its commands allow.
+fn mirror_status(p: &mut PlayerState, status: &PlayerStatus) {
+    p.available = status.available;
+    p.volume_level = status.volume;
+    p.volume_muted = status.muted;
+    for (command, feature) in [
+        (PlayerCommandKind::Volume, PlayerFeature::VolumeSet),
+        (PlayerCommandKind::Mute, PlayerFeature::VolumeMute),
+    ] {
+        if status.supports(command) {
+            p.supported_features.insert(feature);
+        } else {
+            p.supported_features.remove(&feature);
+        }
     }
 }
 

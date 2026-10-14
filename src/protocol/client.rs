@@ -252,8 +252,11 @@ impl ClientState {
 }
 
 /// The `player` object in `client/state`. Every field is optional: an
-/// update carries only what changed. Volume is left unclamped for the
-/// handler to clamp, so one out-of-range value doesn't drop the update.
+/// update carries only what changed. Volume and delay are left unclamped
+/// for the handler to clamp, so one out-of-range value doesn't drop the
+/// update. The delay is `output_delay_ms` in the current spec and
+/// `static_delay_ms` in aiosendspin 9.x; read it with
+/// [`PlayerStateReport::output_delay_ms`].
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PlayerStateReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,6 +266,8 @@ pub struct PlayerStateReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub muted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_delay_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_delay_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_lead_time_ms: Option<u32>,
@@ -270,6 +275,13 @@ pub struct PlayerStateReport {
     pub min_buffer_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_commands: Option<Vec<PlayerCommandKind>>,
+}
+
+impl PlayerStateReport {
+    /// The output delay in milliseconds, under either name.
+    pub fn output_delay_ms(&self) -> Option<u32> {
+        self.output_delay_ms.or(self.static_delay_ms)
+    }
 }
 
 /// `client/command`: a controller acting on its group.

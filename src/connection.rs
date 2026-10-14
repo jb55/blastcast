@@ -21,8 +21,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 
 use crate::protocol::{
-    ClientHello, ConnectionReason, GoodbyeReason, HeaderLayout, Role, ServerMessage,
+    ClientHello, ClientState, ConnectionReason, GoodbyeReason, HeaderLayout, Role, ServerMessage,
 };
+use crate::status::{PlayerStatus, StatusChange};
 
 /// Control messages that may wait for the writer. A client that lets this
 /// many pile up isn't reading, and is disconnected.
@@ -47,6 +48,8 @@ pub enum SendError {
     Closed,
     #[error("the client hasn't sent its first client/state yet")]
     NotReady,
+    #[error("the client is unavailable: its output is in use by something else")]
+    Unavailable,
     #[error("the send queue is full")]
     Full,
 }
@@ -64,6 +67,7 @@ pub struct Connection {
     audio: mpsc::Sender<Bytes>,
     /// Set by the first `client/state`. Audio waits for it.
     ready: AtomicBool,
+    status: watch::Sender<PlayerStatus>,
     goodbye: Mutex<Option<GoodbyeReason>>,
     closed: watch::Sender<bool>,
 }
@@ -83,6 +87,7 @@ impl Connection {
     ) -> (Self, Queues) {
         let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
         let (audio, audio_rx) = mpsc::channel(AUDIO_QUEUE);
+        let status = watch::channel(PlayerStatus::from_hello(&hello)).0;
         let conn = Self {
             hello,
             active_roles,
@@ -94,6 +99,7 @@ impl Connection {
             control,
             audio,
             ready: AtomicBool::new(false),
+            status,
             goodbye: Mutex::new(None),
             closed: watch::channel(false).0,
         };
@@ -152,8 +158,36 @@ impl Connection {
     }
 
     /// Marks the client ready; true the first time.
-    pub(crate) fn mark_ready(&self) -> bool {
+    fn mark_ready(&self) -> bool {
         !self.ready.swap(true, Ordering::AcqRel)
+    }
+
+    /// What the client last reported about itself.
+    pub fn player_status(&self) -> PlayerStatus {
+        self.status.borrow().clone()
+    }
+
+    /// Sees every change to [`Connection::player_status`]: availability,
+    /// volume, and the timing a streamer schedules by.
+    pub fn watch_player_status(&self) -> watch::Receiver<PlayerStatus> {
+        self.status.subscribe()
+    }
+
+    /// Whether the client has said it can take part in playback.
+    pub fn is_available(&self) -> bool {
+        self.status.borrow().available
+    }
+
+    /// Merges a `client/state` into the status, marking the client ready.
+    /// Watchers are woken only when something changed.
+    pub(crate) fn apply_state(&self, state: &ClientState) -> StatusChange {
+        let first = self.mark_ready();
+        let mut change = StatusChange::default();
+        self.status.send_if_modified(|status| {
+            change = status.apply(state, first);
+            change.changed
+        });
+        change
     }
 
     /// The reason the client gave in `client/goodbye`, once it has.
@@ -183,14 +217,17 @@ impl Connection {
     }
 
     /// Queues a binary frame (an encoded audio chunk or artwork). Refused
-    /// until the client's first `client/state`, and when the queue is full,
-    /// which is the streamer's to handle.
+    /// until the client's first `client/state`, while it is unavailable,
+    /// and when the queue is full, which is the streamer's to handle.
     pub fn send_audio(&self, frame: Bytes) -> Result<(), SendError> {
         if self.is_closed() {
             return Err(SendError::Closed);
         }
         if !self.is_ready() {
             return Err(SendError::NotReady);
+        }
+        if !self.is_available() {
+            return Err(SendError::Unavailable);
         }
         self.audio.try_send(frame).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => SendError::Full,
@@ -300,6 +337,13 @@ mod tests {
         Connection::new(hello, roles, ConnectionReason::Playback, ServerClock::new())
     }
 
+    fn state(available: bool) -> ClientState {
+        ClientState {
+            available: Some(available),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn audio_waits_for_the_first_client_state() {
         let (c, _q) = conn(&["player@v1"]);
@@ -307,14 +351,35 @@ mod tests {
             c.send_audio(Bytes::from_static(b"x")),
             Err(SendError::NotReady)
         );
-        assert!(c.mark_ready());
-        assert!(!c.mark_ready());
+        assert!(c.apply_state(&state(true)).first);
+        assert!(!c.apply_state(&state(true)).first);
         assert_eq!(c.send_audio(Bytes::from_static(b"x")), Ok(()));
         c.close();
         assert_eq!(
             c.send_audio(Bytes::from_static(b"x")),
             Err(SendError::Closed)
         );
+    }
+
+    #[test]
+    fn audio_stops_while_the_client_is_unavailable() {
+        let (c, _q) = conn(&["player@v1"]);
+        let mut watch = c.watch_player_status();
+        c.apply_state(&state(true));
+        assert!(watch.has_changed().unwrap());
+        assert!(watch.borrow_and_update().available);
+
+        assert!(c.apply_state(&state(false)).became_unavailable);
+        assert_eq!(
+            c.send_audio(Bytes::from_static(b"x")),
+            Err(SendError::Unavailable)
+        );
+        assert!(!watch.borrow_and_update().available);
+
+        c.apply_state(&state(false));
+        assert!(!watch.has_changed().unwrap(), "no change, no wake");
+        c.apply_state(&state(true));
+        assert_eq!(c.send_audio(Bytes::from_static(b"x")), Ok(()));
     }
 
     #[test]
@@ -342,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn control_overtakes_queued_audio() {
         let (c, q) = conn(&["player@v1"]);
-        c.mark_ready();
+        c.apply_state(&state(true));
         for i in 0..5u8 {
             c.send_audio(Bytes::from(vec![i])).unwrap();
         }
@@ -385,7 +450,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stamps_transmit_time_when_written_not_when_queued() {
         let (c, q) = conn(&["player@v1"]);
-        c.mark_ready();
+        c.apply_state(&state(true));
         let (sink, mut socket) = futures_channel::mpsc::channel::<Frame>(0);
         let c = std::sync::Arc::new(c);
         let writer = {

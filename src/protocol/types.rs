@@ -119,6 +119,9 @@ pub enum PlayerSyncState {
 pub enum PlayerCommandKind {
     Volume,
     Mute,
+    /// The current spec's name for setting the output delay.
+    SetOutputDelay,
+    /// aiosendspin 9.x's name for the same command.
     SetStaticDelay,
     #[serde(other)]
     Unknown,
