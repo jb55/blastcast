@@ -74,8 +74,8 @@ pub struct Connection {
 
 /// The receiving ends of a connection's queues, for its writer.
 pub(crate) struct Queues {
-    control: mpsc::Receiver<ServerMessage>,
-    audio: mpsc::Receiver<Bytes>,
+    pub(crate) control: mpsc::Receiver<ServerMessage>,
+    pub(crate) audio: mpsc::Receiver<Bytes>,
 }
 
 impl Connection {
@@ -233,6 +233,12 @@ impl Connection {
             mpsc::error::TrySendError::Full(_) => SendError::Full,
             mpsc::error::TrySendError::Closed(_) => SendError::Closed,
         })
+    }
+
+    /// How many more binary frames the audio queue takes before
+    /// [`Connection::send_audio`] answers `Full`.
+    pub fn audio_queue_room(&self) -> usize {
+        self.audio.capacity()
     }
 
     /// Ends the connection: the writer sends a close frame and the read
