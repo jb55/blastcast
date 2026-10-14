@@ -39,7 +39,7 @@ pub const PATH: &str = "/sendspin";
 /// The `provider` of every player this server registers.
 pub const PROVIDER: &str = "sendspin";
 /// The largest frame a client may send; hellos and states are small.
-const MAX_MESSAGE: usize = 1 << 20;
+pub(crate) const MAX_MESSAGE: usize = 1 << 20;
 /// sendspin-go's limits on a hello.
 const MAX_ID_LEN: usize = 256;
 const MAX_ROLES: usize = 20;
