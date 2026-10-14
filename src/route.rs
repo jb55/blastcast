@@ -46,9 +46,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use async_trait::async_trait;
 use tas_core::images::image_url;
 use tas_core::player::{MediaType, PlayerMedia, PlayerSource, unix_now};
-use tas_core::{CommandError, PlayerCommand, PlayerRegistry, SourceMetadata, SourceSession};
+use tas_core::{
+    CommandError, PlayerCommand, PlayerRegistry, SourceMetadata, SourceSelect, SourceSession,
+};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::audio::AirplayAudio;
@@ -63,6 +66,14 @@ pub const SOURCE_PROVIDER: &str = "airplay_receiver";
 /// entry in the source list and the `active_source` while it plays.
 pub fn source_id(target_id: &str) -> String {
     format!("{SOURCE_PROVIDER}://audio_source/{target_id}")
+}
+
+/// The receiver whose source id is `source_id`.
+pub fn target_of(source_id: &str) -> Option<&str> {
+    source_id
+        .strip_prefix(SOURCE_PROVIDER)?
+        .strip_prefix("://audio_source/")
+        .filter(|t| !t.is_empty())
 }
 
 /// The source's entry in a player's source list.
@@ -412,6 +423,34 @@ impl AirplayRouter {
                 }
                 None => {}
             }
+        }
+    }
+}
+
+/// `players/cmd/select_source` of an AirPlay source, and the release when
+/// the player playing it stops.
+#[async_trait]
+impl SourceSelect for AirplayRouter {
+    fn owns(&self, source_id: &str) -> bool {
+        target_of(source_id).is_some()
+    }
+
+    async fn select(&self, source_id: &str, player_id: &str) -> Result<(), CommandError> {
+        let target = target_of(source_id)
+            .ok_or_else(|| CommandError::Failed(format!("{source_id} is not an AirPlay source")))?;
+        AirplayRouter::select(self, target, player_id)
+            .await
+            .map(drop)
+    }
+
+    async fn release(&self, source_id: &str, player_id: &str) {
+        let Some(target) = target_of(source_id) else {
+            return;
+        };
+        if let Some(claim) = self.claim(target).await
+            && claim.player_id == player_id
+        {
+            self.unselect(target, player_id, claim.session).await;
         }
     }
 }
@@ -843,6 +882,27 @@ mod tests {
         // The sender plays on to nobody: its metadata goes nowhere.
         rig.track("Angel");
         assert!(rig.wait(1).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_select_selects_and_releases_by_source_id() {
+        let rig = Rig::new(true);
+        let router: &dyn SourceSelect = &*rig.router;
+        assert!(router.owns(KITCHEN));
+        assert!(!router.owns("airplay_receiver://audio_source/"));
+        assert!(!router.owns("spotify://kitchen"));
+        rig.marker(PLAY_BEGIN);
+        rig.wait(2).await;
+
+        router.select(KITCHEN, "den").await.unwrap();
+        rig.calls();
+        assert_eq!(rig.router.claim("kitchen").await.unwrap().player_id, "den");
+        // A player that isn't playing it can't release it.
+        router.release(KITCHEN, "kitchen").await;
+        assert!(rig.router.claim("kitchen").await.is_some());
+        router.release(KITCHEN, "den").await;
+        assert_eq!(rig.router.claim("kitchen").await, None);
+        assert_eq!(rig.get("den").active_source, None);
     }
 
     #[tokio::test]
