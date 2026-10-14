@@ -9,11 +9,14 @@
 //! - [`audio`] reads each receiver's PCM fifo into a live source.
 //! - [`metadata`] parses each receiver's metadata fifo into what its
 //!   sender is playing.
+//! - [`route`] plays each sender's session on the receiver's target player
+//!   or group, with its volume and what it is playing.
 
 pub mod audio;
 pub mod binary;
 pub mod config;
 pub mod metadata;
+pub mod route;
 pub mod supervisor;
 #[cfg(test)]
 mod testing;
@@ -21,4 +24,5 @@ mod testing;
 pub use audio::AirplayAudio;
 pub use config::{NameTemplate, ReceiverInfo};
 pub use metadata::{AirplayEvent, AirplayMetadata, MetadataEvent, NowPlaying};
+pub use route::AirplayRouter;
 pub use supervisor::{ReceiverHandler, ReceiverSupervisor, SupervisorConfig};

@@ -218,13 +218,13 @@ impl LiveSource for FifoSource {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::time::{Duration, Instant};
 
     use tas_audio::SESSION_FORMAT;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+    use crate::testing::mkfifo;
 
     struct Rig {
         _dir: tempfile::TempDir,
@@ -260,15 +260,6 @@ mod tests {
         fn raw(&self) -> FifoSource {
             self.audio.subscribe("ss-kitchen").unwrap()
         }
-    }
-
-    fn mkfifo(path: &Path) {
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::Mode::from_raw_mode(0o600),
-        )
-        .unwrap();
     }
 
     fn s16(samples: &[i16]) -> Vec<u8> {

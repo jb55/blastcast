@@ -462,6 +462,11 @@ impl AirplayMetadata {
     pub fn now_playing(&self, target_id: &str) -> Option<NowPlaying> {
         lock(&self.receivers).get(target_id).map(|r| r.now.clone())
     }
+
+    /// The targets whose receivers are running.
+    pub fn targets(&self) -> Vec<String> {
+        lock(&self.receivers).keys().cloned().collect()
+    }
 }
 
 impl ReceiverHandler for AirplayMetadata {
@@ -496,8 +501,16 @@ impl ReceiverHandler for AirplayMetadata {
         }
     }
 
+    /// A receiver that stops mid-session ends it: its hook never will.
     fn stopped(&self, receiver: &ReceiverInfo) {
-        lock(&self.receivers).remove(&receiver.target_id);
+        let removed = lock(&self.receivers).remove(&receiver.target_id);
+        if removed.is_some_and(|r| r.now.playing) {
+            tracing::debug!(target_id = %receiver.target_id, "AirPlay receiver stopped mid-session");
+            let _ = self.events.send(AirplayEvent {
+                target_id: receiver.target_id.clone(),
+                event: MetadataEvent::PlayEnd,
+            });
+        }
     }
 }
 
@@ -509,6 +522,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::item;
 
     /// A session from an iPhone, written byte for byte as shairport's
     /// `metadata/pipe.c` writes it: two empty batches, the begin marker,
@@ -558,31 +572,6 @@ mod tests {
             }),
             PlayEnd,
         ]
-    }
-
-    /// Writes one item the way `metadata/pipe.c` does.
-    fn item(kind: &str, code: &str, data: &[u8]) -> Vec<u8> {
-        let hex = |s: &str| u32::from_be_bytes(s.as_bytes().try_into().unwrap());
-        let mut out = format!(
-            "<item><type>{:x}</type><code>{:x}</code><length>{}</length>",
-            hex(kind),
-            hex(code),
-            data.len()
-        )
-        .into_bytes();
-        if !data.is_empty() {
-            out.extend(b"\n<data encoding=\"base64\">\n");
-            for group in data.chunks(57) {
-                out.extend(
-                    base64::engine::general_purpose::STANDARD
-                        .encode(group)
-                        .bytes(),
-                );
-            }
-            out.extend(b"</data>");
-        }
-        out.extend(b"</item>\n");
-        out
     }
 
     #[test]
@@ -769,6 +758,26 @@ mod tests {
 
         meta.stopped(&info);
         assert!(meta.now_playing("ss-kitchen").is_none());
+    }
+
+    #[test]
+    fn a_receiver_stopping_mid_session_ends_it() {
+        let meta = AirplayMetadata::new();
+        let info = receiver();
+        let mut events = meta.subscribe();
+        meta.started(&info);
+        meta.stopped(&info);
+        assert!(events.try_recv().is_err(), "an idle one ends nothing");
+
+        meta.started(&info);
+        assert_eq!(meta.targets(), ["ss-kitchen"]);
+        meta.metadata(&info, b"MA_PLAY_BEGIN\n");
+        assert_eq!(events.try_recv().unwrap().event, MetadataEvent::PlayBegin);
+        meta.stopped(&info);
+        let end = events.try_recv().unwrap();
+        assert_eq!(end.target_id, "ss-kitchen");
+        assert_eq!(end.event, MetadataEvent::PlayEnd);
+        assert!(meta.targets().is_empty());
     }
 
     #[test]
