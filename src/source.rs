@@ -79,6 +79,10 @@ impl LiveSource for SineSource {
         self.pacing.is_some()
     }
 
+    fn kind(&self) -> &'static str {
+        "tone"
+    }
+
     async fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError> {
         let frames = match self.remaining {
             Some(0) => return Ok(None),
@@ -133,6 +137,10 @@ impl<S: LiveSource> LiveSource for Resampled<S> {
 
     fn is_live(&self) -> bool {
         self.inner.is_live()
+    }
+
+    fn kind(&self) -> &'static str {
+        self.inner.kind()
     }
 
     async fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError> {
