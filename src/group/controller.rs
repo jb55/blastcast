@@ -256,6 +256,7 @@ mod tests {
             } else {
                 PlaybackState::Stopped
             },
+            stream: None,
         }
     }
 

@@ -146,7 +146,13 @@ async fn a_group_plays_one_timeline_to_all_its_players() {
     assert_eq!(groups.get(&group).unwrap().members, ["kitchen", "den"]);
     assert_eq!(groups.list().len(), 1, "the den's own group is gone");
 
+    let started = clock.now_us();
     groups.play(&group, tone(clock)).await.unwrap();
+    let stream = groups.get(&group).unwrap().stream.expect("a stream");
+    assert_eq!(
+        (stream.source, stream.live, stream.format, stream.started_us),
+        ("tone", true, SESSION_FORMAT, started)
+    );
     sleep_ms(100).await;
     assert_eq!(
         control(&mut kq),
@@ -172,6 +178,10 @@ async fn a_group_plays_one_timeline_to_all_its_players() {
     groups.stop(&group).await.unwrap();
     assert_eq!(control(&mut kq), ["end", "group stopped kitchen speaker"]);
     assert_eq!(control(&mut dq), ["end", "group stopped kitchen speaker"]);
+    assert_eq!(groups.get(&group).unwrap().stream, None);
+    groups.play(&group, tone(clock)).await.unwrap();
+    let again = groups.get(&group).unwrap().stream.expect("a stream");
+    assert_ne!(again.generation, stream.generation, "a new stream");
 }
 
 /// The card's test: two players in one group stay in sync while one joins

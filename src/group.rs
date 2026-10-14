@@ -40,7 +40,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-use tas_audio::{AudioError, LiveSource, ServerClock};
+use tas_audio::{AudioError, AudioFormat, LiveSource, ServerClock};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::connection::Connection;
@@ -63,6 +63,22 @@ pub struct GroupInfo {
     /// Client ids, in the order they joined.
     pub members: Vec<String>,
     pub playback_state: PlaybackState,
+    /// What the group is streaming, while it plays.
+    pub stream: Option<StreamInfo>,
+}
+
+/// A group's [`AudioStream`], as of its start or its last seek.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInfo {
+    /// New for every stream the groups start, across all groups.
+    pub generation: u64,
+    /// The source's [`LiveSource::kind`].
+    pub source: &'static str,
+    pub live: bool,
+    /// The source's format, before it is resampled to the session's.
+    pub format: AudioFormat,
+    /// Server-clock µs.
+    pub started_us: i64,
 }
 
 /// What a group's source says is playing, for its metadata clients. Every
@@ -470,8 +486,9 @@ struct Group {
 
 struct Playing {
     stream: AudioStream,
-    /// Tells this stream's end apart from an earlier one's.
-    generation: u64,
+    /// Its `generation` tells this stream's end apart from an earlier
+    /// one's.
+    info: StreamInfo,
 }
 
 impl Group {
@@ -493,6 +510,7 @@ impl Group {
                 .map(|m| m.client_id().to_owned())
                 .collect(),
             playback_state: self.playback_state(),
+            stream: self.stream.as_ref().map(|p| p.info.clone()),
         }
     }
 
@@ -702,7 +720,7 @@ impl Actor {
                 if group
                     .stream
                     .as_ref()
-                    .is_some_and(|p| p.generation == generation)
+                    .is_some_and(|p| p.info.generation == generation)
                 {
                     tracing::info!(group_id, "group stream played out");
                     group.stream = None;
@@ -809,9 +827,13 @@ impl Actor {
         let generation = self.next_generation;
         self.next_generation += 1;
         let ops = self.ops.clone();
+        let (kind, live, format) = (source.kind(), source.is_live(), source.format());
         let group = self.group_mut(group_id)?;
-        if let Some(playing) = &group.stream {
+        if let Some(playing) = &mut group.stream {
             playing.stream.seek(source)?;
+            playing.info.source = kind;
+            playing.info.live = live;
+            playing.info.format = format;
             return Ok(());
         }
         // The stream's task, and every log line from it, is in this
@@ -829,7 +851,14 @@ impl Actor {
                 });
             }
         });
-        group.stream = Some(Playing { stream, generation });
+        let info = StreamInfo {
+            generation,
+            source: kind,
+            live,
+            format,
+            started_us: clock.now_us(),
+        };
+        group.stream = Some(Playing { stream, info });
         group.update_all();
         let playing = group.stream.as_ref().expect("set above");
         for conn in group.members.iter().filter(|c| c.has_role("player")) {

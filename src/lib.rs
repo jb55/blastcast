@@ -18,7 +18,9 @@ pub mod stream;
 pub use connection::{Connection, Frame, SendError};
 pub use debug::DebugReport;
 pub use dialer::{Dialer, DialerConfig};
-pub use group::{GroupError, GroupInfo, Groups, TrackMetadata, Transport, TransportControl};
+pub use group::{
+    GroupError, GroupInfo, Groups, StreamInfo, TrackMetadata, Transport, TransportControl,
+};
 pub use player::SendspinPlayer;
 pub use server::{Disconnect, HandshakeError, SendspinServer, ServerConfig};
 pub use status::{PlayerStatus, PlayerTiming, StatusChange};
