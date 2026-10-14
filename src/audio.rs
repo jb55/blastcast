@@ -1,8 +1,9 @@
-//! shairport-sync's PCM, read off each receiver's audio fifo and handed to
-//! whoever plays it as a [`LiveSource`].
+//! Each receiver's PCM, handed to whoever plays it as a [`LiveSource`]: a
+//! native receiver's as it hands it over ([`ReceiverHandler::audio`]), or
+//! shairport-sync's, read off its audio fifo.
 //!
-//! [`AirplayAudio`] is a [`ReceiverHandler`]: when a run starts it opens
-//! that run's audio fifo and reads it until the run stops, **whether or not
+//! [`AirplayAudio`] is a [`ReceiverHandler`]: when a shairport run starts
+//! it opens that run's audio fifo and reads it until the run stops, **whether or not
 //! anything is playing it**. A reader that only read while a session was
 //! playing would leave shairport's blocking write stuck on a full pipe in
 //! between, stalling its player thread and the sender's session. What is
@@ -27,6 +28,7 @@
 //! Only audio passes through: nothing is kept past the chunk in flight.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
@@ -40,7 +42,8 @@ use tokio::task::JoinHandle;
 use crate::config::ReceiverInfo;
 use crate::supervisor::ReceiverHandler;
 
-/// What shairport-sync's pipe backend writes: s16le, 44.1 kHz, stereo.
+/// What shairport-sync's pipe backend writes, and a native receiver hands
+/// over: s16, 44.1 kHz, stereo.
 pub const AIRPLAY_FORMAT: AudioFormat = AudioFormat::new(44_100, 2);
 
 /// One s16le stereo frame.
@@ -55,21 +58,52 @@ const READ_BYTES: usize = 16 * 1024;
 /// letting the reader, and so shairport, wait.
 const STREAM_QUEUE: usize = 128;
 
-/// The audio fifo of every running receiver, by target.
+/// The audio of every running receiver, by target.
 #[derive(Default)]
 pub struct AirplayAudio {
     receivers: Mutex<HashMap<String, Reader>>,
 }
 
-/// One run's reader task and the stream it feeds, if any.
+/// One run's stream, and the task reading its fifo, if it has one.
 struct Reader {
-    stream: Arc<Mutex<Option<mpsc::Sender<PcmChunk>>>>,
-    task: JoinHandle<()>,
+    slot: Arc<Slot>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+/// Where a receiver's audio goes: the stream handed out, if any.
+#[derive(Default)]
+struct Slot {
+    stream: Mutex<Option<mpsc::Sender<PcmChunk>>>,
+    /// Chunks are being dropped, and that has been logged.
+    overflowing: AtomicBool,
+}
+
+impl Slot {
+    /// Passes `chunk` to the stream, or drops it when nobody is listening
+    /// or the listener is behind.
+    fn send(&self, target_id: &str, chunk: PcmChunk) {
+        let mut stream = lock(&self.stream);
+        let Some(tx) = stream.as_ref() else { return };
+        match tx.try_send(chunk) {
+            Ok(()) => self.overflowing.store(false, Ordering::Relaxed),
+            Err(TrySendError::Full(_)) => {
+                if !self.overflowing.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target_id,
+                        "AirPlay audio isn't being played fast enough; dropping some"
+                    );
+                }
+            }
+            Err(TrySendError::Closed(_)) => *stream = None,
+        }
     }
 }
 
@@ -92,10 +126,11 @@ impl AirplayAudio {
         let receivers = lock(&self.receivers);
         receivers
             .get(target_id)
-            .is_some_and(|r| lock(&r.stream).take().is_some())
+            .is_some_and(|r| lock(&r.slot.stream).take().is_some())
     }
 
-    /// Whether `target_id`'s receiver is running and its fifo open.
+    /// Whether `target_id`'s receiver is running (and its fifo, if it has
+    /// one, open).
     pub fn is_reading(&self, target_id: &str) -> bool {
         lock(&self.receivers).contains_key(target_id)
     }
@@ -104,7 +139,7 @@ impl AirplayAudio {
         let receivers = lock(&self.receivers);
         let reader = receivers.get(target_id)?;
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
-        *lock(&reader.stream) = Some(tx);
+        *lock(&reader.slot.stream) = Some(tx);
         Some(FifoSource { chunks: rx })
     }
 }
@@ -112,29 +147,44 @@ impl AirplayAudio {
 impl ReceiverHandler for AirplayAudio {
     fn started(&self, receiver: &ReceiverInfo) {
         let id = &receiver.target_id;
-        // Opened here, before shairport starts, so its first open for
-        // writing finds a reader rather than failing with ENXIO.
-        let fifo = match pipe::OpenOptions::new()
-            .read_write(true)
-            .open_receiver(&receiver.audio_pipe)
-        {
-            Ok(fifo) => fifo,
-            Err(e) => {
-                tracing::error!(
-                    target_id = %id,
-                    path = %receiver.audio_pipe.display(),
-                    error = %e,
-                    "can't open the AirPlay audio fifo; this receiver will be silent"
-                );
-                lock(&self.receivers).remove(id);
-                return;
+        let slot = Arc::<Slot>::default();
+        let task = match &receiver.fifos {
+            None => None,
+            Some(fifos) => {
+                // Opened here, before shairport starts, so its first open
+                // for writing finds a reader rather than failing with
+                // ENXIO.
+                let fifo = match pipe::OpenOptions::new()
+                    .read_write(true)
+                    .open_receiver(&fifos.audio_pipe)
+                {
+                    Ok(fifo) => fifo,
+                    Err(e) => {
+                        tracing::error!(
+                            target_id = %id,
+                            path = %fifos.audio_pipe.display(),
+                            error = %e,
+                            "can't open the AirPlay audio fifo; this receiver will be silent"
+                        );
+                        lock(&self.receivers).remove(id);
+                        return;
+                    }
+                };
+                Some(tokio::spawn(read(id.clone(), fifo, Arc::clone(&slot))))
             }
         };
-        let stream = Arc::default();
-        let task = tokio::spawn(read(id.clone(), fifo, Arc::clone(&stream)));
         // A run that never reported stopping is replaced, and its stream
         // ended.
-        lock(&self.receivers).insert(id.clone(), Reader { stream, task });
+        lock(&self.receivers).insert(id.clone(), Reader { slot, task });
+    }
+
+    fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk) {
+        let slot = lock(&self.receivers)
+            .get(&receiver.target_id)
+            .map(|r| r.slot.clone());
+        if let Some(slot) = slot {
+            slot.send(&receiver.target_id, chunk.clone());
+        }
     }
 
     fn stopped(&self, receiver: &ReceiverInfo) {
@@ -150,15 +200,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Reads `fifo` until the task is aborted, sending whole frames to the
 /// current stream.
-async fn read(
-    target_id: String,
-    mut fifo: pipe::Receiver,
-    stream: Arc<Mutex<Option<mpsc::Sender<PcmChunk>>>>,
-) {
+async fn read(target_id: String, mut fifo: pipe::Receiver, slot: Arc<Slot>) {
     let mut buf = vec![0u8; READ_BYTES];
     // Bytes of a frame split across reads, kept at the front of `buf`.
     let mut carry = 0;
-    let mut overflowing = false;
     loop {
         let n = match fifo.read(&mut buf[carry..]).await {
             // We hold a write end, so this is never EOF, but don't spin.
@@ -172,31 +217,16 @@ async fn read(
         let len = carry + n;
         let whole = len - len % FRAME_BYTES;
         carry = len - whole;
-        if whole > 0 {
-            let mut slot = lock(&stream);
-            if let Some(tx) = slot.as_ref() {
-                let mut samples = Vec::with_capacity(whole / 2);
-                pcm::s16le_to_f32(&buf[..whole], &mut samples);
-                match tx.try_send(PcmChunk::new(AIRPLAY_FORMAT, samples)) {
-                    Ok(()) => overflowing = false,
-                    Err(TrySendError::Full(_)) => {
-                        if !overflowing {
-                            tracing::warn!(
-                                target_id,
-                                "AirPlay audio isn't being played fast enough; dropping some"
-                            );
-                        }
-                        overflowing = true;
-                    }
-                    Err(TrySendError::Closed(_)) => *slot = None,
-                }
-            }
+        if whole > 0 && lock(&slot.stream).is_some() {
+            let mut samples = Vec::with_capacity(whole / 2);
+            pcm::s16le_to_f32(&buf[..whole], &mut samples);
+            slot.send(&target_id, PcmChunk::new(AIRPLAY_FORMAT, samples));
         }
         buf.copy_within(whole..len, 0);
     }
 }
 
-/// One stream of a receiver's audio, as shairport wrote it.
+/// One stream of a receiver's audio, as it was handed over.
 struct FifoSource {
     chunks: mpsc::Receiver<PcmChunk>,
 }
@@ -238,7 +268,7 @@ mod tests {
         fn start() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let info = ReceiverInfo::new(dir.path(), "ss-kitchen", "Kitchen".into(), 7000, None);
-            mkfifo(&info.audio_pipe);
+            mkfifo(&info.files().audio_pipe);
             let audio = AirplayAudio::new();
             audio.started(&info);
             assert!(audio.is_reading("ss-kitchen"));
@@ -253,7 +283,7 @@ mod tests {
         /// the reader is already there.
         fn writer(&self) -> pipe::Sender {
             pipe::OpenOptions::new()
-                .open_sender(&self.info.audio_pipe)
+                .open_sender(&self.info.files().audio_pipe)
                 .unwrap()
         }
 
@@ -397,6 +427,27 @@ mod tests {
         audio.started(&info);
         assert!(!audio.is_reading("ss-kitchen"));
         assert!(audio.source("ss-kitchen").is_none());
+    }
+
+    /// A native receiver has no fifo: its audio is handed over.
+    #[tokio::test]
+    async fn a_native_receivers_audio_is_handed_over() {
+        let info = ReceiverInfo::native("ss-kitchen", "Kitchen".into(), 7000, None);
+        let audio = AirplayAudio::new();
+        let chunk = |v: f32| PcmChunk::new(AIRPLAY_FORMAT, vec![v; 352 * 2]);
+        // Not running: nowhere to go.
+        audio.audio(&info, &chunk(0.1));
+        audio.started(&info);
+        assert!(audio.is_reading("ss-kitchen"));
+        // Nobody listening yet: dropped.
+        audio.audio(&info, &chunk(0.2));
+        let mut source = audio.subscribe("ss-kitchen").unwrap();
+        audio.audio(&info, &chunk(0.3));
+        assert_eq!(samples(&mut source, 704).await, vec![0.3; 704]);
+        assert!(audio.end_stream("ss-kitchen"));
+        assert!(ended(&mut source).await);
+        audio.stopped(&info);
+        assert!(!audio.is_reading("ss-kitchen"));
     }
 
     #[tokio::test]

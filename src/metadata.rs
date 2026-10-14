@@ -26,7 +26,8 @@
 //!
 //! Everything else is ignored. [`AirplayMetadata`] is the
 //! [`ReceiverHandler`] that runs a parser per receiver, keeps what each
-//! one is playing as a [`NowPlaying`], and broadcasts the events.
+//! one is playing as a [`NowPlaying`], and broadcasts the events. A native
+//! receiver ([`crate::raop`]) hands it the same events already parsed.
 //!
 //! Like the audio, nothing here reaches the disk: the latest cover art is
 //! held in memory until the session ends.
@@ -163,7 +164,7 @@ pub struct Progress {
 
 impl Progress {
     /// From `prgr`'s `start/current/end`, RTP frames that wrap at 2^32.
-    fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         let mut parts = text.trim().split('/').map(|p| p.trim().parse::<u32>());
         let (start, current, end) = (
             parts.next()?.ok()?,
@@ -497,17 +498,46 @@ impl ReceiverHandler for AirplayMetadata {
     }
 
     fn metadata(&self, receiver: &ReceiverInfo, bytes: &[u8]) {
-        let id = &receiver.target_id;
         let events = {
             let mut receivers = lock(&self.receivers);
-            let r = receivers.entry(id.clone()).or_default();
-            let events = r.parser.push(bytes);
+            let r = receivers.entry(receiver.target_id.clone()).or_default();
+            r.parser.push(bytes)
+        };
+        self.publish(receiver, events);
+    }
+
+    fn event(&self, receiver: &ReceiverInfo, event: &MetadataEvent) {
+        self.publish(receiver, vec![event.clone()]);
+    }
+
+    /// A receiver that stops mid-session ends it: its hook never will.
+    fn stopped(&self, receiver: &ReceiverInfo) {
+        let removed = lock(&self.receivers).remove(&receiver.target_id);
+        if removed.is_some_and(|r| r.now.playing) {
+            tracing::debug!(target_id = %receiver.target_id, "AirPlay receiver stopped mid-session");
+            let _ = self.events.send(AirplayEvent {
+                target_id: receiver.target_id.clone(),
+                event: MetadataEvent::PlayEnd,
+            });
+        }
+    }
+}
+
+impl AirplayMetadata {
+    /// Applies `events` to what the receiver is playing, then broadcasts
+    /// them. Only while it runs: an event after it stopped is dropped.
+    fn publish(&self, receiver: &ReceiverInfo, events: Vec<MetadataEvent>) {
+        let id = &receiver.target_id;
+        {
+            let mut receivers = lock(&self.receivers);
+            let Some(r) = receivers.get_mut(id) else {
+                return;
+            };
             let now = Instant::now();
             for event in &events {
                 r.now.apply(event, now);
             }
-            events
-        };
+        }
         for event in events {
             match &event {
                 MetadataEvent::Artwork(art) => {
@@ -519,18 +549,6 @@ impl ReceiverHandler for AirplayMetadata {
             let _ = self.events.send(AirplayEvent {
                 target_id: id.clone(),
                 event,
-            });
-        }
-    }
-
-    /// A receiver that stops mid-session ends it: its hook never will.
-    fn stopped(&self, receiver: &ReceiverInfo) {
-        let removed = lock(&self.receivers).remove(&receiver.target_id);
-        if removed.is_some_and(|r| r.now.playing) {
-            tracing::debug!(target_id = %receiver.target_id, "AirPlay receiver stopped mid-session");
-            let _ = self.events.send(AirplayEvent {
-                target_id: receiver.target_id.clone(),
-                event: MetadataEvent::PlayEnd,
             });
         }
     }

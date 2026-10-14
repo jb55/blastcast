@@ -1,5 +1,6 @@
-//! What one shairport-sync instance is told: its advertised name, port,
-//! fifos and config file, and the config text itself.
+//! What identifies one AirPlay receiver: its target, advertised name and
+//! port, and, for a shairport-sync one, its fifos and config file and the
+//! config text itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ pub const PORT_RANGE: u16 = 1000;
 pub const DEFAULT_NAME_TEMPLATE: &str = "{player}";
 
 /// Everything that identifies one running receiver. A change to any of it
-/// restarts the daemon; the starting volume is not part of it.
+/// restarts it; the starting volume is not part of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverInfo {
     /// The player or group the receiver plays to.
@@ -31,17 +32,25 @@ pub struct ReceiverInfo {
     /// The name the phone shows.
     pub airplay_name: String,
     pub port: u16,
+    /// `general.interface`: the network interface to advertise on.
+    pub interface: Option<String>,
+    /// A shairport-sync receiver's files; `None` for a native one.
+    pub fifos: Option<Fifos>,
+}
+
+/// Where one shairport-sync writes, and its config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fifos {
     /// shairport writes raw PCM, s16le 44.1 kHz stereo, here.
     pub audio_pipe: PathBuf,
     /// shairport writes its metadata items, and the hooks write
     /// [`PLAY_BEGIN`] and [`PLAY_END`], here.
     pub metadata_pipe: PathBuf,
     pub config_file: PathBuf,
-    /// `general.interface`: the network interface to advertise on.
-    pub interface: Option<String>,
 }
 
 impl ReceiverInfo {
+    /// A shairport-sync receiver, with its files in `run_dir`.
     pub fn new(
         run_dir: &Path,
         target_id: &str,
@@ -51,17 +60,43 @@ impl ReceiverInfo {
     ) -> Self {
         let key = file_key(target_id);
         Self {
-            target_id: target_id.to_owned(),
-            airplay_name,
-            port,
-            audio_pipe: run_dir.join(format!("airplay_audio_{key}")),
-            metadata_pipe: run_dir.join(format!("airplay_metadata_{key}")),
-            config_file: run_dir.join(format!("shairport-sync_{key}.conf")),
-            interface,
+            fifos: Some(Fifos {
+                audio_pipe: run_dir.join(format!("airplay_audio_{key}")),
+                metadata_pipe: run_dir.join(format!("airplay_metadata_{key}")),
+                config_file: run_dir.join(format!("shairport-sync_{key}.conf")),
+            }),
+            ..Self::native(target_id, airplay_name, port, interface)
         }
     }
 
-    /// The config file text. `volume` (0-100) is the volume shairport
+    /// A native receiver ([`crate::raop`]): no files.
+    pub fn native(
+        target_id: &str,
+        airplay_name: String,
+        port: u16,
+        interface: Option<String>,
+    ) -> Self {
+        Self {
+            target_id: target_id.to_owned(),
+            airplay_name,
+            port,
+            interface,
+            fifos: None,
+        }
+    }
+
+    /// A shairport-sync receiver's files.
+    ///
+    /// # Panics
+    ///
+    /// For a native receiver, which has none.
+    pub fn files(&self) -> &Fifos {
+        self.fifos
+            .as_ref()
+            .expect("only a shairport-sync receiver has files")
+    }
+
+    /// The shairport-sync config file text. `volume` (0-100) is the volume shairport
     /// reports to the sender before it has heard one, mapped onto AirPlay's
     /// -30..0 dB; `None` is full volume.
     pub fn render(&self, volume: Option<u8>) -> String {
@@ -76,8 +111,8 @@ impl ReceiverInfo {
                 "DEFAULT_VOLUME" => format!("{db:.1}"),
                 "PORT" => self.port.to_string(),
                 "INTERFACE_LINE" => interface.clone(),
-                "METADATA_PIPE" => escape(&self.metadata_pipe.to_string_lossy()),
-                "AUDIO_PIPE" => escape(&self.audio_pipe.to_string_lossy()),
+                "METADATA_PIPE" => escape(&self.files().metadata_pipe.to_string_lossy()),
+                "AUDIO_PIPE" => escape(&self.files().audio_pipe.to_string_lossy()),
                 "PLAY_BEGIN" => PLAY_BEGIN.to_owned(),
                 "PLAY_END" => PLAY_END.to_owned(),
                 _ => return None,
@@ -310,6 +345,7 @@ mod tests {
     fn file_names_are_safe_and_distinct() {
         let a = ReceiverInfo::new(Path::new("/r"), "a:b/c", "n".into(), 7000, None);
         let b = ReceiverInfo::new(Path::new("/r"), "a_b_c", "n".into(), 7000, None);
+        let (a, b) = (a.files(), b.files());
         let name = a.audio_pipe.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("airplay_audio_a_b_c-"), "{name}");
         assert_eq!(a.audio_pipe.parent(), Some(Path::new("/r")));

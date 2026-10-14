@@ -1,9 +1,11 @@
-//! One shairport-sync per AirPlay target, kept running.
+//! One AirPlay receiver per AirPlay target, kept running: a native one
+//! ([`crate::raop`]), or a shairport-sync.
 //!
 //! A **target** is a player or group player whose config has
 //! `airplay_target` set (group players are configured by their
 //! `syncgroup_*` id). The [`ReceiverSupervisor`] reconciles the running
-//! daemons with the targets:
+//! receivers (called daemons here, whichever [`Backend`] runs them) with
+//! the targets:
 //!
 //! - A target gets a daemon once its player has been seen in the registry,
 //!   since the advertised name comes from the player's name.
@@ -18,7 +20,9 @@
 //!   anything else that changes `airplay_target` calls
 //!   [`ReceiverSupervisor::reconcile`].
 //!
-//! Each run creates the audio and metadata fifos and the config file in the
+//! A native receiver's run binds the target's port and serves senders
+//! until it is stopped; a bind that fails is restarted like a daemon that
+//! exited. A shairport-sync run creates the audio and metadata fifos and the config file in the
 //! run dir, opens the metadata fifo **read-write before shairport starts**
 //! (a fifo with no writer reads EOF in a tight loop, and one with no
 //! reader blocks the session hooks' `echo`), and passes what it reads to
@@ -47,15 +51,29 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use tas_audio::PcmChunk;
+
 use crate::config::{self, NameTemplate, ReceiverInfo};
+use crate::metadata::MetadataEvent;
+use crate::raop::{self, NativeConfig};
+
+/// What runs each receiver.
+#[derive(Debug, Clone)]
+pub enum Backend {
+    /// [`crate::raop`], in this process.
+    Native(NativeConfig),
+    Shairport {
+        /// A shairport-sync that [`crate::binary::find`] accepted.
+        binary: PathBuf,
+        /// Where the fifos and config files go. It must be a
+        /// [plain path](config::is_plain_path).
+        run_dir: PathBuf,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
-    /// A shairport-sync that [`crate::binary::find`] accepted.
-    pub binary: PathBuf,
-    /// Where the fifos and config files go. It must be a
-    /// [plain path](config::is_plain_path).
-    pub run_dir: PathBuf,
+    pub backend: Backend,
     pub name_template: NameTemplate,
     /// `{server}` in the name template.
     pub server_name: String,
@@ -65,17 +83,26 @@ pub struct SupervisorConfig {
     pub max_restarts: u32,
     /// A run that lasts this long resets the restart count.
     pub stable_after: Duration,
-    /// How long a stopped daemon gets to exit after SIGTERM (and send its
-    /// mDNS goodbye) before it is killed.
+    /// How long a stopped shairport-sync gets to exit after SIGTERM (and
+    /// send its mDNS goodbye) before it is killed.
     pub stop_timeout: Duration,
 }
 
 impl SupervisorConfig {
+    /// Native receivers.
+    pub fn native(native: NativeConfig) -> Self {
+        Self::with(Backend::Native(native))
+    }
+
+    /// shairport-sync receivers.
     pub fn new(binary: PathBuf, run_dir: PathBuf) -> Self {
+        Self::with(Backend::Shairport { binary, run_dir })
+    }
+
+    fn with(backend: Backend) -> Self {
         // MA restarts after 2 s, up to 5 times.
         Self {
-            binary,
-            run_dir,
+            backend,
             name_template: NameTemplate::default(),
             server_name: String::new(),
             interface: None,
@@ -96,14 +123,20 @@ pub enum SupervisorError {
 }
 
 /// Told about each run of each receiver, in order: `started`, any number
-/// of `metadata`, then `stopped`. Called from the receiver's task, so it
-/// must not block.
+/// of `metadata`, `event` and `audio`, then `stopped`. Called from the
+/// receiver's tasks, so it must not block.
 pub trait ReceiverHandler: Send + Sync + 'static {
-    /// shairport-sync is about to start with these fifos.
+    /// The receiver is about to start: shairport-sync with these fifos, or
+    /// a native one.
     fn started(&self, _receiver: &ReceiverInfo) {}
-    /// Bytes read from the metadata fifo: shairport's `<item>`s and the
-    /// hooks' marker lines, split wherever the reads fell.
+    /// Bytes read from shairport-sync's metadata fifo: its `<item>`s and
+    /// the hooks' marker lines, split wherever the reads fell.
     fn metadata(&self, _receiver: &ReceiverInfo, _bytes: &[u8]) {}
+    /// What a native receiver's sender said, already parsed.
+    fn event(&self, _receiver: &ReceiverInfo, _event: &MetadataEvent) {}
+    /// A native receiver's audio, in real time: s16 44.1 kHz stereo, as
+    /// shairport-sync writes its fifo.
+    fn audio(&self, _receiver: &ReceiverInfo, _chunk: &PcmChunk) {}
     /// The run ended; its fifos are about to be removed.
     fn stopped(&self, _receiver: &ReceiverInfo) {}
 }
@@ -119,6 +152,12 @@ impl ReceiverHandler for Vec<Arc<dyn ReceiverHandler>> {
     }
     fn metadata(&self, receiver: &ReceiverInfo, bytes: &[u8]) {
         self.iter().for_each(|h| h.metadata(receiver, bytes));
+    }
+    fn event(&self, receiver: &ReceiverInfo, event: &MetadataEvent) {
+        self.iter().for_each(|h| h.event(receiver, event));
+    }
+    fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk) {
+        self.iter().for_each(|h| h.audio(receiver, chunk));
     }
     fn stopped(&self, receiver: &ReceiverInfo) {
         self.iter().for_each(|h| h.stopped(receiver));
@@ -150,8 +189,10 @@ impl ReceiverSupervisor {
         state: Arc<StateStore>,
         handler: Arc<dyn ReceiverHandler>,
     ) -> Result<Arc<Self>, SupervisorError> {
-        if !config::is_plain_path(&config.run_dir) {
-            return Err(SupervisorError::RunDir(config.run_dir));
+        if let Backend::Shairport { run_dir, .. } = &config.backend
+            && !config::is_plain_path(run_dir)
+        {
+            return Err(SupervisorError::RunDir(run_dir.clone()));
         }
         Ok(Arc::new(Self {
             config,
@@ -195,6 +236,14 @@ impl ReceiverSupervisor {
                     Err(RecvError::Closed) => return,
                 }
             }
+        }
+    }
+
+    /// `native` or `shairport`, for logs and `/debug`.
+    pub fn backend_name(&self) -> &'static str {
+        match self.config.backend {
+            Backend::Native(_) => "native",
+            Backend::Shairport { .. } => "shairport",
         }
     }
 
@@ -261,13 +310,13 @@ impl ReceiverSupervisor {
                 // Never seen: no name to advertise yet.
                 (None, None) => continue,
             };
-            let info = ReceiverInfo::new(
-                &self.config.run_dir,
-                id,
-                name,
-                port,
-                self.config.interface.clone(),
-            );
+            let interface = self.config.interface.clone();
+            let info = match &self.config.backend {
+                Backend::Native(_) => ReceiverInfo::native(id, name, port, interface),
+                Backend::Shairport { run_dir, .. } => {
+                    ReceiverInfo::new(run_dir, id, name, port, interface)
+                }
+            };
             if let Some(r) = running.get(id) {
                 if r.info == info {
                     continue;
@@ -372,7 +421,7 @@ impl Daemon {
                     target_id = %id,
                     name = %self.info.airplay_name,
                     restarts,
-                    "shairport-sync {why}; giving up on this AirPlay receiver"
+                    "AirPlay receiver {why}; giving up on it"
                 );
                 return Ended::GaveUp;
             }
@@ -381,7 +430,7 @@ impl Daemon {
                 target_id = %id,
                 name = %self.info.airplay_name,
                 delay = ?self.config.restart_delay,
-                "shairport-sync {why}; restarting"
+                "AirPlay receiver {why}; restarting"
             );
             tokio::select! {
                 _ = tokio::time::sleep(self.config.restart_delay) => {}
@@ -394,22 +443,69 @@ impl Daemon {
         if *stop.borrow() {
             return Exit::Stopped;
         }
-        let metadata = match self.prepare() {
+        match &self.config.backend {
+            Backend::Native(native) => self.run_native(native, stop).await,
+            Backend::Shairport { binary, run_dir } => {
+                self.run_shairport(binary, run_dir, stop).await
+            }
+        }
+    }
+
+    async fn run_native(&self, native: &NativeConfig, stop: &mut watch::Receiver<bool>) -> Exit {
+        let listener = match raop::bind(self.info.port).await {
+            Ok(l) => l,
+            Err(e) => {
+                return Exit::Failed(io::Error::new(
+                    e.kind(),
+                    format!("binding port {}: {e}", self.info.port),
+                ));
+            }
+        };
+        tracing::info!(
+            target_id = %self.info.target_id,
+            name = %self.info.airplay_name,
+            port = self.info.port,
+            "AirPlay receiver listening"
+        );
+        self.handler.started(&self.info);
+        let served = raop::serve(
+            native.clone(),
+            self.info.clone(),
+            self.handler.clone(),
+            listener,
+            self.volume,
+            stop,
+        )
+        .await;
+        self.handler.stopped(&self.info);
+        match served {
+            Ok(()) => Exit::Stopped,
+            Err(e) => Exit::Failed(e),
+        }
+    }
+
+    async fn run_shairport(
+        &self,
+        binary: &Path,
+        run_dir: &Path,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Exit {
+        let metadata = match self.prepare(run_dir) {
             Ok(m) => m,
             Err(e) => {
                 self.cleanup();
                 return Exit::Failed(io::Error::new(
                     e.kind(),
-                    format!("setting up {}: {e}", self.config.run_dir.display()),
+                    format!("setting up {}: {e}", run_dir.display()),
                 ));
             }
         };
         self.handler.started(&self.info);
-        let exit = match self.spawn() {
+        let exit = match self.spawn(binary) {
             Ok(child) => self.watch(child, metadata, stop).await,
             Err(e) => Exit::Failed(io::Error::new(
                 e.kind(),
-                format!("starting {}: {e}", self.config.binary.display()),
+                format!("starting {}: {e}", binary.display()),
             )),
         };
         self.handler.stopped(&self.info);
@@ -418,25 +514,23 @@ impl Daemon {
     }
 
     /// Makes the fifos and config, and opens the metadata fifo.
-    fn prepare(&self) -> io::Result<pipe::Receiver> {
-        create_run_dir(&self.config.run_dir)?;
+    fn prepare(&self, run_dir: &Path) -> io::Result<pipe::Receiver> {
+        create_run_dir(run_dir)?;
         self.cleanup();
-        mkfifo(&self.info.audio_pipe)?;
-        mkfifo(&self.info.metadata_pipe)?;
-        write_private(&self.info.config_file, &self.info.render(self.volume))?;
+        let files = self.info.files();
+        mkfifo(&files.audio_pipe)?;
+        mkfifo(&files.metadata_pipe)?;
+        write_private(&files.config_file, &self.info.render(self.volume))?;
         // Read-write: we are a writer too, so a read never sees EOF while
         // shairport is between writes, and a hook's echo never blocks.
         pipe::OpenOptions::new()
             .read_write(true)
-            .open_receiver(&self.info.metadata_pipe)
+            .open_receiver(&files.metadata_pipe)
     }
 
     fn cleanup(&self) {
-        for path in [
-            &self.info.audio_pipe,
-            &self.info.metadata_pipe,
-            &self.info.config_file,
-        ] {
+        let files = self.info.files();
+        for path in [&files.audio_pipe, &files.metadata_pipe, &files.config_file] {
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -445,16 +539,16 @@ impl Daemon {
         }
     }
 
-    fn spawn(&self) -> io::Result<Child> {
+    fn spawn(&self, binary: &Path) -> io::Result<Child> {
         tracing::info!(
             target_id = %self.info.target_id,
             name = %self.info.airplay_name,
             port = self.info.port,
             "starting shairport-sync"
         );
-        Command::new(&self.config.binary)
+        Command::new(binary)
             .arg("--configfile")
-            .arg(&self.info.config_file)
+            .arg(&self.info.files().config_file)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -791,8 +885,9 @@ echo "connection from 10.0.0.9" >&2
             r.port,
             config::receiver_ports(&server_id, ["ss-kitchen"])["ss-kitchen"]
         );
-        assert!(is_fifo(&r.audio_pipe) && is_fifo(&r.metadata_pipe));
-        let text = std::fs::read_to_string(&r.config_file).unwrap();
+        let files = r.files();
+        assert!(is_fifo(&files.audio_pipe) && is_fifo(&files.metadata_pipe));
+        let text = std::fs::read_to_string(&files.config_file).unwrap();
         assert!(text.contains("name = \"Kitchen\";"), "{text}");
         // The player's volume, 40, as AirPlay dB.
         assert!(text.contains("default_airplay_volume = -18.0;"), "{text}");
@@ -835,7 +930,7 @@ echo "connection from 10.0.0.9" >&2
         let after = rig.running().await[0].clone();
         assert_eq!(after.port, before.port);
         until("the restart", async || rig.recorder.starts() == 2).await;
-        let text = std::fs::read_to_string(&after.config_file).unwrap();
+        let text = std::fs::read_to_string(&after.files().config_file).unwrap();
         assert!(text.contains("name = \"Den\";"), "{text}");
         let events = rig.recorder.events();
         let stop = events
@@ -882,7 +977,8 @@ echo "connection from 10.0.0.9" >&2
             rig.recorder.events().last(),
             Some(&Ev::Stopped("ss-kitchen".into()))
         );
-        for path in [&r.audio_pipe, &r.metadata_pipe, &r.config_file] {
+        let files = r.files();
+        for path in [&files.audio_pipe, &files.metadata_pipe, &files.config_file] {
             assert!(!path.exists(), "{} left behind", path.display());
         }
     }
@@ -931,6 +1027,62 @@ echo "connection from 10.0.0.9" >&2
         assert!(rig.running().await.is_empty());
         let run_dir = rig.dir.path().join("run");
         assert_eq!(std::fs::read_dir(run_dir).unwrap().count(), 0);
+    }
+
+    /// A native receiver runs in-process: it listens on the target's port,
+    /// answers there, and lets the port go when it stops.
+    #[tokio::test]
+    async fn a_native_receiver_listens_on_the_targets_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(dir.path()).unwrap());
+        let registry = Arc::new(PlayerRegistry::default());
+        let recorder = Arc::new(Recorder::default());
+        let config = SupervisorConfig::native(NativeConfig::new(state.server_id(), None));
+        let sup =
+            ReceiverSupervisor::new(config, registry.clone(), state.clone(), recorder.clone())
+                .unwrap();
+        assert_eq!(sup.backend_name(), "native");
+        tokio::spawn(sup.clone().run());
+        state
+            .update(|s| {
+                s.players.insert(
+                    "ss-kitchen".into(),
+                    PlayerConfig {
+                        airplay_target: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        let mut p = PlayerState::new("ss-kitchen", "sendspin", "Kitchen");
+        p.volume_level = Some(40);
+        registry.add(p, Arc::new(Inert)).unwrap();
+        until("the receiver", async || recorder.starts() == 1).await;
+        let r = sup.receivers().await[0].clone();
+        assert_eq!(r.fifos, None);
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", r.port))
+            .await
+            .unwrap();
+        tcp.write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(&mut tcp)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert_eq!(line, "RTSP/1.0 200 OK\r\n");
+
+        sup.shutdown().await;
+        assert_eq!(
+            recorder.events().last(),
+            Some(&Ev::Stopped("ss-kitchen".into()))
+        );
+        tokio::net::TcpListener::bind(("0.0.0.0", r.port))
+            .await
+            .expect("the port is free again");
     }
 
     #[tokio::test]

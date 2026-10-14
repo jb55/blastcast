@@ -614,7 +614,7 @@ mod tests {
         fn new(run: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let info = ReceiverInfo::new(dir.path(), "kitchen", "Kitchen".into(), 7000, None);
-            mkfifo(&info.audio_pipe);
+            mkfifo(&info.files().audio_pipe);
             let registry = Arc::new(PlayerRegistry::default());
             let log = Arc::default();
             let mut sources = HashMap::new();
@@ -740,7 +740,7 @@ mod tests {
         // session format.
         let mut source = rig.source("kitchen").unwrap();
         let mut fifo = pipe::OpenOptions::new()
-            .open_sender(&rig.info.audio_pipe)
+            .open_sender(&rig.info.files().audio_pipe)
             .unwrap();
         fifo.write_all(&[0x00, 0x40, 0x00, 0x40].repeat(1408))
             .await
