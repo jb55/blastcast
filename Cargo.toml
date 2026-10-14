@@ -9,9 +9,20 @@ publish.workspace = true
 [dependencies]
 tas-core.workspace = true
 tas-audio.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures-channel.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite.workspace = true
 
 [lints]
 workspace = true
