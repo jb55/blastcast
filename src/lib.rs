@@ -5,6 +5,8 @@
 //! then". blastcast puts them all on one clock, the [`ServerClock`]: each
 //! input maps its sender's clock to it with a [`ClockMap`], and says when
 //! its frames play with an [`Anchor`]. Any input can then feed any output.
+//! A [`RateMatch`] absorbs the drift between a sender's clock and ours, so
+//! its stamps and its frames stay together.
 //!
 //! It knows nothing of the server around it: it depends on no `tas-*`
 //! crate (`scripts/check.sh` enforces it), so protocol crates depend on
@@ -13,12 +15,14 @@
 pub mod clock;
 pub mod format;
 pub mod map;
+pub mod rate;
 pub mod source;
 pub mod timeline;
 
 pub use clock::ServerClock;
 pub use format::{AudioFormat, PcmChunk, SESSION_FORMAT};
 pub use map::{Anchor, ClockMap};
+pub use rate::{RateMatch, RateStats};
 pub use source::{IntoTimed, Item, LiveSource, TimedSource, Untimed};
 pub use timeline::{Span, Timeline};
 
