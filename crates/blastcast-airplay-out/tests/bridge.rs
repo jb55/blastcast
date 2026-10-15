@@ -6,25 +6,25 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use blastcast::SESSION_FORMAT;
+use blastcast::{IntoTimed, SESSION_FORMAT};
+use blastcast_airplay_out::testing::FakeSpeaker;
+use blastcast_airplay_out::{AirplayOutputs, RaopDevice};
 use blastcast_audio::SineSource;
+use blastcast_sendspin::protocol::PlaybackState;
 use blastcast_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, ConnectionReason, HeaderLayout,
     PlayerStateReport, PlayerSupport, PlayerSyncState, StreamFormat, binary, roles,
 };
-use blastcast_sendspin::{Frame, SendspinServer, ServerConfig};
+use blastcast_sendspin::testing::RecordingHost;
+use blastcast_sendspin::{Frame, SendspinPlayer, SendspinServer, ServerConfig};
 use blastcast_telemetry::{Point, Series, SpeakerState, Telemetry};
 use futures_util::StreamExt;
-use tas_airplay_out::testing::FakeSpeaker;
-use tas_airplay_out::{AirplayOutputs, RaopDevice};
-use tas_core::player::PlaybackState;
-use tas_core::{PlayerCommand, PlayerRegistry};
 
 const WAIT: Duration = Duration::from_secs(10);
 const AP: &str = "apa1b2c3d4e5f6";
 
 struct Setup {
-    registry: Arc<PlayerRegistry>,
+    host: Arc<RecordingHost>,
     server: Arc<SendspinServer>,
     outputs: Arc<AirplayOutputs>,
     speaker: FakeSpeaker,
@@ -32,23 +32,23 @@ struct Setup {
 }
 
 async fn setup() -> Setup {
-    let registry = Arc::new(PlayerRegistry::default());
+    let host = RecordingHost::new();
     let mut config = ServerConfig::new("tas", "Tune Assistant");
     config.telemetry = Telemetry::new();
     let hub = config.telemetry.clone();
-    let server = tas_sendspin::server(config, registry.clone());
+    let server = SendspinServer::new(config, host.clone());
     let outputs = AirplayOutputs::with_local_addrs(server.clone(), vec![]);
     let speaker = FakeSpeaker::start().await;
     outputs.add(device(speaker.addr()));
     let s = Setup {
-        registry,
+        host,
         server,
         outputs,
         speaker,
         hub,
     };
     s.eventually("the speaker is an available player", |s| {
-        s.registry.get(AP).is_some_and(|p| p.available)
+        s.host.is_available(AP)
     })
     .await;
     s
@@ -61,6 +61,19 @@ impl Setup {
             assert!(tokio::time::Instant::now() < deadline, "never: {what}");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// `client_id`'s player, to command.
+    fn player(&self, client_id: &str) -> SendspinPlayer {
+        self.server.player(client_id).expect("connected")
+    }
+
+    /// The player `client_id` follows: the first of its group, when that
+    /// is someone else.
+    fn synced_to(&self, client_id: &str) -> Option<String> {
+        let group = self.server.groups().group_of(client_id)?;
+        let leader = group.members.first()?;
+        (leader != client_id).then(|| leader.clone())
     }
 
     /// Every point of `series` on the airplay speaker.
@@ -172,38 +185,36 @@ async fn sendspin_speaker(server: &Arc<SendspinServer>, client_id: &str) -> Send
 #[tokio::test]
 async fn an_airplay_speaker_is_a_sendspin_player() {
     let s = setup().await;
-    let p = s.registry.get(AP).unwrap();
+    let p = s.host.get(AP).unwrap();
     assert_eq!(p.name, "Kitchen AirPlay");
-    assert_eq!(p.provider, "sendspin");
-    assert_eq!(p.volume_level, Some(50));
-    assert_eq!(p.device_info.model, "ShairportSync");
+    assert_eq!(p.status.volume, Some(50));
+    let hello = s.server.connection(AP).unwrap().hello().clone();
+    let model = hello.device_info.and_then(|d| d.product_name);
+    assert_eq!(model.as_deref(), Some("ShairportSync"));
     assert_eq!(s.outputs.speakers().len(), 1);
 
     // Volume is the bridge's own until a stream opens a session.
-    s.registry
-        .execute(AP, PlayerCommand::VolumeSet(30))
-        .await
-        .unwrap();
+    s.player(AP).set_volume(30).unwrap();
     s.eventually("the volume is reported back", |s| {
-        s.registry.get(AP).unwrap().volume_level == Some(30)
+        s.host.get(AP).unwrap().status.volume == Some(30)
     })
     .await;
     assert!(s.speaker.log().requests.is_empty(), "no session yet");
 
     s.outputs
         .removed("A1B2C3D4E5F6@Kitchen AirPlay._raop._tcp.local.");
-    s.eventually("the player is gone", |s| !s.registry.contains(AP))
+    s.eventually("the player is gone", |s| !s.host.contains(AP))
         .await;
 }
 
 #[tokio::test]
 async fn plays_a_stream_and_lingers_after_it() {
     let s = setup().await;
-    s.registry
-        .execute(AP, PlayerCommand::VolumeSet(80))
+    s.player(AP).set_volume(80).unwrap();
+    s.player(AP)
+        .play(second_of_sine().into_timed())
         .await
         .unwrap();
-    s.registry.play_source(AP, second_of_sine()).await.unwrap();
     s.speaker
         .wait_for("a second of audio", WAIT, |l| {
             l.samples().len() / 2 >= 43_000
@@ -250,10 +261,7 @@ async fn plays_a_stream_and_lingers_after_it() {
         "{session:?}"
     );
     // A volume change while the session is open goes to the speaker.
-    s.registry
-        .execute(AP, PlayerCommand::VolumeSet(20))
-        .await
-        .unwrap();
+    s.player(AP).set_volume(20).unwrap();
     s.speaker
         .wait_for("the new volume", WAIT, |l| {
             l.requests
@@ -277,20 +285,20 @@ async fn plays_in_sync_with_a_sendspin_speaker() {
     let s = setup().await;
     let sendspin = sendspin_speaker(&s.server, "den").await;
     s.eventually("the sendspin speaker is available", |s| {
-        s.registry.get("den").is_some_and(|p| p.available)
+        s.host.is_available("den")
     })
     .await;
-    s.registry
-        .set_members("den", &[AP.to_owned()], &[])
+    s.player("den")
+        .set_members(&[AP.to_owned()], &[])
         .await
         .unwrap();
     s.eventually("the airplay speaker follows den", |s| {
-        s.registry.get(AP).unwrap().synced_to.as_deref() == Some("den")
+        s.synced_to(AP).as_deref() == Some("den")
     })
     .await;
 
-    s.registry
-        .play_source("den", second_of_sine())
+    s.player("den")
+        .play(second_of_sine().into_timed())
         .await
         .unwrap();
     s.speaker
@@ -331,26 +339,26 @@ async fn plays_in_sync_with_a_sendspin_speaker() {
 async fn leaves_its_group_when_another_sender_takes_the_speaker() {
     let s = setup().await;
     let _sendspin = sendspin_speaker(&s.server, "den").await;
-    s.eventually("den is available", |s| {
-        s.registry.get("den").is_some_and(|p| p.available)
-    })
-    .await;
-    s.registry
-        .set_members("den", &[AP.to_owned()], &[])
+    s.eventually("den is available", |s| s.host.is_available("den"))
+        .await;
+    s.player("den")
+        .set_members(&[AP.to_owned()], &[])
         .await
         .unwrap();
     let live = SineSource::new(SESSION_FORMAT, 440.0).paced(s.server.config().clock);
-    s.registry.play_source("den", Box::new(live)).await.unwrap();
+    s.player("den")
+        .play(Box::new(live).into_timed())
+        .await
+        .unwrap();
     s.speaker
         .wait_for("audio", WAIT, |l| !l.packets.is_empty())
         .await;
     s.speaker.hang_up();
     s.eventually("the airplay speaker left den", |s| {
-        s.registry.get(AP).unwrap().synced_to.is_none()
+        s.synced_to(AP).is_none()
     })
     .await;
-    let p = s.registry.get(AP).unwrap();
-    assert!(p.available, "and is free to be picked again");
+    assert!(s.host.is_available(AP), "and is free to be picked again");
 }
 
 /// Thirty seconds of a 48 kHz sine, read as far ahead as the speaker's
@@ -394,8 +402,8 @@ impl Setup {
 #[tokio::test]
 async fn a_stop_mid_stream_goes_quiet_at_once() {
     let s = setup().await;
-    s.registry
-        .play_source(AP, half_a_minute_of_sine())
+    s.player(AP)
+        .play(half_a_minute_of_sine().into_timed())
         .await
         .unwrap();
     s.speaker
@@ -404,7 +412,7 @@ async fn a_stop_mid_stream_goes_quiet_at_once() {
         })
         .await;
     let stopped = tokio::time::Instant::now();
-    s.registry.execute(AP, PlayerCommand::Stop).await.unwrap();
+    s.player(AP).stop().await.unwrap();
     s.goes_quiet(stopped).await;
     // The flush is a mark, as the stream ends.
     assert_eq!(s.points(Series::Flush).len(), 1);
@@ -420,16 +428,14 @@ async fn a_stop_mid_stream_goes_quiet_at_once() {
 async fn ungrouping_mid_stream_goes_quiet_at_once() {
     let s = setup().await;
     let sendspin = sendspin_speaker(&s.server, "den").await;
-    s.eventually("den is available", |s| {
-        s.registry.get("den").is_some_and(|p| p.available)
-    })
-    .await;
-    s.registry
-        .set_members("den", &[AP.to_owned()], &[])
+    s.eventually("den is available", |s| s.host.is_available("den"))
+        .await;
+    s.player("den")
+        .set_members(&[AP.to_owned()], &[])
         .await
         .unwrap();
-    s.registry
-        .play_source("den", half_a_minute_of_sine())
+    s.player("den")
+        .play(half_a_minute_of_sine().into_timed())
         .await
         .unwrap();
     s.speaker
@@ -438,15 +444,15 @@ async fn ungrouping_mid_stream_goes_quiet_at_once() {
         })
         .await;
     let stopped = tokio::time::Instant::now();
-    s.registry
-        .set_members("den", &[], &[AP.to_owned()])
+    s.player("den")
+        .set_members(&[], &[AP.to_owned()])
         .await
         .unwrap();
     s.goes_quiet(stopped).await;
     // Den plays on without it.
     assert!(!sendspin.chunks.lock().unwrap().is_empty());
     assert_eq!(
-        s.registry.get("den").unwrap().playback_state,
+        s.server.groups().group_of("den").unwrap().playback_state,
         PlaybackState::Playing
     );
 }

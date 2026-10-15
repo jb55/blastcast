@@ -3,26 +3,27 @@
 //! needs the binary:
 //!
 //! ```sh
-//! export TAS_SHAIRPORT_SYNC=$(nix-build '<nixpkgs>' -A shairport-sync --no-out-link)/bin/shairport-sync
-//! cargo test -p tas-airplay-out --test shairport --no-run
-//! unshare -rn sh -c 'ip link set lo up; cargo test -p tas-airplay-out --test shairport -- --ignored --nocapture'
+//! export BLASTCAST_SHAIRPORT_SYNC=$(nix-build '<nixpkgs>' -A shairport-sync --no-out-link)/bin/shairport-sync
+//! cargo test -p blastcast-airplay-out --test shairport --no-run
+//! unshare -rn sh -c 'ip link set lo up; cargo test -p blastcast-airplay-out --test shairport -- --ignored --nocapture --test-threads=1'
 //! ```
 //!
 //! shairport-sync 5.5 listens on 5000 whatever its `port` setting or `-p`
 //! says, so the test runs in a network namespace of its own, where 5000 is
-//! free even when a Music Assistant on the host holds it.
+//! free even when a Music Assistant on the host holds it, and one test at a
+//! time, since each starts its own.
 
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use blastcast::{SESSION_FORMAT, ServerClock};
+use blastcast::{IntoTimed, SESSION_FORMAT, ServerClock};
+use blastcast_airplay_out::rtp::NtpClock;
+use blastcast_airplay_out::session::RaopSession;
+use blastcast_airplay_out::{AirplayOutputs, RaopDevice};
 use blastcast_audio::SineSource;
-use blastcast_sendspin::ServerConfig;
-use tas_airplay_out::rtp::NtpClock;
-use tas_airplay_out::session::RaopSession;
-use tas_airplay_out::{AirplayOutputs, RaopDevice};
-use tas_core::{PlayerCommand, PlayerRegistry};
+use blastcast_sendspin::testing::RecordingHost;
+use blastcast_sendspin::{SendspinServer, ServerConfig};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -38,14 +39,14 @@ struct Shairport {
 /// Starts shairport-sync on 127.0.0.1:5000, writing what it plays to
 /// stdout, and returns once it takes connections.
 async fn shairport(clock: ServerClock) -> Shairport {
-    let binary = std::env::var("TAS_SHAIRPORT_SYNC").expect("TAS_SHAIRPORT_SYNC");
+    let binary = std::env::var("BLASTCAST_SHAIRPORT_SYNC").expect("BLASTCAST_SHAIRPORT_SYNC");
     // An empty config, so /etc/shairport-sync.conf isn't read.
     let conf = tempfile::NamedTempFile::new().unwrap();
     let mut child = Command::new(binary)
         .arg("-c")
         .arg(conf.path())
         .args(["-p", "5000", "-o", "stdout", "-m", "tinysvcmdns"])
-        .args(["-a", "tas-airplay-out test", "-v"])
+        .args(["-a", "blastcast-airplay-out test", "-v"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
@@ -107,7 +108,7 @@ impl Shairport {
 const ADDR: &str = "127.0.0.1:5000";
 
 #[tokio::test]
-#[ignore = "needs shairport-sync in TAS_SHAIRPORT_SYNC"]
+#[ignore = "needs shairport-sync in BLASTCAST_SHAIRPORT_SYNC"]
 async fn shairport_plays_what_we_send_when_we_say() {
     let clock = ServerClock::new();
     let ntp = NtpClock::new(clock);
@@ -164,16 +165,16 @@ async fn shairport_plays_what_we_send_when_we_say() {
     );
 }
 
-/// The whole path: a player in the registry, its Sendspin group, the
-/// bridge and the session, to a real receiver.
+/// The whole path: a Sendspin player, its group, the bridge and the
+/// session, to a real receiver.
 #[tokio::test]
-#[ignore = "needs shairport-sync in TAS_SHAIRPORT_SYNC"]
+#[ignore = "needs shairport-sync in BLASTCAST_SHAIRPORT_SYNC"]
 async fn a_bridged_player_plays_on_shairport() {
-    let registry = Arc::new(PlayerRegistry::default());
-    let server = tas_sendspin::server(ServerConfig::new("tas", "Tune Assistant"), registry.clone());
+    let host = RecordingHost::new();
+    let server = SendspinServer::new(ServerConfig::new("tas", "Tune Assistant"), host.clone());
     let clock = server.config().clock;
     let receiver = shairport(clock).await;
-    let outputs = AirplayOutputs::with_local_addrs(server, vec![]);
+    let outputs = AirplayOutputs::with_local_addrs(server.clone(), vec![]);
     outputs.add(RaopDevice {
         player_id: "apshairport".into(),
         name: "shairport".into(),
@@ -184,23 +185,18 @@ async fn a_bridged_player_plays_on_shairport() {
         fullname: "X@shairport._raop._tcp.local.".into(),
     });
     for _ in 0..500 {
-        if registry.get("apshairport").is_some_and(|p| p.available) {
+        if host.is_available("apshairport") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    registry
-        .execute("apshairport", PlayerCommand::VolumeSet(100))
-        .await
-        .unwrap();
+    let player = server.player("apshairport").expect("connected");
+    player.set_volume(100).unwrap();
     // Two seconds of a 48 kHz sine at half scale, in real time.
     let sine = SineSource::new(SESSION_FORMAT, 1000.0)
         .limit_frames(96_000)
         .paced(clock);
-    registry
-        .play_source("apshairport", Box::new(sine))
-        .await
-        .unwrap();
+    player.play(Box::new(sine).into_timed()).await.unwrap();
     tokio::time::sleep(Duration::from_secs(6)).await;
     outputs.shutdown().await;
     let (frames_loud, _) = receiver.loud();

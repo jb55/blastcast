@@ -1,5 +1,5 @@
 [package]
-name = "tas-airplay-out"
+name = "blastcast-airplay-out"
 description = "AirPlay 1 (RAOP) output: a native sender, bridged into Sendspin groups"
 version.workspace = true
 edition.workspace = true
@@ -19,15 +19,14 @@ futures-util.workspace = true
 getrandom.workspace = true
 if-addrs.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
 blastcast-audio.workspace = true
-tas-core.workspace = true
-tas-sendspin.workspace = true
+blastcast-sendspin = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["process", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

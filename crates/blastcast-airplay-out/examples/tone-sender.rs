@@ -1,8 +1,8 @@
 //! A sine tone sent to an AirPlay 1 receiver, as a phone would play to it:
-//! for watching tas' own receiver on the dashboard without a phone.
+//! for watching a receiver (tas' own, on its dashboard) without a phone.
 //!
 //! ```sh
-//! cargo run -p tas-airplay-out --example tone-sender -- 127.0.0.1:7000 [seconds] [hz]
+//! cargo run -p blastcast-airplay-out --example tone-sender -- 127.0.0.1:7000 [seconds] [hz]
 //! ```
 //!
 //! It keeps its own clock, so the receiver's clock map has a real offset
@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use blastcast::ServerClock;
-use tas_airplay_out::{NtpClock, RaopSession};
+use blastcast_airplay_out::{NtpClock, RaopSession};
 
 const RATE: i64 = 44_100;
 const CHUNK: usize = 352;
