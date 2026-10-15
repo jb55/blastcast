@@ -25,7 +25,7 @@ use super::rtsp::{self, Response};
 use super::*;
 use crate::audio::{AirplayAudio, KEEP_LEAD};
 use crate::metadata::{SenderVolume, TrackInfo};
-use tas_sendspin::testing::FakeSpeaker;
+use blastcast_sendspin::testing::FakeSpeaker;
 
 #[derive(Default)]
 struct Recorder {
@@ -288,7 +288,7 @@ async fn a_senders_timeline_and_flush_reach_a_sendspin_player() {
     let rig = Rig::start_with(vec![audio.clone()]).await;
     audio.started(&ReceiverInfo::new(DEVICE, "Kitchen".into(), 7000));
     let source = audio.source(DEVICE).unwrap().unwrap();
-    let stream = tas_sendspin::AudioStream::start(rig.clock, source).unwrap();
+    let stream = blastcast_sendspin::AudioStream::start(rig.clock, source).unwrap();
     let mut speaker = FakeSpeaker::new(rig.clock, "kitchen");
     stream.add_player(speaker.conn());
 
@@ -367,7 +367,7 @@ fn offset_us(speaker: &FakeSpeaker, now: i64) -> (i64, i64) {
 /// late, is `lead`, and most of a sender's two seconds were trimmed for
 /// it.
 fn assert_trimmed(lead: i64, trimmed_us: i64) {
-    let want = tas_sendspin::stream::DEFAULT_SEND_AHEAD_US + KEEP_LEAD.as_micros() as i64;
+    let want = blastcast_sendspin::stream::DEFAULT_SEND_AHEAD_US + KEEP_LEAD.as_micros() as i64;
     assert!(
         (want - 100_000..=want).contains(&lead),
         "first chunk seen {lead} µs ahead, sent {want} ahead"
@@ -1431,7 +1431,7 @@ async fn an_airplay_2_timeline_pause_and_flush_reach_a_sendspin_player() {
     let rig = &ap2.rig;
     audio.started(&ReceiverInfo::new(DEVICE, "Kitchen".into(), 7000));
     let source = audio.source(DEVICE).unwrap().unwrap();
-    let stream = tas_sendspin::AudioStream::start(rig.clock, source).unwrap();
+    let stream = blastcast_sendspin::AudioStream::start(rig.clock, source).unwrap();
     let mut speaker = FakeSpeaker::new(rig.clock, "kitchen");
     stream.add_player(speaker.conn());
 
@@ -1736,7 +1736,7 @@ async fn a_multi_selected_phone_plays_each_target_as_its_own_session() {
     for (rig, name) in rigs.iter().zip(["Kitchen", "Den"]) {
         audio.started(&ReceiverInfo::new(rig.device, name.into(), rig.addr.port()));
         let source = audio.source(rig.device).unwrap().unwrap();
-        let stream = tas_sendspin::AudioStream::start(clock, source).unwrap();
+        let stream = blastcast_sendspin::AudioStream::start(clock, source).unwrap();
         let speaker = FakeSpeaker::new(clock, rig.device);
         stream.add_player(speaker.conn());
         speakers.push(speaker);
