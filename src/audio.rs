@@ -10,6 +10,14 @@
 //! is dropped at once rather than played out. shairport-sync's audio has
 //! no play time: its chunks are unstamped, placed as they arrive.
 //!
+//! **The sender's clock is matched to ours** by blastcast's [`RateMatch`]:
+//! a phone's stamps follow its own clock, tens of ppm off ours, and the
+//! stage drops or repeats a frame now and then to keep the audio on them.
+//! What it does goes to the telemetry hub under the receiver's source id:
+//! each chunk's stamp less where it plays ([`Series::RateError`]), and the
+//! frames dropped and repeated so far ([`Series::FramesDropped`],
+//! [`Series::FramesRepeated`]).
+//!
 //! [`AirplayAudio`] is a [`ReceiverHandler`]: when a shairport run starts
 //! it opens that run's audio fifo and reads it until the run stops, **whether or not
 //! anything is playing it**. A reader that only read while a session was
@@ -40,9 +48,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
+use blastcast::{RateMatch, RateStats};
 use tas_audio::{
-    AudioError, AudioFormat, Item, PcmChunk, TimedSource, pcm, timed_to_session_format,
+    AudioError, AudioFormat, Item, PcmChunk, ServerClock, TimedSource, pcm, timed_to_session_format,
 };
+use tas_proto::Series;
+use tas_telemetry::{Probe, Telemetry};
 use tokio::io::AsyncReadExt;
 use tokio::net::unix::pipe;
 use tokio::sync::mpsc;
@@ -72,6 +83,9 @@ const STREAM_QUEUE: usize = 128;
 #[derive(Default)]
 pub struct AirplayAudio {
     receivers: Mutex<HashMap<String, Reader>>,
+    /// Where each stream's rate matching goes, timed on `clock`.
+    telemetry: Telemetry,
+    clock: ServerClock,
 }
 
 /// One run's stream, and the task reading its fifo, if it has one.
@@ -158,13 +172,29 @@ impl AirplayAudio {
         Arc::default()
     }
 
-    /// `target_id`'s AirPlay audio from now on, in the session format,
-    /// with each chunk's play time kept through the resampling. `None` when
-    /// its receiver isn't running. Ends any stream handed out before for
-    /// the same target.
+    /// As [`Self::new`], with each stream's rate matching sent to
+    /// `telemetry`, timed on `clock`.
+    pub fn with_telemetry(telemetry: Telemetry, clock: ServerClock) -> Arc<Self> {
+        Arc::new(Self {
+            telemetry,
+            clock,
+            ..Self::default()
+        })
+    }
+
+    /// `target_id`'s AirPlay audio from now on, rate matched to the
+    /// server clock and in the session format, with each chunk's play time
+    /// kept through the resampling. `None` when its receiver isn't
+    /// running. Ends any stream handed out before for the same target.
     pub fn source(&self, target_id: &str) -> Option<Result<Box<dyn TimedSource>, AudioError>> {
         let raw = self.subscribe(target_id)?;
-        Some(timed_to_session_format(Box::new(raw)))
+        let matched = Matched {
+            source: RateMatch::new(raw),
+            probe: self.telemetry.probe(&crate::route::source_id(target_id)),
+            clock: self.clock,
+            reported: None,
+        };
+        Some(timed_to_session_format(Box::new(matched)))
     }
 
     /// Ends `target_id`'s stream, once what was already read has been
@@ -304,6 +334,55 @@ impl TimedSource for Received {
 
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
         Ok(self.items.recv().await)
+    }
+}
+
+/// A stream rate matched, with what the matching does sent to the probe:
+/// the error as of each stamped chunk, and the counts as they change.
+struct Matched {
+    source: RateMatch<Received>,
+    probe: Probe,
+    clock: ServerClock,
+    /// The counts last sent.
+    reported: Option<RateStats>,
+}
+
+#[async_trait]
+impl TimedSource for Matched {
+    fn format(&self) -> AudioFormat {
+        self.source.format()
+    }
+
+    fn kind(&self) -> &'static str {
+        self.source.kind()
+    }
+
+    async fn next(&mut self) -> Result<Option<Item>, AudioError> {
+        let item = self.source.next().await?;
+        if let Some(Item::Chunk {
+            play_at_us: Some(_),
+            ..
+        }) = &item
+        {
+            let (now, stats) = (self.clock.now_us(), self.source.stats());
+            self.probe
+                .sample(Series::RateError, now, stats.error_us as f64);
+            let last = self.reported.unwrap_or(RateStats {
+                dropped: u64::MAX,
+                repeated: u64::MAX,
+                ..stats
+            });
+            if stats.dropped != last.dropped {
+                self.probe
+                    .sample(Series::FramesDropped, now, stats.dropped as f64);
+            }
+            if stats.repeated != last.repeated {
+                self.probe
+                    .sample(Series::FramesRepeated, now, stats.repeated as f64);
+            }
+            self.reported = Some(stats);
+        }
+        Ok(item)
     }
 }
 
@@ -571,6 +650,44 @@ mod tests {
         audio.audio(&info, &chunk(0.3), Some(5));
         assert_eq!(next(&mut source).await, Some(Item::Flush));
         assert_eq!(chunk_of(&mut source).await.1, Some(5));
+    }
+
+    /// A native receiver's stream is rate matched, and what the matching
+    /// does goes to the hub under the receiver's source id: a sender whose
+    /// stamps step 20 ms late gets frames repeated until it is caught up.
+    #[tokio::test]
+    async fn rate_matching_is_telemetry() {
+        let info = ReceiverInfo::native("ss-kitchen", "Kitchen".into(), 7000, None);
+        let (hub, clock) = (Telemetry::new(), ServerClock::new());
+        let audio = AirplayAudio::with_telemetry(hub.clone(), clock);
+        audio.started(&info);
+        let mut source = audio.source("ss-kitchen").unwrap().unwrap();
+        let chunk = PcmChunk::new(AIRPLAY_FORMAT, vec![0.1; 352 * 2]);
+        for i in 0..20i64 {
+            let late = if i >= 10 { 20_000 } else { 0 };
+            let at = 1_000_000 + i * 352 * 1_000_000 / 44_100 + late;
+            audio.audio(&info, &chunk, Some(at));
+        }
+        // Most of it through the resampler.
+        samples(&mut *source, 6000 * 2).await;
+        let entity = crate::route::source_id("ss-kitchen");
+        let values = |series| -> Vec<f64> {
+            hub.subscribe(clock.now_us())
+                .history
+                .into_iter()
+                .filter(|t| t.series == series && *t.entity == *entity)
+                .flat_map(|t| t.points)
+                .map(|p| p.value)
+                .collect()
+        };
+        let errors = values(Series::RateError);
+        assert_eq!(errors[..10], [0.0; 10]);
+        // 20 ms late, then 22.7 µs less each frame repeated.
+        assert!((19_990.0..=20_000.0).contains(&errors[10]), "{errors:?}");
+        assert!(errors[11] < errors[10], "{errors:?}");
+        let repeated = values(Series::FramesRepeated);
+        assert_eq!(repeated[..2], [0.0, 1.0], "{repeated:?}");
+        assert_eq!(values(Series::FramesDropped), [0.0]);
     }
 
     #[tokio::test]

@@ -13,16 +13,18 @@
 //! `OPTIONS` (with the [`crypto`] challenge), `ANNOUNCE` ([`announce`]:
 //! codec and key), `SETUP` (our three UDP ports), `RECORD`, then
 //! `SET_PARAMETER`s ([`params`]) and `FLUSH`es until `TEARDOWN`. The audio
-//! packets ([`rtp`]) are decrypted, decoded and played out on our clock by
-//! the jitter buffer ([`playout`]), which asks for lost packets again.
+//! packets ([`rtp`]) are decrypted, decoded and put in order by the
+//! reorder buffer ([`playout`]), which asks for lost packets again.
 //!
 //! **The sender's timeline is kept** ([`clock`]): its NTP clock mapped onto
 //! the server clock and its latest sync packet, so each chunk handed over
 //! carries the server-clock time the sender means it to play, and the
 //! Sendspin stream places it there ([`crate::audio`]). A `FLUSH` is handed
 //! over in line with the audio ([`ReceiverHandler::flush`]). The audio is
-//! still handed over as it plays out here, the latency after it arrived;
-//! handing it over on arrival is headway:tune-assistant/autumn-food-bar.
+//! handed over as soon as it is in order, not when it plays, so the whole
+//! of the sender's lead reaches downstream; the drift between the
+//! sender's clock and ours is absorbed there, by blastcast's rate match
+//! ([`crate::audio`]).
 //!
 //! **A session** is what shairport-sync's active state was, and what
 //! [`MetadataEvent::PlayBegin`] and [`MetadataEvent::PlayEnd`] bracket: it
@@ -41,7 +43,7 @@
 //! [`NativeConfig::telemetry`] under the receiver's source id: every
 //! timing reply and the clock map it leaves, each sync packet, each
 //! packet's lead and the buffer behind it, and marks for what the playout
-//! did (silence, a jump, running dry, a drift correction), resend
+//! did (silence, a jump, running dry), resend
 //! requests, flushes, takeovers, and the session's begin and end.
 //!
 //! Like the rest of AirPlay input, audio only passes through: nothing is
@@ -94,8 +96,10 @@ pub struct NativeConfig {
     pub clock: ServerClock,
     /// Where `_raop._tcp` is advertised; nowhere when `None`, as in tests.
     pub mdns: Option<tas_mdns::Mdns>,
-    /// How long after its packet arrives a frame plays: the window for a
-    /// lost packet to be sent again.
+    /// The least lead a chunk is handed over with: a lost packet is waited
+    /// for until this long before it plays, or, before the sender's
+    /// timeline is known, this long after it was missed. It is also the
+    /// `Audio-Latency` answered to `RECORD`.
     pub latency: Duration,
     /// How long after the last sender leaves the session ends, as
     /// shairport's `active_state_timeout`.

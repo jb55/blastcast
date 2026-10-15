@@ -7,15 +7,22 @@
 //! long as the stream:
 //!
 //! - **audio**: each packet is decrypted, decoded and queued in the
-//!   [`Playout`]. A sequence number that skips ahead asks the sender, on
+//!   [`Playout`], and whatever follows on in order is handed to the
+//!   receiver's handler at once, as PCM stamped with the sender's play
+//!   time for it. A sequence number that skips ahead asks the sender, on
 //!   its control port, for the ones skipped.
 //! - **control**: the packets sent again come back here and are queued the
 //!   same way. Each sync packet is the sender timeline's new anchor.
 //! - **timing**: asks the sender's clock every few seconds, as a receiver
 //!   does, feeding the timeline's clock map, and answers if it asks ours.
-//! - **playout**: wakes when the next frame is due and hands what is due
-//!   to the receiver's handler as PCM, stamped with the sender's play
-//!   time for it.
+//! - **playout**: wakes when a gap's resend is given up on, to hand the
+//!   gap over as silence and what follows it, and when the sender has
+//!   gone quiet.
+//!
+//! A gap waits for its resend until the missing frame plays less
+//! [`NativeConfig::latency`](super::NativeConfig::latency), the lead kept
+//! for downstream: so a phone's two seconds leave most of two seconds for
+//! a resend.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -34,7 +41,7 @@ use tracing::Instrument;
 use super::announce::{Announce, Codec, Decoder, SAMPLE_RATE};
 use super::clock::{self, SyncPacket, Timeline};
 use super::crypto::{self, AudioCipher};
-use super::playout::{Inserted, Note, Playout};
+use super::playout::{Inserted, Note, Played, Playout};
 use super::rtsp::{self, Request, Response};
 use super::{AIRTUNES_VERSION, Receiver, bind_udp, params, rtp};
 use crate::audio::AIRPLAY_FORMAT;
@@ -352,6 +359,11 @@ struct Ingest {
     undecodable: u64,
     /// When the sender means each frame to play.
     timeline: Timeline,
+    /// The lead a chunk is handed over with at the least: a gap waits for
+    /// its resend until this long before it plays.
+    lead: Duration,
+    /// When the sender's lead was last logged.
+    lead_logged: Option<Instant>,
     probe: Probe,
 }
 
@@ -403,8 +415,6 @@ impl Ingest {
                     self.probe
                         .sample(Series::Lead, now_us, (at - now_us) as f64);
                 }
-                let buffered = frames_us(self.playout.buffered_frames());
-                self.probe.sample(Series::Buffered, now_us, buffered);
             }
             Inserted::Overflow => tracing::debug!("AirPlay buffer full; dropping a packet"),
             other => tracing::trace!(seq = header.seq, ?other, "AirPlay packet not queued"),
@@ -420,10 +430,62 @@ impl Ingest {
                 Note::Silence(frames) => (Series::Silence, frames_us(frames)),
                 Note::Jump(frames) => (Series::TimestampJump, frames_us(frames)),
                 Note::RanDry => (Series::RanDry, 0.0),
-                Note::Corrected(frames) => (Series::DriftCorrection, frames as f64),
             };
             self.probe.mark(kind, now_us, detail);
         }
+    }
+
+    /// What is ready by `now`, with the sender's play time for each.
+    fn pop_ready(&mut self, now: Instant) -> Vec<(Played, Option<i64>)> {
+        let ready = self
+            .playout
+            .pop_ready(now, deadline(&self.timeline, self.lead));
+        self.note();
+        ready
+            .into_iter()
+            .map(|p| {
+                let at = self.timeline.play_at_us(p.rtp);
+                (p, at)
+            })
+            .collect()
+    }
+
+    /// When a gap's resend is given up on, or the sender goes idle.
+    fn wake_at(&self) -> Option<Instant> {
+        self.playout.wake_at(deadline(&self.timeline, self.lead))
+    }
+}
+
+/// When frame `rtp` must be handed over by to keep `lead` for downstream,
+/// once the sender's timeline says when it plays.
+fn deadline(timeline: &Timeline, lead: Duration) -> impl Fn(u32) -> Option<Instant> + '_ {
+    move |rtp| {
+        let at = timeline.play_at_us(rtp)?;
+        timeline.clock.instant_at(at).checked_sub(lead)
+    }
+}
+
+/// Hands what is ready to the receiver's handler. Called under the
+/// ingest lock, so a flush can't come between taking a chunk out and
+/// handing it over.
+fn hand_over(shared: &Shared, ingest: &mut Ingest, now: Instant) {
+    let clock = shared.receiver.config.clock;
+    for (p, play_at_us) in ingest.pop_ready(now) {
+        if let Some(at) = play_at_us
+            && ingest
+                .lead_logged
+                .is_none_or(|t| t.elapsed() >= LEAD_LOG_INTERVAL)
+        {
+            ingest.lead_logged = Some(Instant::now());
+            tracing::debug!(
+                lead_ms = (at - clock.now_us()) / 1000,
+                "the AirPlay sender means the audio handed over now to play this far ahead"
+            );
+        }
+        let samples = p.frames.iter().map(|&s| f32::from(s) / 32_768.0).collect();
+        shared
+            .receiver
+            .audio(&PcmChunk::new(AIRPLAY_FORMAT, samples), play_at_us);
     }
 }
 
@@ -463,6 +525,8 @@ impl Stream {
                 paused: false,
                 undecodable: 0,
                 timeline: Timeline::new(clock),
+                lead: latency,
+                lead_logged: None,
                 probe,
             }),
             queued: Notify::new(),
@@ -522,7 +586,13 @@ async fn queue(
 ) {
     let (missing, resumed, request_seq) = {
         let mut ingest = shared.lock();
-        let (missing, resumed) = ingest.packet(Instant::now(), packet.0, packet.1, resent);
+        let now = Instant::now();
+        let (missing, resumed) = ingest.packet(now, packet.0, packet.1, resent);
+        hand_over(shared, &mut ingest, now);
+        // What is held behind a gap, once what follows on has gone.
+        let buffered = frames_us(ingest.playout.buffered_frames());
+        let now_us = ingest.timeline.clock.now_us();
+        ingest.probe.sample(Series::Buffered, now_us, buffered);
         if missing.is_some() {
             ingest.resend_seq = ingest.resend_seq.wrapping_add(1);
         }
@@ -653,10 +723,8 @@ async fn keep_time(
 }
 
 async fn play_out(shared: Arc<Shared>) {
-    let clock = shared.receiver.config.clock;
-    let mut lead_logged: Option<Instant> = None;
     loop {
-        let wake = shared.lock().playout.wake_at();
+        let wake = shared.lock().wake_at();
         match wake {
             Some(at) => {
                 tokio::select! {
@@ -666,26 +734,7 @@ async fn play_out(shared: Arc<Shared>) {
             }
             None => shared.queued.notified().await,
         }
-        // Handed over under the lock, so a flush can't come between taking
-        // a chunk out and handing it over.
         let mut ingest = shared.lock();
-        let due = ingest.playout.pop_due(Instant::now());
-        ingest.note();
-        for p in due {
-            let (play_at_us, frames) = (ingest.timeline.play_at_us(p.rtp), p.frames);
-            if let Some(at) = play_at_us
-                && lead_logged.is_none_or(|t| t.elapsed() >= LEAD_LOG_INTERVAL)
-            {
-                lead_logged = Some(Instant::now());
-                tracing::debug!(
-                    lead_ms = (at - clock.now_us()) / 1000,
-                    "the AirPlay sender means the audio played now to play this far ahead"
-                );
-            }
-            let samples = frames.iter().map(|&s| f32::from(s) / 32_768.0).collect();
-            shared
-                .receiver
-                .audio(&PcmChunk::new(AIRPLAY_FORMAT, samples), play_at_us);
-        }
+        hand_over(&shared, &mut ingest, Instant::now());
     }
 }

@@ -32,8 +32,9 @@ use tas_sendspin::testing::FakeSpeaker;
 struct Recorder {
     events: Mutex<Vec<MetadataEvent>>,
     samples: Mutex<Vec<f32>>,
-    /// Each chunk's frame count and play time.
-    stamps: Mutex<Vec<(usize, Option<i64>)>>,
+    /// Each chunk's frame count and play time, and when it was handed
+    /// over.
+    stamps: Mutex<Vec<(usize, Option<i64>, Instant)>>,
 }
 
 impl ReceiverHandler for Recorder {
@@ -45,7 +46,7 @@ impl ReceiverHandler for Recorder {
             .lock()
             .unwrap()
             .extend_from_slice(&chunk.samples);
-        let stamp = (chunk.frames(), play_at_us);
+        let stamp = (chunk.frames(), play_at_us, Instant::now());
         self.stamps.lock().unwrap().push(stamp);
     }
 }
@@ -224,7 +225,7 @@ async fn chunks_carry_the_senders_play_time() {
         .await;
     let stamps = rig.recorder.stamps.lock().unwrap().clone();
     let mut frames = 0;
-    for (n, stamp) in stamps {
+    for (n, stamp, handed) in stamps {
         let want = t + frames * 1_000_000 / 44_100;
         let got = stamp.expect("every chunk is stamped");
         // The clock map's error on localhost, and a µs of rounding.
@@ -232,12 +233,16 @@ async fn chunks_carry_the_senders_play_time() {
             (got - want).abs() < 500,
             "frame {frames}: stamped {got}, sent for {want}"
         );
+        // Handed over as it arrived, with the whole of the two seconds the
+        // sender sent it ahead by: not the receiver's latency (100 ms here)
+        // less.
+        let lead = got - rig.clock.us_at(handed);
+        assert!(
+            lead > 1_960_000,
+            "frame {frames}: handed over {lead} µs ahead"
+        );
         frames += n as i64;
     }
-    // Handed over the receiver's latency after arriving, well ahead of
-    // when the sender means it to play: that lead is the budget.
-    let lead = t - rig.clock.now_us();
-    assert!(lead > 1_000_000, "{lead} µs");
     sender.teardown().await;
     rig.shutdown().await;
 }
