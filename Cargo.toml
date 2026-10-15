@@ -11,11 +11,13 @@ publish = false
 
 [workspace.dependencies]
 blastcast = { path = "crates/blastcast" }
+blastcast-audio = { path = "crates/blastcast-audio" }
 blastcast-mdns = { path = "crates/blastcast-mdns" }
 
 async-trait = "0.1"
 if-addrs = "0.15"
 mdns-sd = "0.21"
+rubato = "5"
 serde_json = "1"
 thiserror = "2"
 tokio = "1"

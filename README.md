@@ -13,9 +13,10 @@ It is a cargo workspace, one crate per directory under `crates/`:
 | crate | what it holds |
 |---|---|
 | `blastcast` | the timing core: the clock, clock maps, anchors, timed sources, the rate match and the timeline |
+| `blastcast-audio` | audio plumbing between protocols: PCM sample conversion (`pcm`), a streaming resampler over rubato (`StreamResampler`, `Resampled`, `TimedResampled`, `to_session_format`) and a test tone (`SineSource`) |
 | `blastcast-mdns` | one mDNS responder shared by every protocol: our adverts (any `Service`, with `_sendspin-server._tcp` and `_mass._tcp` built in) and browsing for players |
 
-The other protocol crates (`blastcast-audio`, `blastcast-sendspin`,
+The other protocol crates (`blastcast-telemetry`, `blastcast-sendspin`,
 `blastcast-airplay`, ...) are moving in beside them from tune-assistant-server.
 
 `blastcast-mdns`'s `advertise_browse` test advertises and browses over the
@@ -50,5 +51,5 @@ stream is the sink. It depends on these crates by path, as a sibling checkout
 ```
 
 The history before this repo existed is that of each crate's directory in
-tune-assistant-server (`crates/blastcast`, `crates/tas-mdns`), carried over
+tune-assistant-server (`crates/blastcast`, `crates/tas-mdns`, `crates/tas-audio`), carried over
 with `git subtree split`.

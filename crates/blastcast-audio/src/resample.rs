@@ -18,7 +18,7 @@ use rubato::{
     WindowFunction,
 };
 
-use crate::AudioError;
+use blastcast::AudioError;
 
 /// Input frames per rubato block: about 23 ms at 44.1 kHz.
 const BLOCK_FRAMES: usize = 1024;

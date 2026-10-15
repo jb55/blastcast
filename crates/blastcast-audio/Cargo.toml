@@ -1,5 +1,6 @@
 [package]
-name = "tas-audio"
+name = "blastcast-audio"
+description = "Audio plumbing between protocols: PCM conversion, streaming resampling and test tones"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,11 +11,10 @@ publish.workspace = true
 async-trait.workspace = true
 blastcast.workspace = true
 rubato.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
 
 [lints]
 workspace = true
