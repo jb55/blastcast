@@ -2,6 +2,8 @@
 //! shairport-sync per target whose PCM and metadata fifos are read.
 //!
 //! - [`raop`] is the native receiver.
+//! - [`ap2`] is what it adds for AirPlay 2 senders: the advert, `/info`
+//!   and each target's identity.
 //! - [`binary`] finds a working shairport-sync.
 //! - [`config`] names each receiver's port, fifos and config file, and
 //!   writes the config.
@@ -14,6 +16,7 @@
 //! - [`route`] plays each sender's session on the receiver's target player
 //!   or group, with its volume and what it is playing.
 
+pub mod ap2;
 pub mod audio;
 pub mod binary;
 pub mod config;

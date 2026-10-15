@@ -414,11 +414,19 @@ impl Phone {
         headers: &[(&str, String)],
         body: Option<(&str, Vec<u8>)>,
     ) -> Response {
+        self.request_to(method, "rtsp://127.0.0.1/42", headers, body)
+            .await
+    }
+
+    async fn request_to(
+        &mut self,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, String)],
+        body: Option<(&str, Vec<u8>)>,
+    ) -> Response {
         self.cseq += 1;
-        let mut text = format!(
-            "{method} rtsp://127.0.0.1/42 RTSP/1.0\r\nCSeq: {}\r\n",
-            self.cseq
-        );
+        let mut text = format!("{method} {uri} RTSP/1.0\r\nCSeq: {}\r\n", self.cseq);
         for (k, v) in headers {
             text.push_str(&format!("{k}: {v}\r\n"));
         }
@@ -515,27 +523,7 @@ impl Phone {
 }
 
 async fn read_response(r: &mut BufReader<TcpStream>) -> Response {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-    let mut line = String::new();
-    r.read_line(&mut line).await.unwrap();
-    let status: u16 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let mut response = Response::new(status);
-    loop {
-        line.clear();
-        r.read_line(&mut line).await.unwrap();
-        let text = line.trim_end();
-        if text.is_empty() {
-            break;
-        }
-        let (k, v) = text.split_once(':').unwrap();
-        response = response.header(k.trim(), v.trim());
-    }
-    if let Some(len) = response.get("Content-Length") {
-        let mut body = vec![0; len.parse().unwrap()];
-        r.read_exact(&mut body).await.unwrap();
-        response.body = body;
-    }
-    response
+    Response::read(r).await.unwrap().expect("a response")
 }
 
 #[tokio::test]
@@ -835,5 +823,117 @@ async fn requests_out_of_order_and_unknown_ones_are_refused() {
     assert_eq!(options.get("CSeq"), Some("5"));
     assert!(options.get("Public").unwrap().contains("ANNOUNCE"));
     assert!(rig.recorder.events().is_empty());
+    rig.shutdown().await;
+}
+
+/// An AirPlay 2 sender's first request, `GET /info`, is answered on the
+/// AirPlay 1 receiver's connection, and AirPlay 1 goes on after it.
+#[tokio::test]
+async fn info_is_answered_beside_airplay_1() {
+    let rig = Rig::start().await;
+    let mut phone = Phone::connect(rig.addr).await;
+    let info = phone.request_to("GET", "/info", &[], None).await;
+    assert_eq!(info.status, 200);
+    assert_eq!(info.get("CSeq"), Some("1"));
+    assert_eq!(info.get("Content-Type"), Some(crate::ap2::BPLIST));
+    let plist = plist::Value::from_reader(std::io::Cursor::new(info.body)).unwrap();
+    let dict = plist.as_dictionary().unwrap();
+    let hex: Vec<String> = device_id("server", DEVICE)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    let s = |k: &str| dict.get(k).and_then(plist::Value::as_string);
+    assert_eq!(s("deviceID"), Some(hex.join(":").as_str()));
+    assert_eq!(s("name"), Some("Kitchen"));
+    assert_eq!(
+        dict.get("features").unwrap().as_unsigned_integer(),
+        Some(crate::ap2::FEATURES)
+    );
+
+    let options = phone.request("OPTIONS", &[], None).await;
+    assert_eq!((options.status, options.get("CSeq")), (200, Some("2")));
+    rig.shutdown().await;
+}
+
+/// A phone's AirPlay 2 handshake, up to where SETUP will go: transient
+/// pairing, then everything encrypted, `/fp-setup` included, with AirPlay
+/// 1's methods still answered on the same connection.
+#[tokio::test]
+async fn an_airplay_2_sender_pairs_and_talks_encrypted() {
+    use crate::ap2::testing::{Controller, PairError};
+    use crate::ap2::tlv::error;
+
+    let rig = Rig::start().await;
+    let mut phone = Controller::connect(rig.addr).await.unwrap();
+    let info = phone.info().await.unwrap();
+    let pk: [u8; 32] = info
+        .get("pk")
+        .and_then(plist::Value::as_data)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    phone.pair_setup("3939").await.unwrap();
+    assert!(phone.keys().is_some());
+
+    // Encrypted now: the same requests, answered the same way.
+    let again = phone.info().await.unwrap();
+    assert_eq!(
+        again.get("pk").and_then(plist::Value::as_data),
+        Some(&pk[..])
+    );
+    let options = phone.request("OPTIONS", "*", &[], None).await.unwrap();
+    // /info, M1, M3, /info again, then this.
+    assert_eq!((options.status, options.get("CSeq")), (200, Some("5")));
+    assert_eq!(options.get("Server"), Some("AirTunes/366.0"));
+    for mode in 0..4 {
+        let (first, second) = phone.fp_setup(mode).await.unwrap();
+        assert_eq!((first.status, first.body.len()), (200, 142));
+        assert_eq!(first.body[13], mode, "mode {mode}'s reply");
+        assert_eq!(second.body.len(), 32);
+        assert_eq!(&second.body[..12], b"FPLY\x03\x01\x04\x00\x00\x00\x00\x14");
+        assert_eq!(
+            &second.body[12..],
+            &(144..164).map(|i| (i - 12) as u8).collect::<Vec<_>>()[..]
+        );
+    }
+    // Pairing twice on one connection isn't.
+    assert!(matches!(
+        phone.pair_setup("3939").await,
+        Err(PairError::Status(455))
+    ));
+
+    // A wrong PIN is refused, and the connection stays in the clear.
+    let mut wrong = Controller::connect(rig.addr).await.unwrap();
+    assert!(matches!(
+        wrong.pair_setup("1234").await,
+        Err(PairError::Refused {
+            state: 4,
+            code: error::AUTHENTICATION
+        })
+    ));
+    assert!(wrong.keys().is_none());
+    assert_eq!(
+        wrong
+            .info()
+            .await
+            .unwrap()
+            .get("pk")
+            .and_then(plist::Value::as_data),
+        Some(&pk[..])
+    );
+
+    // Pair-verify, against the advertised key.
+    let mut verified = Controller::connect(rig.addr).await.unwrap();
+    verified.pair_verify(&pk).await.unwrap();
+    let options = verified.request("OPTIONS", "*", &[], None).await.unwrap();
+    assert_eq!(options.status, 200);
+    // And a sender that expects some other device's key gives up on us.
+    let mut other = Controller::connect(rig.addr).await.unwrap();
+    assert!(matches!(
+        other.pair_verify(&[9; 32]).await,
+        Err(PairError::Unproven(_))
+    ));
+
+    drop((phone, wrong, verified, other));
     rig.shutdown().await;
 }
