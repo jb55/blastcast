@@ -15,8 +15,10 @@
 //! none of it itself. So the stream may trim it ([`TimedSource::trim_lead`]):
 //! each timeline (a start, or after a flush) starts the players'
 //! send-ahead (plus [`KEEP_LEAD`]) after its first chunk arrives, and the
-//! rest keep the stamps' spacing. Play and pause on the phone take about a
-//! quarter second to be heard, not two seconds.
+//! rest keep the stamps' spacing. A jump in the stamps, such as the clock
+//! map settling as a session starts, trims again rather than adding the
+//! jump to the lead. Play and pause on the phone take about a quarter
+//! second to be heard, not two seconds.
 //!
 //! **The sender's clock is matched to ours** by blastcast's [`RateMatch`]:
 //! a phone's stamps follow its own clock, tens of ppm off ours, and the
