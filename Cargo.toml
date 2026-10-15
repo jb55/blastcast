@@ -22,8 +22,7 @@ plist.workspace = true
 tas-core.workspace = true
 blastcast-audio.workspace = true
 blastcast-mdns.workspace = true
-tas-proto.workspace = true
-tas-telemetry.workspace = true
+blastcast-telemetry = { workspace = true, features = ["hub"] }
 
 rsa.workspace = true
 sha1.workspace = true

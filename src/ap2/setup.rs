@@ -37,8 +37,8 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use blastcast::ServerClock;
+use blastcast_telemetry::Probe;
 use plist::{Dictionary, Value};
-use tas_telemetry::Probe;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;

@@ -38,8 +38,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use blastcast::ClockMap;
 use blastcast::ServerClock;
-use tas_proto::Series;
-use tas_telemetry::{Probe, Telemetry};
+use blastcast_telemetry::{Probe, Series, Telemetry};
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 

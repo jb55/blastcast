@@ -49,8 +49,7 @@ use async_trait::async_trait;
 use blastcast::{AudioError, AudioFormat, Item, PcmChunk, ServerClock, TimedSource};
 use blastcast::{RateMatch, RateStats};
 use blastcast_audio::timed_to_session_format;
-use tas_proto::Series;
-use tas_telemetry::{Probe, Telemetry};
+use blastcast_telemetry::{Probe, Series, Telemetry};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 

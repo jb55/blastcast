@@ -66,9 +66,8 @@ use std::time::Duration;
 
 use blastcast::{Anchor, ClockMap};
 use blastcast::{PcmChunk, ServerClock};
+use blastcast_telemetry::{Probe, Series};
 use plist::{Dictionary, Value};
-use tas_proto::Series;
-use tas_telemetry::Probe;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 

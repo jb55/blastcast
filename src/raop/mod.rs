@@ -77,9 +77,8 @@ use std::time::Duration;
 
 use blastcast::{PcmChunk, ServerClock};
 use blastcast_mdns::service::{Service, TxtEntry};
+use blastcast_telemetry::{Probe, Roster, Series, Telemetry};
 use sha2::{Digest, Sha256};
-use tas_proto::Series;
-use tas_telemetry::{Probe, Roster, Telemetry};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
@@ -122,9 +121,9 @@ pub struct NativeConfig {
     /// by default.
     pub telemetry: Telemetry,
     /// Every receiver running.
-    pub receivers: Roster<tas_proto::Receiver>,
+    pub receivers: Roster<blastcast_telemetry::Receiver>,
     /// Every sender's stream on one.
-    pub sessions: Roster<tas_proto::Session>,
+    pub sessions: Roster<blastcast_telemetry::Session>,
     /// What each target's AirPlay 2 key and `pi` come from: the one in
     /// the state file ([`crate::ap2::Identity::load`]), so a phone keeps
     /// recognising it. A new one each run by default, as in tests.
@@ -286,7 +285,7 @@ pub async fn serve(
         _ => None,
     };
     let id = crate::route::source_id(&info.target_id);
-    config.receivers.set(tas_proto::Receiver {
+    config.receivers.set(blastcast_telemetry::Receiver {
         id: id.clone(),
         target: info.target_id.clone(),
         name: info.airplay_name.clone(),
@@ -349,8 +348,8 @@ pub async fn serve(
 
 /// Unlists a receiver and its sessions however its run ends.
 struct Listed {
-    receivers: Roster<tas_proto::Receiver>,
-    sessions: Roster<tas_proto::Session>,
+    receivers: Roster<blastcast_telemetry::Receiver>,
+    sessions: Roster<blastcast_telemetry::Session>,
     id: String,
 }
 
@@ -451,7 +450,7 @@ impl Receiver {
     /// and the connection that played before is dropped, whichever
     /// protocol it spoke.
     fn take_over(&self, conn: u64, sender: Sender) {
-        let session = tas_proto::Session {
+        let session = blastcast_telemetry::Session {
             id: self.session_id(conn),
             receiver: self.id.clone(),
             sender: sender.peer.to_string(),

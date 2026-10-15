@@ -9,10 +9,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use blastcast::{PcmChunk, ServerClock};
+use blastcast_telemetry::{Point, Series, Telemetry};
 use rsa::Pkcs1v15Sign;
 use tas_airplay_out::{NtpClock, RaopSession};
-use tas_proto::Series;
-use tas_telemetry::{Point, Telemetry};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
@@ -70,8 +69,8 @@ struct Rig {
     addr: SocketAddr,
     clock: ServerClock,
     hub: Telemetry,
-    receivers: tas_telemetry::Roster<tas_proto::Receiver>,
-    sessions: tas_telemetry::Roster<tas_proto::Session>,
+    receivers: blastcast_telemetry::Roster<blastcast_telemetry::Receiver>,
+    sessions: blastcast_telemetry::Roster<blastcast_telemetry::Session>,
     recorder: Arc<Recorder>,
     stop: watch::Sender<bool>,
     task: JoinHandle<io::Result<()>>,
