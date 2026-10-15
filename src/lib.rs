@@ -22,12 +22,16 @@
 //! lock and writes a ring; once a ring has filled its window, that
 //! allocates nothing. Only an entity or series seen for the first time
 //! allocates.
+//!
+//! **State.** A [`Roster`] is the other thing a producer hands `/v1/ws`:
+//! the entities of one topic it has (receivers, speakers), whole, as a
+//! watch.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tas_proto::{Column, Kind, Series, TelemetryFilter};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// How far back a series' history goes: a minute, on the server clock.
 pub const WINDOW_US: i64 = 60_000_000;
@@ -275,6 +279,108 @@ impl Probe {
     }
 }
 
+/// An entity a [`Roster`] holds, by its id.
+pub trait Keyed {
+    fn key(&self) -> &str;
+}
+
+impl Keyed for tas_proto::Stream {
+    fn key(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Keyed for tas_proto::Receiver {
+    fn key(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Keyed for tas_proto::Session {
+    fn key(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Keyed for tas_proto::Speaker {
+    fn key(&self) -> &str {
+        &self.id
+    }
+}
+
+/// The entities of one kind a producer has, by id, and a watch of them in
+/// id order. A cheap clone: clones share it. A change that changes nothing
+/// wakes nobody.
+#[derive(Debug)]
+pub struct Roster<T>(Arc<watch::Sender<Vec<T>>>);
+
+impl<T> Clone for Roster<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: Keyed + Clone + PartialEq> Default for Roster<T> {
+    fn default() -> Self {
+        Self(Arc::new(watch::channel(Vec::new()).0))
+    }
+}
+
+impl<T: Keyed + Clone + PartialEq> Roster<T> {
+    /// Every entity as of now, then each change.
+    pub fn subscribe(&self) -> watch::Receiver<Vec<T>> {
+        self.0.subscribe()
+    }
+
+    /// Every entity as of now.
+    pub fn all(&self) -> Vec<T> {
+        self.0.borrow().clone()
+    }
+
+    /// Adds `value`, or replaces the one with its id.
+    pub fn set(&self, value: T) {
+        self.0.send_if_modified(
+            |all| match all.binary_search_by(|e| e.key().cmp(value.key())) {
+                Ok(i) if all[i] == value => false,
+                Ok(i) => {
+                    all[i] = value;
+                    true
+                }
+                Err(i) => {
+                    all.insert(i, value);
+                    true
+                }
+            },
+        );
+    }
+
+    /// Changes the entity `id`, if there is one.
+    pub fn modify(&self, id: &str, f: impl FnOnce(&mut T)) {
+        self.0.send_if_modified(|all| {
+            let Ok(i) = all.binary_search_by(|e| e.key().cmp(id)) else {
+                return false;
+            };
+            let before = all[i].clone();
+            f(&mut all[i]);
+            all[i] != before
+        });
+    }
+
+    /// Drops the entity `id`.
+    pub fn remove(&self, id: &str) {
+        self.retain(|e| e.key() != id);
+    }
+
+    /// Keeps only the entities `keep` picks.
+    pub fn retain(&self, mut keep: impl FnMut(&T) -> bool) {
+        self.0.send_if_modified(|all| {
+            let before = all.len();
+            all.retain(|e| keep(e));
+            all.len() != before
+        });
+    }
+}
+
 /// Points gathered into tas-proto's columns: one per series and entity,
 /// in the order each first came.
 #[derive(Debug, Default)]
@@ -424,6 +530,42 @@ mod tests {
                 }
             )
         );
+    }
+
+    fn receiver(id: &str, name: &str) -> tas_proto::Receiver {
+        tas_proto::Receiver {
+            id: id.into(),
+            target: id.into(),
+            name: name.into(),
+            port: 7000,
+            session: None,
+            playing: false,
+        }
+    }
+
+    #[test]
+    fn a_roster_keeps_entities_in_id_order_and_wakes_only_on_change() {
+        let roster = Roster::default();
+        let mut rx = roster.subscribe();
+        roster.set(receiver("b", "Den"));
+        roster.set(receiver("a", "Kitchen"));
+        assert!(rx.has_changed().unwrap());
+        let names: Vec<String> = rx
+            .borrow_and_update()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert_eq!(names, ["Kitchen", "Den"]);
+        roster.set(receiver("a", "Kitchen"));
+        roster.modify("a", |r| r.name = "Kitchen".into());
+        roster.modify("nobody", |r| r.name = "x".into());
+        roster.remove("nobody");
+        assert!(!rx.has_changed().unwrap(), "nothing changed");
+        roster.modify("a", |r| r.playing = true);
+        assert!(rx.borrow_and_update()[0].playing);
+        roster.remove("a");
+        assert_eq!(rx.borrow_and_update().len(), 1);
+        assert_eq!(roster.all()[0].id, "b");
     }
 
     #[test]
