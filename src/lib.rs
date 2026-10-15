@@ -203,17 +203,6 @@ pub fn host_label(server_id: &str) -> String {
     }
 }
 
-/// The name of the interface `wanted` names, by name or by one of its
-/// addresses, for tools that only take a name. `None` if there is none.
-pub fn interface_name(wanted: &str) -> Option<String> {
-    let interfaces = if_addrs::get_if_addrs().ok()?;
-    let found = match wanted.parse::<IpAddr>() {
-        Ok(ip) => interfaces.into_iter().find(|i| i.ip() == ip),
-        Err(_) => interfaces.into_iter().find(|i| i.name == wanted),
-    };
-    found.map(|i| i.name)
-}
-
 /// The address a device on the LAN can reach us on, for URLs we hand out
 /// (MA's publish IP). On `interface` (a name or one of its addresses) when
 /// one is given; otherwise the one the default route leaves from, else any
@@ -296,13 +285,6 @@ fn only(ip: IpAddr) -> impl Fn(&if_addrs::Interface) -> bool + Send + Sync + 'st
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn interface_name_from_a_name_or_an_address() {
-        assert_eq!(interface_name("lo").as_deref(), Some("lo"));
-        assert_eq!(interface_name("127.0.0.1").as_deref(), Some("lo"));
-        assert_eq!(interface_name("no-such-if0"), None);
-    }
 
     #[test]
     fn publish_ip_on_an_interface() {
