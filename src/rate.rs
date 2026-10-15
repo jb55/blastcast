@@ -152,6 +152,10 @@ impl<S: TimedSource> TimedSource for RateMatch<S> {
         self.source.kind()
     }
 
+    fn trim_lead(&self) -> Option<i64> {
+        self.source.trim_lead()
+    }
+
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
         let item = self.source.next().await?;
         Ok(match item {

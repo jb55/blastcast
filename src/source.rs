@@ -103,6 +103,18 @@ pub trait TimedSource: Send {
         "unknown"
     }
 
+    /// Whether the sink may play this source's audio sooner than stamped,
+    /// keeping the stamps' spacing: `Some(keep_us)` when whatever lead a
+    /// chunk comes with past the sink's own send-ahead plus `keep_us` is a
+    /// sender's buffer, not a time anything else plays to. An AirPlay 1
+    /// phone's is: it stamps its audio two seconds ahead and plays none of
+    /// it itself. `keep_us` is the lateness the source can hand a chunk
+    /// over with after the first, such as waiting for a resend. `None`,
+    /// the default: the stamps are when the audio plays.
+    fn trim_lead(&self) -> Option<i64> {
+        None
+    }
+
     /// The next item. `Ok(None)` ends the stream as [`Item::End`] does.
     /// Chunks may be any size, but never empty.
     async fn next(&mut self) -> Result<Option<Item>, AudioError>;
@@ -124,6 +136,10 @@ impl<S: TimedSource + ?Sized> TimedSource for Box<S> {
 
     fn kind(&self) -> &'static str {
         (**self).kind()
+    }
+
+    fn trim_lead(&self) -> Option<i64> {
+        (**self).trim_lead()
     }
 
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
