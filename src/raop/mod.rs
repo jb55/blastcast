@@ -1,12 +1,9 @@
-//! A native AirPlay 1 (RAOP) receiver, in place of shairport-sync.
+//! A native AirPlay 1 (RAOP) receiver.
 //!
-//! One receiver per target, run by the [`crate::supervisor`] as it runs a
-//! shairport-sync: it listens on the target's port, advertises
-//! `_raop._tcp` on the shared mDNS responder, and tells the same
-//! [`ReceiverHandler`] what happens, so the audio, metadata and router
-//! downstream don't know which one they are fed by. The difference is
-//! that nothing goes through a fifo: the audio arrives as
-//! [`ReceiverHandler::audio`] and what the sender says as
+//! One receiver per target, run by the [`crate::supervisor`]: it listens
+//! on the target's port, advertises `_raop._tcp` on the shared mDNS
+//! responder, and tells the [`ReceiverHandler`] what happens: the audio
+//! arrives as [`ReceiverHandler::audio`] and what the sender says as
 //! [`ReceiverHandler::event`], already parsed.
 //!
 //! A sender's connection runs iTunes' sequence ([`connection`]):
@@ -26,7 +23,7 @@
 //! sender's clock and ours is absorbed there, by blastcast's rate match
 //! ([`crate::audio`]).
 //!
-//! **A session** is what shairport-sync's active state was, and what
+//! **A session** is what shairport-sync calls its active state, and what
 //! [`MetadataEvent::PlayBegin`] and [`MetadataEvent::PlayEnd`] bracket: it
 //! begins at the first `RECORD` and ends [`NativeConfig::end_after`] after
 //! the last sender has gone, so a phone that reconnects between tracks

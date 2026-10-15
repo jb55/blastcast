@@ -566,12 +566,9 @@ mod tests {
     use tas_audio::{Item, TimedSource};
     use tas_core::player::PlayerState;
     use tas_core::{ImageSource, PlayerControl, PlayerFeature};
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::unix::pipe;
 
     use super::*;
-    use crate::config::{PLAY_BEGIN, PLAY_END};
-    use crate::testing::{item, mkfifo};
+    use crate::metadata::{Artwork, TrackInfo};
 
     /// Where a fake player keeps the source it was handed.
     type Slot = Arc<Mutex<Option<Box<dyn TimedSource>>>>;
@@ -637,7 +634,6 @@ mod tests {
     /// A running receiver for "kitchen", a "den" player beside it, and
     /// the router, handed the run as the supervisor hands it.
     struct Rig {
-        _dir: tempfile::TempDir,
         info: ReceiverInfo,
         registry: Arc<PlayerRegistry>,
         handlers: Vec<Arc<dyn ReceiverHandler>>,
@@ -650,9 +646,7 @@ mod tests {
     impl Rig {
         /// `run`: whether the router follows the events from the start.
         fn new(run: bool) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let info = ReceiverInfo::new(dir.path(), "kitchen", "Kitchen".into(), 7000, None);
-            mkfifo(&info.files().audio_pipe);
+            let info = ReceiverInfo::new("kitchen", "Kitchen".into(), 7000);
             let registry = Arc::new(PlayerRegistry::default());
             let log = Arc::default();
             let mut sources = HashMap::new();
@@ -684,7 +678,6 @@ mod tests {
                 vec![audio, metadata.clone(), router.clone()];
             handlers.started(&info);
             Self {
-                _dir: dir,
                 info,
                 registry,
                 handlers,
@@ -695,29 +688,21 @@ mod tests {
             }
         }
 
-        /// What shairport and its hooks write to the metadata fifo.
-        fn say(&self, bytes: &[u8]) {
-            self.handlers.metadata(&self.info, bytes);
-        }
-
-        fn marker(&self, marker: &str) {
-            self.say(format!("{marker}\n").as_bytes());
+        /// What the receiver's sender says.
+        fn say(&self, event: MetadataEvent) {
+            self.handlers.event(&self.info, &event);
         }
 
         fn pvol(&self, db: f64) {
-            self.say(&item(
-                "ssnc",
-                "pvol",
-                format!("{db:.2},0.00,0.00,0.00").as_bytes(),
-            ));
+            self.say(MetadataEvent::Volume(SenderVolume::from_db(db)));
         }
 
         fn track(&self, title: &str) {
-            let mut bytes = item("ssnc", "mdst", b"");
-            bytes.extend(item("core", "minm", title.as_bytes()));
-            bytes.extend(item("core", "asar", b"Massive Attack"));
-            bytes.extend(item("ssnc", "mden", b""));
-            self.say(&bytes);
+            self.say(MetadataEvent::Track(TrackInfo {
+                title: Some(title.into()),
+                artist: Some("Massive Attack".into()),
+                ..Default::default()
+            }));
         }
 
         /// The calls so far, and forgets them.
@@ -756,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn an_ending_session_leaves_its_player_to_a_group_playing_another() {
         let rig = Rig::new(true);
-        rig.marker(PLAY_BEGIN);
+        rig.say(MetadataEvent::PlayBegin);
         rig.wait(1).await;
         let mut home = PlayerState::new("home", "fake", "Home".to_owned());
         home.group_members = vec!["kitchen".into(), "den".into()];
@@ -776,7 +761,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        rig.marker(PLAY_END);
+        rig.say(MetadataEvent::PlayEnd);
         // Long enough for a stop, which takes the fake 30 ms.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let calls = rig.calls();
@@ -794,7 +779,7 @@ mod tests {
         assert!(listed[0].passive && !listed[0].can_play_pause && !listed[0].can_seek);
         assert!(rig.get("den").source_list.is_empty());
 
-        rig.marker(PLAY_BEGIN);
+        rig.say(MetadataEvent::PlayBegin);
         assert_eq!(
             rig.wait(2).await,
             ["kitchen play_source", "kitchen metadata -"]
@@ -811,18 +796,13 @@ mod tests {
         // The receiver's audio is what the player was handed, in the
         // session format.
         let mut source = rig.source("kitchen").unwrap();
-        let mut fifo = pipe::OpenOptions::new()
-            .open_sender(&rig.info.files().audio_pipe)
-            .unwrap();
-        fifo.write_all(&[0x00, 0x40, 0x00, 0x40].repeat(1408))
-            .await
-            .unwrap();
+        let chunk = tas_audio::PcmChunk::new(crate::audio::AIRPLAY_FORMAT, vec![0.5; 2816]);
+        rig.handlers.audio(&rig.info, &chunk, None);
         let next = tokio::time::timeout(Duration::from_secs(5), source.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        // shairport's audio carries no play time.
         let Item::Chunk { pcm, play_at_us } = next else {
             panic!("expected audio, got {next:?}");
         };
@@ -833,7 +813,7 @@ mod tests {
         rig.pvol(-24.0);
         rig.track("Teardrop");
         let art = [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 0xFF, 0xD9];
-        rig.say(&item("ssnc", "PICT", &art));
+        rig.say(MetadataEvent::Artwork(Artwork::new(art.to_vec())));
         assert_eq!(
             rig.wait(2).await,
             ["kitchen metadata Teardrop", "kitchen artwork 9"]
@@ -842,7 +822,7 @@ mod tests {
         let media = rig.get("kitchen").current_media.unwrap();
         assert_eq!(media.title.as_deref(), Some("Teardrop"));
         assert_eq!(media.artist.as_deref(), Some("Massive Attack"));
-        let hash = crate::metadata::Artwork::new(art.to_vec()).hash;
+        let hash = Artwork::new(art.to_vec()).hash;
         assert_eq!(
             media.image_url,
             Some(format!("{BASE_URL}/imageproxy/{hash}?size=0&fmt=jpg"))
@@ -864,7 +844,7 @@ mod tests {
             ]
         );
 
-        rig.marker(PLAY_END);
+        rig.say(MetadataEvent::PlayEnd);
         assert_eq!(
             rig.wait(3).await,
             [
@@ -892,10 +872,11 @@ mod tests {
     #[tokio::test]
     async fn a_new_session_waits_for_the_last_to_stop() {
         let rig = Rig::new(true);
-        rig.marker(PLAY_BEGIN);
+        rig.say(MetadataEvent::PlayBegin);
         rig.wait(2).await;
-        // The end and the next begin in one read; the stop is slow.
-        rig.say(format!("{PLAY_END}\n{PLAY_BEGIN}\n").as_bytes());
+        // The end and the next begin at once; the stop is slow.
+        rig.say(MetadataEvent::PlayEnd);
+        rig.say(MetadataEvent::PlayBegin);
         assert_eq!(
             rig.wait(5).await,
             [
@@ -909,7 +890,7 @@ mod tests {
         // A second begin while it plays changes nothing, but its first
         // volume is skipped again.
         let claim = rig.router.claim("kitchen").await;
-        rig.marker(PLAY_BEGIN);
+        rig.say(MetadataEvent::PlayBegin);
         rig.pvol(-15.0);
         assert!(rig.wait(1).await.is_empty());
         assert_eq!(rig.router.claim("kitchen").await, claim);
@@ -922,7 +903,7 @@ mod tests {
             rig.router.select("kitchen", "den").await.is_err(),
             "no sender yet"
         );
-        rig.marker(PLAY_BEGIN);
+        rig.say(MetadataEvent::PlayBegin);
         rig.wait(2).await;
         let first = rig.router.claim("kitchen").await.unwrap().session;
 
@@ -973,7 +954,7 @@ mod tests {
         assert!(router.owns(KITCHEN));
         assert!(!router.owns("airplay_receiver://audio_source/"));
         assert!(!router.owns("spotify://kitchen"));
-        rig.marker(PLAY_BEGIN);
+        rig.say(MetadataEvent::PlayBegin);
         rig.wait(2).await;
 
         router.select(KITCHEN, "den").await.unwrap();
@@ -993,7 +974,7 @@ mod tests {
         rig.registry
             .update("kitchen", |p| p.available = false)
             .unwrap();
-        rig.marker(PLAY_BEGIN);
+        rig.say(MetadataEvent::PlayBegin);
         // Nothing reaches a player that isn't there.
         assert!(rig.wait(1).await.is_empty());
         assert_eq!(rig.router.claim("kitchen").await, None);
@@ -1003,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn a_receiver_stopping_mid_session_ends_it() {
         let rig = Rig::new(true);
-        rig.marker(PLAY_BEGIN);
+        rig.say(MetadataEvent::PlayBegin);
         rig.wait(2).await;
         rig.handlers.stopped(&rig.info);
         assert_eq!(
@@ -1021,7 +1002,7 @@ mod tests {
     #[tokio::test]
     async fn a_resync_starts_a_missed_session_without_skipping_its_volume() {
         let rig = Rig::new(false);
-        rig.marker(PLAY_BEGIN);
+        rig.say(MetadataEvent::PlayBegin);
         rig.track("Teardrop");
         assert!(rig.metadata.now_playing("kitchen").unwrap().playing);
         rig.router.resync().await;
@@ -1035,7 +1016,7 @@ mod tests {
         assert_eq!(rig.calls(), ["kitchen volume 50"]);
 
         // Its end missed too.
-        rig.marker(PLAY_END);
+        rig.say(MetadataEvent::PlayEnd);
         rig.router.resync().await;
         assert_eq!(
             rig.calls(),

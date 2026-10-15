@@ -1,13 +1,12 @@
-//! What a sender's `SET_PARAMETER`s say, as the [`MetadataEvent`]s
-//! shairport-sync's metadata would have said it:
+//! What a sender's `SET_PARAMETER`s say, as [`MetadataEvent`]s:
 //!
 //! - `text/parameters`: `volume: <dB>` and `progress: start/current/end`
-//!   lines, as shairport's `pvol` and `prgr`.
+//!   lines.
 //! - `application/x-dmap-tagged`: a DMAP listing item (`mlit`) with the
 //!   track's `minm` (title), `asar` (artist), `asal` (album) and `astm`
-//!   (length, ms), as shairport's `mdst` … `mden` batch.
-//! - `image/*`: the cover art, as `PICT`. An empty body, or `image/none`,
-//!   is no art and says nothing.
+//!   (length, ms).
+//! - `image/*`: the cover art. An empty body, or `image/none`, is no art
+//!   and says nothing.
 
 use std::time::Duration;
 

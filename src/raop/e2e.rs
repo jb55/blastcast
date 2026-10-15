@@ -124,7 +124,7 @@ impl Rig {
             config.receivers.clone(),
             config.sessions.clone(),
         );
-        let info = ReceiverInfo::native(device, name.into(), addr.port(), None);
+        let info = ReceiverInfo::new(device, name.into(), addr.port());
         let (stop, mut stopped) = watch::channel(false);
         let mut all: Vec<Arc<dyn ReceiverHandler>> = vec![recorder.clone()];
         all.extend(handlers);
@@ -287,7 +287,7 @@ async fn chunks_carry_the_senders_play_time() {
 async fn a_senders_timeline_and_flush_reach_a_sendspin_player() {
     let audio = AirplayAudio::new();
     let rig = Rig::start_with(vec![audio.clone()]).await;
-    audio.started(&ReceiverInfo::native(DEVICE, "Kitchen".into(), 7000, None));
+    audio.started(&ReceiverInfo::new(DEVICE, "Kitchen".into(), 7000));
     let source = audio.source(DEVICE).unwrap().unwrap();
     let stream = tas_sendspin::AudioStream::start(rig.clock, source).unwrap();
     let mut speaker = FakeSpeaker::new(rig.clock, "kitchen");
@@ -1430,7 +1430,7 @@ async fn an_airplay_2_timeline_pause_and_flush_reach_a_sendspin_player() {
     let audio = AirplayAudio::new();
     let ap2 = Ap2::start(vec![audio.clone()]).await;
     let rig = &ap2.rig;
-    audio.started(&ReceiverInfo::native(DEVICE, "Kitchen".into(), 7000, None));
+    audio.started(&ReceiverInfo::new(DEVICE, "Kitchen".into(), 7000));
     let source = audio.source(DEVICE).unwrap().unwrap();
     let stream = tas_sendspin::AudioStream::start(rig.clock, source).unwrap();
     let mut speaker = FakeSpeaker::new(rig.clock, "kitchen");
@@ -1735,12 +1735,7 @@ async fn a_multi_selected_phone_plays_each_target_as_its_own_session() {
     let mut streams = Vec::new();
     let mut phones = Vec::new();
     for (rig, name) in rigs.iter().zip(["Kitchen", "Den"]) {
-        audio.started(&ReceiverInfo::native(
-            rig.device,
-            name.into(),
-            rig.addr.port(),
-            None,
-        ));
+        audio.started(&ReceiverInfo::new(rig.device, name.into(), rig.addr.port()));
         let source = audio.source(rig.device).unwrap().unwrap();
         let stream = tas_sendspin::AudioStream::start(clock, source).unwrap();
         let speaker = FakeSpeaker::new(clock, rig.device);
