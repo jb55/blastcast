@@ -114,6 +114,14 @@ pub struct NativeConfig {
     pub receivers: Roster<tas_proto::Receiver>,
     /// Every sender's stream on one.
     pub sessions: Roster<tas_proto::Session>,
+    /// What each target's AirPlay 2 key and `pi` come from: the one in
+    /// the state file ([`crate::ap2::Identity::load`]), so a phone keeps
+    /// recognising it. A new one each run by default, as in tests.
+    pub identity: crate::ap2::Identity,
+    /// Whether each target also advertises `_airplay._tcp`. Off until
+    /// AirPlay 2 can pair and play: a phone that sees it uses it rather
+    /// than AirPlay 1. `GET /info` is answered either way.
+    pub airplay2: bool,
 }
 
 /// The UDP ports streams use by default: three a stream, so ten at once.
@@ -136,6 +144,8 @@ impl NativeConfig {
             telemetry: Telemetry::default(),
             receivers: Roster::default(),
             sessions: Roster::default(),
+            identity: crate::ap2::Identity::generate(),
+            airplay2: false,
         }
     }
 }
@@ -148,6 +158,7 @@ impl std::fmt::Debug for NativeConfig {
             .field("latency", &self.latency)
             .field("end_after", &self.end_after)
             .field("udp_ports", &self.udp_ports)
+            .field("airplay2", &self.airplay2)
             .finish()
     }
 }
@@ -168,15 +179,7 @@ pub fn device_id(server_id: &str, target_id: &str) -> [u8; 6] {
 /// `md=0,1,2`: text, art and progress metadata.
 pub fn service(device_id: [u8; 6], name: &str, port: u16) -> Service {
     let hex: String = device_id.iter().map(|b| format!("{b:02X}")).collect();
-    // A DNS label is at most 63 bytes.
-    let mut name = name;
-    while hex.len() + 1 + name.len() > 63 {
-        let mut end = name.len() - 1;
-        while !name.is_char_boundary(end) {
-            end -= 1;
-        }
-        name = &name[..end];
-    }
+    let name = fit_label(name, hex.len() + 1);
     let txt = [
         ("txtvers", "1"),
         ("ch", "2"),
@@ -204,6 +207,20 @@ pub fn service(device_id: [u8; 6], name: &str, port: u16) -> Service {
     }
 }
 
+/// As much of `name` as fits a DNS label, at most 63 bytes, after
+/// `taken` bytes of it are used.
+pub(crate) fn fit_label(name: &str, taken: usize) -> &str {
+    let mut name = name;
+    while !name.is_empty() && taken + name.len() > 63 {
+        let mut end = name.len() - 1;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name = &name[..end];
+    }
+    name
+}
+
 /// Listens on `port` on every address, v6 and v4 if the host has both.
 pub async fn bind(port: u16) -> io::Result<TcpListener> {
     // Dual-stack on Linux unless net.ipv6.bindv6only is set.
@@ -225,12 +242,22 @@ pub async fn serve(
 ) -> io::Result<()> {
     let port = listener.local_addr()?.port();
     let device_id = device_id(&config.server_id, &info.target_id);
+    let ap2 = config
+        .identity
+        .device(device_id, &info.target_id, &info.airplay_name);
     let _advert = match &config.mdns {
         Some(mdns) => Some(
             mdns.advertise(service(device_id, &info.airplay_name, port))
                 .map_err(|e| io::Error::other(format!("advertising _raop._tcp: {e}")))?,
         ),
         None => None,
+    };
+    let _ap2_advert = match &config.mdns {
+        Some(mdns) if config.airplay2 => Some(
+            mdns.advertise(crate::ap2::info::service(&ap2, port))
+                .map_err(|e| io::Error::other(format!("advertising _airplay._tcp: {e}")))?,
+        ),
+        _ => None,
     };
     let id = crate::route::source_id(&info.target_id);
     config.receivers.set(tas_proto::Receiver {
@@ -253,6 +280,7 @@ pub async fn serve(
         info,
         handler,
         device_id,
+        ap2,
         volume,
         state: Mutex::default(),
     });
@@ -316,6 +344,8 @@ pub(crate) struct Receiver {
     info: ReceiverInfo,
     handler: Arc<dyn ReceiverHandler>,
     device_id: [u8; 6],
+    /// The target as an AirPlay 2 device.
+    ap2: crate::ap2::Device,
     /// The volume to report before a sender has set one, 0-100.
     volume: Option<u8>,
     state: Mutex<State>,

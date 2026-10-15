@@ -802,3 +802,39 @@ async fn requests_out_of_order_and_unknown_ones_are_refused() {
     assert!(rig.recorder.events().is_empty());
     rig.shutdown().await;
 }
+
+/// An AirPlay 2 sender's first request, `GET /info`, is answered on the
+/// AirPlay 1 receiver's connection, and AirPlay 1 goes on after it.
+#[tokio::test]
+async fn info_is_answered_beside_airplay_1() {
+    let rig = Rig::start().await;
+    let mut phone = Phone::connect(rig.addr).await;
+    phone
+        .rtsp
+        .get_mut()
+        .write_all(b"GET /info RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: AirPlay/770.8.1\r\n\r\n")
+        .await
+        .unwrap();
+    let info = read_response(&mut phone.rtsp).await;
+    assert_eq!(info.status, 200);
+    assert_eq!(info.get("CSeq"), Some("1"));
+    assert_eq!(info.get("Content-Type"), Some(crate::ap2::BPLIST));
+    let plist = plist::Value::from_reader(std::io::Cursor::new(info.body)).unwrap();
+    let dict = plist.as_dictionary().unwrap();
+    let hex: Vec<String> = device_id("server", DEVICE)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    let s = |k: &str| dict.get(k).and_then(plist::Value::as_string);
+    assert_eq!(s("deviceID"), Some(hex.join(":").as_str()));
+    assert_eq!(s("name"), Some("Kitchen"));
+    assert_eq!(
+        dict.get("features").unwrap().as_unsigned_integer(),
+        Some(crate::ap2::FEATURES)
+    );
+
+    phone.cseq = 1;
+    let options = phone.request("OPTIONS", &[], None).await;
+    assert_eq!((options.status, options.get("CSeq")), (200, Some("2")));
+    rig.shutdown().await;
+}

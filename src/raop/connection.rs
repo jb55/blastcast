@@ -44,6 +44,7 @@ use super::crypto::{self, AudioCipher};
 use super::playout::{Inserted, Note, Played, Playout};
 use super::rtsp::{self, Request, Response};
 use super::{AIRTUNES_VERSION, Receiver, bind_udp, params, rtp};
+use crate::ap2;
 use crate::audio::AIRPLAY_FORMAT;
 use crate::metadata::MetadataEvent;
 
@@ -137,6 +138,7 @@ struct Connection {
 impl Connection {
     async fn answer(&mut self, req: &Request) -> Response {
         let response = match req.method.as_str() {
+            _ if ap2::handles(req) => ap2::answer(&self.receiver.ap2, req),
             "OPTIONS" => Response::ok().header("Public", PUBLIC),
             "ANNOUNCE" => self.announce(req),
             "SETUP" => self.setup(req).await,
