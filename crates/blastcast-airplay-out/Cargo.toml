@@ -1,0 +1,33 @@
+[package]
+name = "tas-airplay-out"
+description = "AirPlay 1 (RAOP) output: a native sender, bridged into Sendspin groups"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+blastcast-mdns.workspace = true
+blastcast-telemetry = { workspace = true, features = ["hub"] }
+blastcast-sendspin.workspace = true
+
+blastcast.workspace = true
+bytes.workspace = true
+futures-channel.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+if-addrs.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+blastcast-audio.workspace = true
+tas-core.workspace = true
+tas-sendspin.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
