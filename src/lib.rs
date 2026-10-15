@@ -8,9 +8,8 @@
 //! A [`RateMatch`] absorbs the drift between a sender's clock and ours, so
 //! its stamps and its frames stay together.
 //!
-//! It knows nothing of the server around it: it depends on no `tas-*`
-//! crate (`scripts/check.sh` enforces it), so protocol crates depend on
-//! it and never the reverse.
+//! It knows no protocol and nothing of the server around it, so protocol
+//! code depends on blastcast and never the reverse.
 
 pub mod clock;
 pub mod format;

@@ -1,21 +1,24 @@
 [package]
 name = "blastcast"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-publish.workspace = true
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "One timeline across every audio protocol: clock maps, anchors, timed sources and a rate match"
+repository = "https://github.com/jb55/blastcast"
+publish = false
 
-# No tas-* dependency, ever: protocol crates depend on blastcast, never the
-# reverse, so it can move to its own repo as a directory copy.
-# scripts/check.sh enforces it.
+# It knows no protocol and no server: protocol code depends on blastcast,
+# never the reverse.
 [dependencies]
-async-trait.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"
