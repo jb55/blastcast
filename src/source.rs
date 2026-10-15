@@ -264,6 +264,10 @@ impl<S: TimedSource> TimedSource for TimedResampled<S> {
         self.inner.kind()
     }
 
+    fn trim_lead(&self) -> Option<i64> {
+        self.inner.trim_lead()
+    }
+
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
         if let Some(item) = self.after.take() {
             return Ok(Some(item));
