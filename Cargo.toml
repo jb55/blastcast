@@ -1,24 +1,23 @@
-[package]
-name = "blastcast"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "One timeline across every audio protocol: clock maps, anchors, timed sources and a rate match"
 repository = "https://github.com/jb55/blastcast"
 publish = false
 
-# It knows no protocol and no server: protocol code depends on blastcast,
-# never the reverse.
-[dependencies]
+[workspace.dependencies]
+blastcast = { path = "crates/blastcast" }
+
 async-trait = "0.1"
 thiserror = "2"
-tokio = { version = "1", features = ["time"] }
+tokio = "1"
 
-[dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "test-util"] }
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 dbg_macro = "warn"

@@ -1,0 +1,21 @@
+[package]
+name = "blastcast"
+description = "One timeline across every audio protocol: clock maps, anchors, timed sources and a rate match"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The timing core: no protocol and no server. The protocol crates beside it
+# depend on blastcast, never the reverse.
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+
+[lints]
+workspace = true
