@@ -1086,3 +1086,55 @@ async fn a_trimmable_source_starts_its_keep_past_the_floor() {
     assert!(track(&hub, now, Series::TimelineRebase, "s").is_empty());
     drop(stream);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_jump_in_a_trimmable_sources_stamps_trims_again() {
+    let clock = ServerClock::new();
+    let hub = tas_telemetry::Telemetry::new();
+    let (conn, mut q) = traced_player(clock, &hub, "kitchen");
+    // A second of lead, keeping 50 ms past the 250 ms send-ahead, as in
+    // a_trimmable_source_starts_its_keep_past_the_floor. Then the stamps
+    // jump 360 ms forward (a clock map settling) while the chunks keep
+    // coming as they did; then 1.2 s back, past all that is trimmed.
+    let source = Scripted::new(clock, SESSION_FORMAT)
+        .trimmed(50_000)
+        .chunks(2_000_000, 5, 960, 1_000_000)
+        .chunks(2_460_000, 5, 960, 1_360_000)
+        .chunks(1_360_000, 5, 960, 160_000);
+    let stream = AudioStream::start_with(clock, source.boxed(), hub.probe("s")).unwrap();
+    stream.add_player(conn.clone());
+    sleep_ms(1150).await;
+    assert_eq!(trimmed_lead_ms(&conn, clock.now_us()), 1060.0);
+    sleep_ms(500).await;
+    let now = clock.now_us();
+
+    let ts: Vec<i64> = audio(&mut q).iter().map(|c| c.0).collect();
+    let contiguous: Vec<i64> = (0..15).map(|k| 1_300_000 + k * 20_000).collect();
+    assert_eq!(ts, contiguous, "the audio carries on through both jumps");
+    // Each chunk arrives 20 ms after the last, so each keeps the lead the
+    // first was given: the floor and the keep, not 360 ms more.
+    let leads: Vec<f64> = track(&hub, now, Series::Lead, "kitchen")
+        .iter()
+        .map(|p| p.value)
+        .collect();
+    assert_eq!(leads, [300_000.0; 15]);
+    assert_eq!(trimmed_lead_ms(&conn, now), 0.0);
+    assert_eq!(added_latency_ms(&conn, now), 140.0, "the 1.2 s back");
+
+    let marks = |series| -> Vec<(i64, f64)> {
+        let points = track(&hub, now, series, "s");
+        points.iter().map(|p| (p.t_us, p.value)).collect()
+    };
+    assert_eq!(
+        marks(Series::LeadTrimmed),
+        [
+            (1_000_000, 700_000.0),
+            (1_100_000, 1_060_000.0),
+            (1_200_000, 0.0)
+        ]
+    );
+    assert_eq!(marks(Series::LatencyAdded), [(1_200_000, 140_000.0)]);
+    assert!(marks(Series::TimelineRebase).is_empty());
+    assert_eq!(control(&mut q), ["start", "end"], "no stream/clear");
+    drop(stream);
+}

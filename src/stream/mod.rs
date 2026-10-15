@@ -59,7 +59,7 @@
 //! contiguous timeline still wins within [`SHIFT_TOLERANCE_US`]: a chunk
 //! further than that from the cursor is a discontinuity (the sender
 //! skipped, or resumed after a gap without a flush), and the timeline moves
-//! to it. A chunk that would land more than the tolerance short of the
+//! to it, unless the source's lead may be trimmed (below). A chunk that would land more than the tolerance short of the
 //! send-ahead floor grows the offset by the shortfall instead of being
 //! dropped, and says so in the log and in `/debug` (`added_latency_ms`):
 //! a phone with less lead than the players need plays a little late
@@ -78,17 +78,21 @@
 //! what the source asks to keep for its own lateness (a resend), after it
 //! arrives, and the rest keep the stamps' spacing and rate. `/debug` shows
 //! it as `trimmed_lead_ms`, apart from `added_latency_ms`, which still
-//! grows on top. A source that doesn't say so plays at its stamps.
+//! grows on top. Such a source's stamps are only spacing, so a jump in
+//! them past [`SHIFT_TOLERANCE_US`] (a sender's clock map settling) sets
+//! the trim again instead of moving the timeline: the audio carries on
+//! from the cursor, and a jump forward doesn't become lead the players
+//! hold. A source that doesn't say so plays at its stamps.
 //!
 //! **Telemetry.** A stream started with a [`Probe`] emits, as its own
 //! entity, the timeline cursor and the send-ahead floor per chunk, and
 //! marks for its start, each `stream/clear`, each shift (by how much) and
 //! its end. A timed source's chunks add their lead as stamped against
 //! their arrival and the latency added, with marks for each time that
-//! grows, the lead trimmed as each timeline starts, and each discontinuity
-//! the timeline moves for (by how much). Each player emits its own per chunk (see
-//! [`LinkStats`](crate::stats::LinkStats)), and marks its `stream/start`
-//! and `stream/end`.
+//! grows, the lead trimmed as each timeline starts or its stamps jump, and
+//! each discontinuity the timeline moves for (by how much). Each player
+//! emits its own per chunk (see [`LinkStats`](crate::stats::LinkStats)),
+//! and marks its `stream/start` and `stream/end`.
 
 mod buffer;
 mod encode;
@@ -500,8 +504,8 @@ struct Streamer {
     added_us: i64,
     /// Taken off a timed source's play times: the surplus lead a source
     /// that allows it ([`TimedSource::trim_lead`]) came with as its
-    /// timeline started. `None` until the first stamped chunk since the
-    /// start or the last flush sets it.
+    /// timeline started, or as its stamps last jumped. `None` until the
+    /// first stamped chunk since the start or the last flush sets it.
     trimmed_us: Option<i64>,
     /// The latest chunk's source's [`TimedSource::trim_lead`].
     trim_lead: Option<i64>,
@@ -834,7 +838,9 @@ impl Streamer {
     /// the offset growing by whatever that takes. The floor leaves out the
     /// required lead, which is honoured only once the chunk's lead covers
     /// it. The first stamped chunk since the start or a flush sets what is
-    /// trimmed (see [`Self::trim`]).
+    /// trimmed (see [`Self::trim`]), and a jump in a trimmable source's
+    /// stamps sets it again rather than moving the timeline (see
+    /// [`Self::retrim`]).
     fn place_timed(&mut self, at: i64, now: i64) {
         let send_ahead = self.send_ahead_with(true);
         let floor = now + send_ahead;
@@ -842,16 +848,19 @@ impl Streamer {
             self.trim(at, floor, now);
         }
         let target = at + self.offset_us();
-        let mut start = match &self.timeline {
+        let cursor = self.timeline.as_ref().map(Timeline::cursor_us);
+        let mut start = match cursor {
             None => {
                 self.probe
                     .mark(Series::StreamStart, now, (target.max(floor) - now) as f64);
                 target
             }
-            Some(timeline) => {
-                let jump = target - timeline.cursor_us();
+            Some(cursor) => {
+                let jump = target - cursor;
                 if jump.abs() <= SHIFT_TOLERANCE_US {
-                    timeline.cursor_us()
+                    cursor
+                } else if let Some(keep) = self.trim_lead {
+                    self.retrim(at, jump, cursor, floor + keep, now)
                 } else {
                     tracing::debug!(
                         jump_us = jump,
@@ -905,6 +914,39 @@ impl Streamer {
             self.probe.mark(Series::LeadTrimmed, now, trimmed as f64);
         }
         self.set_trimmed(Some(trimmed));
+    }
+
+    /// Sets again what is taken off the play times of a source whose lead
+    /// may be trimmed, when its stamps jump by `jump` from the `cursor`
+    /// (its clock map corrected, say): the chunk stamped `at` goes on from
+    /// the cursor, or `kept` (the floor plus the source's keep) plus what
+    /// was added, if the cursor fell behind that. Returns where it goes.
+    /// The audio stays contiguous, and a jump forward doesn't add to the
+    /// lead the players hold. What was added stays, since it is margin for
+    /// the source's lateness; stamps that jumped back past what was
+    /// trimmed grow it, as too little lead does.
+    fn retrim(&mut self, at: i64, jump: i64, cursor: i64, kept: i64, now: i64) -> i64 {
+        let start = cursor.max(kept + self.added_us);
+        let trimmed = (at + self.added_us - start).max(0);
+        let added = start - at + trimmed;
+        tracing::info!(
+            "the sender's play times jumped {} ms, carrying on from its audio: {} ms of its lead trimmed, {} ms added",
+            jump / 1000,
+            trimmed / 1000,
+            added / 1000,
+        );
+        self.probe.mark(Series::LeadTrimmed, now, trimmed as f64);
+        if added > self.added_us {
+            self.probe
+                .mark(Series::LatencyAdded, now, (added - self.added_us) as f64);
+        }
+        if start != cursor {
+            self.probe
+                .mark(Series::TimelineRebase, now, (start - cursor) as f64);
+        }
+        self.set_added(added);
+        self.set_trimmed(Some(trimmed));
+        start
     }
 
     /// Puts the shared timeline's cursor at `at`, and every running
