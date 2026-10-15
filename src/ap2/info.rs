@@ -2,8 +2,8 @@
 //! twice, once for a sender browsing and once for one that connected. The
 //! plist also carries the TXT record itself, packed, as `txtAirPlay`.
 
+use blastcast_mdns::service::{Service, TxtEntry};
 use plist::{Dictionary, Value};
-use tas_mdns::service::{Service, TxtEntry};
 
 use super::{AIRPLAY_SERVICE_TYPE, Device, FEATURES, MODEL, SOURCE_VERSION, STATUS_FLAGS};
 use crate::raop::fit_label;

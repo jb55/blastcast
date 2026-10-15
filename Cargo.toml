@@ -21,7 +21,7 @@ hmac.workspace = true
 plist.workspace = true
 tas-core.workspace = true
 tas-audio.workspace = true
-tas-mdns.workspace = true
+blastcast-mdns.workspace = true
 tas-proto.workspace = true
 tas-telemetry.workspace = true
 

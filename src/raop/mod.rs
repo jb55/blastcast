@@ -75,9 +75,9 @@ use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use blastcast_mdns::service::{Service, TxtEntry};
 use sha2::{Digest, Sha256};
 use tas_audio::{PcmChunk, ServerClock};
-use tas_mdns::service::{Service, TxtEntry};
 use tas_proto::Series;
 use tas_telemetry::{Probe, Roster, Telemetry};
 use tokio::net::TcpListener;
@@ -103,7 +103,7 @@ pub struct NativeConfig {
     /// Sendspin server stamps chunks with.
     pub clock: ServerClock,
     /// Where `_raop._tcp` is advertised; nowhere when `None`, as in tests.
-    pub mdns: Option<tas_mdns::Mdns>,
+    pub mdns: Option<blastcast_mdns::Mdns>,
     /// The least lead a chunk is handed over with: a lost packet is waited
     /// for [`playout::RESEND_WINDOW`] after it was missed, but no later
     /// than this long before it plays. It is also the `Audio-Latency`
@@ -152,7 +152,7 @@ impl NativeConfig {
     pub fn new(
         server_id: impl Into<String>,
         clock: ServerClock,
-        mdns: Option<tas_mdns::Mdns>,
+        mdns: Option<blastcast_mdns::Mdns>,
     ) -> Self {
         Self {
             server_id: server_id.into(),
@@ -176,7 +176,10 @@ impl std::fmt::Debug for NativeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeConfig")
             .field("server_id", &self.server_id)
-            .field("mdns", &self.mdns.as_ref().map(tas_mdns::Mdns::host_name))
+            .field(
+                "mdns",
+                &self.mdns.as_ref().map(blastcast_mdns::Mdns::host_name),
+            )
             .field("latency", &self.latency)
             .field("end_after", &self.end_after)
             .field("udp_ports", &self.udp_ports)
