@@ -13,17 +13,36 @@ publish = false
 blastcast = { path = "crates/blastcast" }
 blastcast-audio = { path = "crates/blastcast-audio" }
 blastcast-mdns = { path = "crates/blastcast-mdns" }
+blastcast-sendspin = { path = "crates/blastcast-sendspin" }
 blastcast-telemetry = { path = "crates/blastcast-telemetry", default-features = false }
 
+aes-gcm = "0.10"
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+bytes = "1"
+chacha20poly1305 = "0.10"
+claxon = "0.4"
+crypto-bigint = "0.5"
+flacenc = { version = "0.5", default-features = false }
+futures-channel = { version = "0.3", features = ["sink"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom = "0.3"
+hmac = "0.12"
 if-addrs = "0.15"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 mdns-sd = "0.21"
+opus = "0.4"
+opus-pure = "0.2"
 rubato = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = "1"
+tokio-tungstenite = "0.29"
 tracing = "0.1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

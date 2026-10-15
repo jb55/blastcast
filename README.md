@@ -16,13 +16,16 @@ It is a cargo workspace, one crate per directory under `crates/`:
 | `blastcast-audio` | audio plumbing between protocols: PCM sample conversion (`pcm`), a streaming resampler over rubato (`StreamResampler`, `Resampled`, `TimedResampled`, `to_session_format`) and a test tone (`SineSource`) |
 | `blastcast-mdns` | one mDNS responder shared by every protocol: our adverts (any `Service`, with `_sendspin-server._tcp` and `_mass._tcp` built in) and browsing for players |
 | `blastcast-telemetry` | every timing a protocol measures: the `Series` (with its `Kind` and `Unit`), `Point` and the status types (`Stream`, `Receiver`, `Session`, `Speaker`), serde only; and behind the default `hub` feature, on tokio, the hub (`Telemetry`, `Probe`), a minute of history per series streamed live, and `Roster`, a watch of a protocol's entities |
+| `blastcast-sendspin` | the Sendspin server: handshakes, clock sync, groups, streams (Opus, FLAC, PCM) and pairing. An app hears about its players through the `Host` trait and keeps pairings with `Trust`; behind the `testing` feature, an in-memory speaker for other crates' tests |
 
-The other protocol crates (`blastcast-sendspin`, `blastcast-airplay`,
-...) are moving in beside them from tune-assistant-server.
+The other protocol crates (`blastcast-airplay`, `blastcast-airplay-out`)
+are moving in beside them from tune-assistant-server.
 
 `blastcast-mdns`'s `advertise_browse` test advertises and browses over the
 host's real interfaces, so `./scripts/check.sh` needs multicast on the
 machine running it.
+`blastcast-sendspin`'s tests decode its Opus with libopus, which the `opus`
+crate builds from source, so they need cmake.
 
 The `blastcast` crate's modules:
 
@@ -53,5 +56,5 @@ stream is the sink. It depends on these crates by path, as a sibling checkout
 
 The history before this repo existed is that of each crate's directory in
 tune-assistant-server (`crates/blastcast`, `crates/tas-mdns`, `crates/tas-audio`,
-`crates/tas-telemetry`), carried over
-with `git subtree split`.
+`crates/tas-telemetry`, and `crates/tas-sendspin` until it became
+`crates/blastcast-sendspin`), carried over with `git subtree split`.
