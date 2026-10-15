@@ -53,10 +53,29 @@
 //! A `stream/request-format` moves the player to the format it asks for,
 //! answered with a fresh `stream/start`.
 //!
+//! **Timed sources.** A [`TimedSource`] may stamp its chunks with when they
+//! play (an AirPlay sender's times, on the server clock), and the stream
+//! places them there, plus an `offset_us` it adds to every stamp. The
+//! contiguous timeline still wins within [`SHIFT_TOLERANCE_US`]: a chunk
+//! further than that from the cursor is a discontinuity (the sender
+//! skipped, or resumed after a gap without a flush), and the timeline moves
+//! to it. A chunk that would land more than the tolerance short of the
+//! send-ahead floor grows the offset by the shortfall instead of being
+//! dropped, and says so in the log and in `/debug` (`added_latency_ms`):
+//! a phone with less lead than the players need plays a little late
+//! rather than not at all. The offset never shrinks while the stream runs;
+//! [`Item::Flush`] (`stream/clear`, as a seek) resets it, and the next
+//! chunk places the timeline afresh. A timed source whose lead already
+//! covers a player's `required_lead_time_ms` is sent with it, which the
+//! spec allows only when it adds no latency. An unstamped chunk, and every
+//! [`LiveSource`]'s, is placed as described above.
+//!
 //! **Telemetry.** A stream started with a [`Probe`] emits, as its own
 //! entity, the timeline cursor and the send-ahead floor per chunk, and
 //! marks for its start, each `stream/clear`, each shift (by how much) and
-//! its end. Each player emits its own per chunk (see
+//! its end. A timed source's chunks add their lead as stamped against
+//! their arrival and the offset, with marks for each time the offset grows
+//! and each discontinuity the timeline moves for (by how much). Each player emits its own per chunk (see
 //! [`LinkStats`](crate::stats::LinkStats)), and marks its `stream/start`
 //! and `stream/end`.
 
@@ -70,8 +89,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tas_audio::{
-    AudioError, LiveSource, SESSION_FORMAT, ServerClock, Span, Timeline, to_session_format,
+    AudioError, IntoTimed, SESSION_FORMAT, ServerClock, Span, TimedSource, Timeline,
+    timed_to_session_format,
 };
+#[cfg(doc)]
+use tas_audio::{Item, LiveSource};
 use tas_proto::Series;
 use tas_telemetry::Probe;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -136,15 +158,15 @@ pub struct AudioStream {
 enum Command {
     Add(Arc<Connection>),
     Remove(String, oneshot::Sender<()>),
-    Seek(Box<dyn LiveSource>),
-    Queue(Box<dyn LiveSource>),
+    Seek(Box<dyn TimedSource>),
+    Queue(Box<dyn TimedSource>),
     Stop,
 }
 
 impl AudioStream {
     /// Starts streaming `source`, timed on `clock`. The clock must be the
     /// one the players sync to, the server's `ServerConfig::clock`.
-    pub fn start(clock: ServerClock, source: Box<dyn LiveSource>) -> Result<Self, AudioError> {
+    pub fn start(clock: ServerClock, source: impl IntoTimed) -> Result<Self, AudioError> {
         Self::start_with(clock, source, Probe::default())
     }
 
@@ -152,10 +174,10 @@ impl AudioStream {
     /// `probe`.
     pub fn start_with(
         clock: ServerClock,
-        source: Box<dyn LiveSource>,
+        source: impl IntoTimed,
         probe: Probe,
     ) -> Result<Self, AudioError> {
-        let source = to_session_format(source)?;
+        let source = timed_to_session_format(source.into_timed())?;
         let (commands, rx) = mpsc::unbounded_channel();
         let (ended_tx, ended) = watch::channel(());
         let streamer = Streamer {
@@ -163,12 +185,15 @@ impl AudioStream {
             history: VecDeque::new(),
             clock,
             live: source.is_live(),
+            honour_lead: !source.is_live(),
+            offset_us: 0,
             feed: Some(Feed::spawn(source)),
             queued: VecDeque::new(),
             timeline: None,
             outputs: Vec::new(),
             encodings: Vec::new(),
             pending: None,
+            pending_at: None,
             wake_us: None,
             probe,
         };
@@ -199,16 +224,16 @@ impl AudioStream {
     /// Jumps to `source`: the players drop what they hold (`stream/clear`)
     /// and the timeline starts again a send-ahead from now. A seek and a
     /// track skip are both this.
-    pub fn seek(&self, source: Box<dyn LiveSource>) -> Result<(), AudioError> {
-        let source = to_session_format(source)?;
+    pub fn seek(&self, source: impl IntoTimed) -> Result<(), AudioError> {
+        let source = timed_to_session_format(source.into_timed())?;
         let _ = self.commands.send(Command::Seek(source));
         Ok(())
     }
 
     /// Plays `source` when the current one runs out, with no gap and
     /// nothing sent to the players.
-    pub fn queue_next(&self, source: Box<dyn LiveSource>) -> Result<(), AudioError> {
-        let source = to_session_format(source)?;
+    pub fn queue_next(&self, source: impl IntoTimed) -> Result<(), AudioError> {
+        let source = timed_to_session_format(source.into_timed())?;
         let _ = self.commands.send(Command::Queue(source));
         Ok(())
     }
@@ -274,9 +299,10 @@ impl Output {
         }
     }
 
-    /// `live` is whether the stream's source is, which the send-ahead
-    /// `/debug` shows for it depends on.
-    fn start(&mut self, encoding: &Encoding, live: bool) {
+    /// `without_lead` is whether the stream leaves out the players'
+    /// required lead, which the send-ahead `/debug` shows for it depends
+    /// on; `added_latency_us` is the stream's offset, shown beside it.
+    fn start(&mut self, encoding: &Encoding, without_lead: bool, added_latency_us: i64) {
         let encoder = &encoding.encoder;
         self.send_control(ServerMessage::StreamStart(StreamStart {
             server_transmitted: None,
@@ -290,9 +316,10 @@ impl Output {
         self.started = true;
         self.open = true;
         let timing = self.conn.player_status().timing;
-        let send_ahead = send_ahead_us(&timing, live);
+        let send_ahead = send_ahead_us(&timing, without_lead);
         let stats = self.conn.stats();
         stats.stream_started(encoder.format(), send_ahead);
+        stats.added_latency(added_latency_us);
         stats.probe().mark(
             Series::StreamStart,
             self.conn.clock().now_us(),
@@ -449,10 +476,17 @@ struct Streamer {
     clock: ServerClock,
     /// Whether the source being read is live, from its latest chunk.
     live: bool,
+    /// Whether send-ahead includes the players' required lead: for a
+    /// source that isn't live, and for a timed one whose latest chunk's
+    /// lead already covers it.
+    honour_lead: bool,
+    /// Added to a timed source's play times: what it took to send its
+    /// chunks a send-ahead before they play. Only grows until a flush.
+    offset_us: i64,
     /// `None` once every source has run out.
     feed: Option<Feed>,
     /// Sources queued too late for the feed, which had already finished.
-    queued: VecDeque<Box<dyn LiveSource>>,
+    queued: VecDeque<Box<dyn TimedSource>>,
     /// The shared timeline, at the session rate. `None` until the first
     /// chunk after a start or a seek, which places it.
     timeline: Option<Timeline>,
@@ -462,6 +496,8 @@ struct Streamer {
     /// A chunk read but not yet sent: a source that isn't live waits here
     /// until every player has room for it.
     pending: Option<Vec<f32>>,
+    /// When the pending chunk plays, if its source said.
+    pending_at: Option<i64>,
     /// When to look again at the pending chunk, or, with the feed ended,
     /// when the last chunk has played.
     wake_us: Option<i64>,
@@ -485,10 +521,24 @@ impl Streamer {
             match event {
                 Event::Command(None | Some(Command::Stop)) => break,
                 Event::Command(Some(cmd)) => self.handle(cmd),
-                Event::Feed(FeedItem::Chunk { samples, live }) => {
+                Event::Feed(FeedItem::Chunk {
+                    samples,
+                    live,
+                    play_at_us,
+                }) => {
                     self.live = live;
+                    if let Some(at) = play_at_us {
+                        let now = self.clock.now_us();
+                        self.probe
+                            .sample(Series::SourceLead, now, (at - now) as f64);
+                    }
                     self.pending = Some(samples);
+                    self.pending_at = play_at_us;
                     self.pump();
+                }
+                Event::Feed(FeedItem::Flush) => {
+                    tracing::debug!("source flushed");
+                    self.clear();
                 }
                 Event::Feed(FeedItem::End) => {
                     self.feed = None;
@@ -526,23 +576,7 @@ impl Streamer {
             Command::Seek(source) => {
                 self.queued.clear();
                 self.feed = Some(Feed::spawn(source));
-                self.pending = None;
-                self.wake_us = None;
-                self.timeline = None;
-                self.history.clear();
-                self.probe
-                    .mark(Series::StreamClear, self.clock.now_us(), 0.0);
-                for out in self.outputs.iter_mut().filter(|o| o.started) {
-                    out.send_control(ServerMessage::StreamClear(StreamClear {
-                        server_transmitted: None,
-                        roles: Some(vec![PLAYER_ROLE.into()]),
-                    }));
-                    out.tracker.clear();
-                }
-                for encoding in &mut self.encodings {
-                    encoding.encoder.reset();
-                    encoding.sent.clear();
-                }
+                self.clear();
             }
             Command::Queue(source) => {
                 let source = match &self.feed {
@@ -559,6 +593,41 @@ impl Streamer {
                 }
             }
             Command::Stop => unreachable!("handled by run"),
+        }
+    }
+
+    /// Drops everything sent that hasn't played: `stream/clear` to every
+    /// started player, and the timeline is placed afresh by the next chunk,
+    /// with nothing added to its play time.
+    fn clear(&mut self) {
+        self.pending = None;
+        self.pending_at = None;
+        self.wake_us = None;
+        self.timeline = None;
+        self.history.clear();
+        self.probe
+            .mark(Series::StreamClear, self.clock.now_us(), 0.0);
+        self.set_offset(0);
+        for out in self.outputs.iter_mut().filter(|o| o.started) {
+            out.send_control(ServerMessage::StreamClear(StreamClear {
+                server_transmitted: None,
+                roles: Some(vec![PLAYER_ROLE.into()]),
+            }));
+            out.tracker.clear();
+        }
+        for encoding in &mut self.encodings {
+            encoding.encoder.reset();
+            encoding.sent.clear();
+        }
+    }
+
+    fn set_offset(&mut self, offset_us: i64) {
+        if offset_us == self.offset_us {
+            return;
+        }
+        self.offset_us = offset_us;
+        for out in &self.outputs {
+            out.conn.stats().added_latency(offset_us);
         }
     }
 
@@ -629,10 +698,15 @@ impl Streamer {
 
     /// The largest send-ahead among players that can play now.
     fn send_ahead_us(&self) -> i64 {
+        self.send_ahead_with(!self.honour_lead)
+    }
+
+    /// As [`Self::send_ahead_us`], with or without the required lead.
+    fn send_ahead_with(&self, without_lead: bool) -> i64 {
         self.outputs
             .iter()
             .filter(|o| o.conn.is_available())
-            .map(|o| send_ahead_us(&o.conn.player_status().timing, self.live))
+            .map(|o| send_ahead_us(&o.conn.player_status().timing, without_lead))
             .max()
             .unwrap_or(DEFAULT_SEND_AHEAD_US)
     }
@@ -647,9 +721,15 @@ impl Streamer {
             return;
         };
         let now = self.clock.now_us();
+        match self.pending_at {
+            Some(at) => self.place_timed(at, now),
+            None => {
+                self.honour_lead = !self.live;
+                self.place_timeline(now + self.send_ahead_us(), now);
+            }
+        }
         let send_ahead = self.send_ahead_us();
         let floor = now + send_ahead;
-        self.place_timeline(floor, now);
         self.sync_outputs(now);
 
         if !self.live
@@ -660,6 +740,7 @@ impl Streamer {
         }
         self.wake_us = None;
         let samples = self.pending.take().expect("checked above");
+        self.pending_at = None;
         let session_span = self
             .timeline
             .as_mut()
@@ -689,15 +770,10 @@ impl Streamer {
     /// encoding's with it, forward to `floor` if the source fell more than
     /// [`SHIFT_TOLERANCE_US`] behind.
     fn place_timeline(&mut self, floor: i64, now: i64) {
-        let Some(timeline) = &mut self.timeline else {
+        let Some(timeline) = &self.timeline else {
             self.probe
                 .mark(Series::StreamStart, now, (floor - now) as f64);
-            self.timeline = Some(Timeline::new(floor, SESSION_FORMAT.sample_rate));
-            for encoding in self.encodings.iter_mut().filter(|e| e.running) {
-                encoding
-                    .timeline
-                    .rebase(floor - encoding.encoder.delay_us());
-            }
+            self.move_timeline(floor);
             return;
         };
         let shift = floor - timeline.cursor_us();
@@ -707,11 +783,76 @@ impl Streamer {
                 "source fell behind, shifting the timeline"
             );
             self.probe.mark(Series::TimelineShift, now, shift as f64);
-            timeline.rebase(floor);
-            for encoding in self.encodings.iter_mut().filter(|e| e.running) {
-                let cursor = encoding.timeline.cursor_us();
-                encoding.timeline.rebase(cursor + shift);
+            self.move_timeline(floor);
+        }
+    }
+
+    /// Places a timed chunk stamped to play at `at`: at `at` plus the
+    /// offset, unless the cursor is within [`SHIFT_TOLERANCE_US`] of that,
+    /// and no earlier than the tolerance short of the send-ahead floor,
+    /// the offset growing by whatever that takes. The floor leaves out the
+    /// required lead, which is honoured only once the chunk's lead covers
+    /// it.
+    fn place_timed(&mut self, at: i64, now: i64) {
+        let send_ahead = self.send_ahead_with(true);
+        let floor = now + send_ahead;
+        let target = at + self.offset_us;
+        let mut start = match &self.timeline {
+            None => {
+                self.probe
+                    .mark(Series::StreamStart, now, (target.max(floor) - now) as f64);
+                target
             }
+            Some(timeline) => {
+                let jump = target - timeline.cursor_us();
+                if jump.abs() <= SHIFT_TOLERANCE_US {
+                    timeline.cursor_us()
+                } else {
+                    tracing::debug!(
+                        jump_us = jump,
+                        "source's play times jumped, moving the timeline"
+                    );
+                    self.probe.mark(Series::TimelineRebase, now, jump as f64);
+                    target
+                }
+            }
+        };
+        if start < floor - SHIFT_TOLERANCE_US {
+            let shortfall = floor - start;
+            tracing::info!(
+                "added {} ms to the sender's latency: send-ahead {} ms, lead {} ms",
+                shortfall / 1000,
+                send_ahead / 1000,
+                (at - now) / 1000,
+            );
+            self.probe.mark(Series::LatencyAdded, now, shortfall as f64);
+            self.set_offset(self.offset_us + shortfall);
+            start = floor;
+        }
+        if self.timeline.as_ref().map(Timeline::cursor_us) != Some(start) {
+            self.move_timeline(start);
+        }
+        self.honour_lead = start - now >= self.send_ahead_with(false);
+        self.probe
+            .sample(Series::AddedLatency, now, self.offset_us as f64);
+    }
+
+    /// Puts the shared timeline's cursor at `at`, and every running
+    /// encoding's the same distance from where it was; a timeline not yet
+    /// placed starts there.
+    fn move_timeline(&mut self, at: i64) {
+        let Some(timeline) = &mut self.timeline else {
+            self.timeline = Some(Timeline::new(at, SESSION_FORMAT.sample_rate));
+            for encoding in self.encodings.iter_mut().filter(|e| e.running) {
+                encoding.timeline.rebase(at - encoding.encoder.delay_us());
+            }
+            return;
+        };
+        let shift = at - timeline.cursor_us();
+        timeline.rebase(at);
+        for encoding in self.encodings.iter_mut().filter(|e| e.running) {
+            let cursor = encoding.timeline.cursor_us();
+            encoding.timeline.rebase(cursor + shift);
         }
     }
 
@@ -781,19 +922,21 @@ impl Streamer {
             encodings,
             history,
             live,
+            honour_lead,
+            offset_us,
             ..
         } = self;
-        let live = *live;
+        let (live, without_lead, offset_us) = (*live, !*honour_lead, *offset_us);
         let out = &mut outputs[i];
         let encoding = encodings
             .iter_mut()
             .find(|e| e.format() == out.format)
             .expect("added with its output");
-        let lead = send_ahead_us(&out.conn.player_status().timing, live);
+        let lead = send_ahead_us(&out.conn.player_status().timing, without_lead);
         let target = now + lead.max(LATE_JOIN_MIN_LEAD_US);
 
         if encoding.running {
-            out.start(encoding, live);
+            out.start(encoding, without_lead, offset_us);
             let first = encoding.sent.partition_point(|(s, _)| s.start_us < target);
             let chunks = encoding.sent.range(first..);
             let n = fitting_tail(
@@ -820,7 +963,7 @@ impl Streamer {
             .get(history.len() - n)
             .map_or(cursor, |(s, _)| s.start_us);
         encoding.run(at);
-        out.start(encoding, live);
+        out.start(encoding, without_lead, offset_us);
         for (span, samples) in replay {
             // A shift left a gap in the kept audio; the format's timeline
             // takes the same gap.

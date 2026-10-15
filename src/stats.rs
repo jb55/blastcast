@@ -75,6 +75,8 @@ struct StreamStats {
     end_us: Option<i64>,
     /// How far ahead of its play time the last chunk was sent.
     lead_us: Option<i64>,
+    /// The latency the stream added to its timed source's play times.
+    added_latency_us: i64,
 }
 
 /// Something that went wrong on a connection, kept after it closes.
@@ -163,7 +165,15 @@ impl LinkStats {
             chunks_dropped: 0,
             end_us: None,
             lead_us: None,
+            added_latency_us: 0,
         });
+    }
+
+    /// The stream now adds `us` to its timed source's play times.
+    pub fn added_latency(&self, us: i64) {
+        if let Some(s) = &mut self.lock().stream {
+            s.added_latency_us = us;
+        }
     }
 
     /// The player's stream ended or paused.
@@ -237,6 +247,7 @@ impl LinkStats {
             bit_depth: s.format.bit_depth,
             playing: s.playing,
             send_ahead_ms: ms(s.send_ahead_us),
+            added_latency_ms: ms(s.added_latency_us),
             lead_ms: s.lead_us.map(ms),
             buffered_ms: match s.end_us {
                 Some(end) if s.playing => ms((end - now_us).max(0)),
@@ -302,6 +313,10 @@ pub struct StreamSnapshot {
     /// The player's own send-ahead floor; the stream runs at the largest
     /// of its players'.
     pub send_ahead_ms: f64,
+    /// The latency the stream added to its timed source's play times, so a
+    /// sender's chunks with less lead than the send-ahead still play: 0 for
+    /// a source that isn't timed. It only grows while the stream runs.
+    pub added_latency_ms: f64,
     /// How far ahead of its play time the last chunk was sent.
     pub lead_ms: Option<f64>,
     /// Audio sent that hasn't played yet, as far as the server knows.
