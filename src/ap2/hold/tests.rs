@@ -379,3 +379,22 @@ fn requests_read_as_commands() {
     assert_eq!(Command::flush(&write(plist::Dictionary::new())), None);
     assert_eq!(Command::rate(b"not a plist"), None);
 }
+
+/// Paused is said once it pauses after playing, and Resumed once it plays
+/// again; not before it first plays, nor for a rate that changes nothing.
+#[test]
+fn paused_and_resumed_follow_the_rate_after_it_first_plays() {
+    let mut hold = held(1000, 10);
+    hold.set_rate(Some(false), anchor(1000, 0));
+    assert!(!hold.is_paused(), "not playing yet isn't paused");
+    hold.set_rate(Some(true), anchor(1000, 0));
+    assert!(!hold.is_paused());
+    hold.set_rate(Some(true), None);
+    assert!(!hold.is_paused());
+    hold.set_rate(Some(false), anchor(1352, 10_000));
+    assert!(hold.is_paused());
+    hold.set_rate(None, None);
+    assert!(hold.is_paused(), "a rate that changes nothing");
+    hold.set_rate(Some(true), anchor(1352, 50_000));
+    assert!(!hold.is_paused());
+}

@@ -29,7 +29,9 @@
 //! that hasn't played, and nothing the phone still means to play is lost:
 //!
 //! - **rate 0 pauses**: the sink is flushed and nothing goes until an
-//!   anchor with rate 1. That anchor's `rtpTime` is where the phone
+//!   anchor with rate 1. The sink is told [`MetadataEvent::Paused`], and
+//!   [`MetadataEvent::Resumed`] when it plays again, as AirPlay 1's FLUSH
+//!   and RECORD tell it. That anchor's `rtpTime` is where the phone
 //!   resumes, so what is held from there plays at its new time, with no
 //!   gap in the frames or the stamps. No silence is sent while paused.
 //! - **an anchor that moves the timeline** (rate 1 again, at a time that
@@ -74,6 +76,7 @@ use super::buffered::Decoded;
 use super::ptp::Ptp;
 use super::setup::AUDIO_BUFFER_SIZE;
 use crate::audio::AIRPLAY_FORMAT;
+use crate::metadata::MetadataEvent;
 use crate::raop::announce::{CHANNELS, SAMPLE_RATE};
 
 /// How long before it plays a packet is handed over: as much lead as the
@@ -110,6 +113,9 @@ pub trait Sink: Send + Sync + 'static {
     fn audio(&self, chunk: &PcmChunk, play_at_us: Option<i64>);
     /// Drop everything handed over that hasn't played.
     fn flush(&self);
+    /// What the stream did that the sender's metadata would say: paused
+    /// or resumed.
+    fn event(&self, event: MetadataEvent);
 }
 
 /// SETRATEANCHORTIME's anchor: frame `rtp` plays at `remote_us` on PTP
@@ -232,6 +238,8 @@ pub struct Hold {
     anchor: Option<(u64, Anchor)>,
     /// The latest rate was 1.
     playing: bool,
+    /// Paused after playing, and not playing since.
+    paused: bool,
     /// The next frame to hand over; `None` starts afresh from the first
     /// held.
     next: Option<i64>,
@@ -262,6 +270,13 @@ impl Hold {
 
     pub fn is_playing(&self) -> bool {
         self.playing && self.anchor.is_some()
+    }
+
+    /// Paused after playing, and not playing again yet: what AirPlay 1's
+    /// FLUSH and RECORD say as [`MetadataEvent::Paused`] and
+    /// [`MetadataEvent::Resumed`]. Not before it first plays.
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     /// The PTP timeline the latest anchor is on.
@@ -318,6 +333,17 @@ impl Hold {
     /// from `anchor` if there is one. Returns whether the sink must be
     /// flushed.
     pub fn set_rate(&mut self, playing: Option<bool>, anchor: Option<RateAnchor>) -> bool {
+        let was = self.is_playing();
+        let flush = self.rate(playing, anchor);
+        if self.is_playing() {
+            self.paused = false;
+        } else if was {
+            self.paused = true;
+        }
+        flush
+    }
+
+    fn rate(&mut self, playing: Option<bool>, anchor: Option<RateAnchor>) -> bool {
         let playing = playing.unwrap_or(self.playing);
         if self.reference.is_none()
             && let Some(a) = anchor
@@ -570,8 +596,14 @@ fn apply(hold: &mut Hold, out: &Out, command: Command) {
     let now = out.clock.now_us();
     let flush = match command {
         Command::Rate { playing, anchor } => {
+            let paused = hold.is_paused();
             let flush = hold.set_rate(playing, anchor);
             let playing = hold.is_playing();
+            match (paused, hold.is_paused()) {
+                (false, true) => out.sink.event(MetadataEvent::Paused),
+                (true, false) => out.sink.event(MetadataEvent::Resumed),
+                _ => {}
+            }
             out.probe
                 .mark(Series::Rate, now, if playing { 1.0 } else { 0.0 });
             let at = anchor.and_then(|a| {

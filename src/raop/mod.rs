@@ -37,6 +37,17 @@
 //! does by default. A phone that left a dead connection behind can't lock
 //! the receiver.
 //!
+//! **AirPlay 2 shares all of it.** Its requests come on the same
+//! connections ([`crate::ap2`]), so its session is this one: a SETUP of
+//! its streams takes the target over as `ANNOUNCE` does, its `RECORD`
+//! begins the session and its `TEARDOWN` releases it, its
+//! `SET_PARAMETER`s go through the same [`params`], and its rate's pause
+//! and resume are the same events. An old Mac on AirPlay 1 and a phone on
+//! AirPlay 2 take one target over from each other and never mix. A phone
+//! that multi-selects targets opens one connection to each, so each is
+//! its own session, in step only because the one PTP clock map stamps
+//! them all.
+//!
 //! **What it reports.** The receiver is listed in
 //! [`NativeConfig::receivers`] while it runs, and each sender's stream in
 //! [`NativeConfig::sessions`], for `/v1/ws`. Its timings go to
@@ -350,7 +361,26 @@ impl Drop for Listed {
     }
 }
 
-/// One target's receiver, shared by its connections.
+/// A sender's stream, as [`Receiver::take_over`] lists it.
+pub(crate) struct Sender {
+    pub peer: IpAddr,
+    /// What it calls itself.
+    pub name: Option<String>,
+    pub codec: &'static str,
+    pub encrypted: bool,
+}
+
+/// What a sender calls itself in `req`'s headers: its
+/// `X-Apple-Client-Name`, or else its `User-Agent`.
+pub(crate) fn client_name(req: &rtsp::Request) -> Option<String> {
+    req.header("X-Apple-Client-Name")
+        .or_else(|| req.header("User-Agent"))
+        .map(str::to_owned)
+}
+
+/// One target's receiver, shared by its connections, AirPlay 1 and
+/// AirPlay 2 alike: whichever protocol a sender speaks, it takes the
+/// session over from the last one.
 pub(crate) struct Receiver {
     /// Its source id: what it is listed and measured under.
     id: String,
@@ -410,9 +440,20 @@ impl Receiver {
         format!("{}/{conn}", self.id)
     }
 
-    /// `conn` announced `session`: it plays from now, and the connection
-    /// that played before is dropped.
-    fn take_over(&self, conn: u64, session: tas_proto::Session) {
+    /// `conn` set up a stream from `sender`, on either protocol (AirPlay
+    /// 1's ANNOUNCE, AirPlay 2's SETUP of its streams): it plays from now,
+    /// and the connection that played before is dropped, whichever
+    /// protocol it spoke.
+    fn take_over(&self, conn: u64, sender: Sender) {
+        let session = tas_proto::Session {
+            id: self.session_id(conn),
+            receiver: self.id.clone(),
+            sender: sender.peer.to_string(),
+            sender_name: sender.name,
+            codec: sender.codec.into(),
+            encrypted: sender.encrypted,
+            since_us: self.now_us(),
+        };
         let mut state = self.lock();
         if let Some(previous) = state.current.replace(conn)
             && previous != conn
@@ -494,6 +535,10 @@ impl crate::ap2::hold::Sink for Receiver {
 
     fn flush(&self) {
         Receiver::flush(self);
+    }
+
+    fn event(&self, event: MetadataEvent) {
+        Receiver::event(self, event);
     }
 }
 

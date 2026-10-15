@@ -251,6 +251,9 @@ impl Controller {
     }
 }
 
+/// What the test phone calls itself in SETUP.
+pub const PHONE_NAME: &str = "Test iPhone";
+
 impl Controller {
     /// SETUP's first phase, as a phone sends it: PTP timing, with `peers`
     /// as the `timingPeerInfo` to follow.
@@ -273,6 +276,7 @@ impl Controller {
             plist::Value::String("5A3D4E3B-0000-4000-8000-746173746573".into()),
         );
         body.insert("isMultiSelectAirPlay".into(), plist::Value::Boolean(true));
+        body.insert("name".into(), plist::Value::String(PHONE_NAME.into()));
         self.plist_request(
             "SETUP",
             "rtsp://127.0.0.1/1",

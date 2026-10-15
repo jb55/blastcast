@@ -65,6 +65,8 @@ impl Recorder {
 }
 
 struct Rig {
+    /// The target it receives for.
+    device: &'static str,
     addr: SocketAddr,
     clock: ServerClock,
     hub: Telemetry,
@@ -94,6 +96,17 @@ impl Rig {
         handlers: Vec<Arc<dyn ReceiverHandler>>,
         configure: impl FnOnce(&mut NativeConfig),
     ) -> Self {
+        Self::start_target(DEVICE, "Kitchen", handlers, configure).await
+    }
+
+    /// As [`start_configured`](Self::start_configured), for target
+    /// `device` called `name`.
+    async fn start_target(
+        device: &'static str,
+        name: &str,
+        handlers: Vec<Arc<dyn ReceiverHandler>>,
+        configure: impl FnOnce(&mut NativeConfig),
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let recorder = Arc::new(Recorder::default());
@@ -111,7 +124,7 @@ impl Rig {
             config.receivers.clone(),
             config.sessions.clone(),
         );
-        let info = ReceiverInfo::native(DEVICE, "Kitchen".into(), addr.port(), None);
+        let info = ReceiverInfo::native(device, name.into(), addr.port(), None);
         let (stop, mut stopped) = watch::channel(false);
         let mut all: Vec<Arc<dyn ReceiverHandler>> = vec![recorder.clone()];
         all.extend(handlers);
@@ -120,6 +133,7 @@ impl Rig {
             serve(config, info, handler, listener, Some(50), &mut stopped).await
         });
         Self {
+            device,
             addr,
             clock,
             hub,
@@ -141,7 +155,7 @@ impl Rig {
 
     /// Every point of `series` the receiver has emitted.
     fn points(&self, series: Series) -> Vec<Point> {
-        let entity = crate::route::source_id(DEVICE);
+        let entity = crate::route::source_id(self.device);
         self.hub
             .subscribe(self.clock.now_us())
             .history
@@ -961,15 +975,28 @@ const PHONE_OFFSET_US: i64 = 123_456_789_000;
 /// A receiver that can play AirPlay 2 audio, its audio and events going to
 /// `handlers` as well as the recorder: a PTP follower on loopback, on the
 /// rig's clock, and the phone's grandmaster syncing it every 20 ms until
-/// [`Ap2::mapped`].
+/// [`Ap2::mapped`]. More targets' receivers can share the follower, as
+/// every target in one process does.
 struct Ap2 {
     rig: Rig,
+    /// The other targets', from [`Ap2::start_targets`].
+    others: Vec<Rig>,
     ptp: crate::ap2::ptp::Ptp,
     grandmaster: JoinHandle<()>,
 }
 
+/// A target for [`Ap2::start_targets`]: its id, its name, and where else
+/// its audio and events go.
+type Target = (&'static str, &'static str, Vec<Arc<dyn ReceiverHandler>>);
+
 impl Ap2 {
     async fn start(handlers: Vec<Arc<dyn ReceiverHandler>>) -> Self {
+        Self::start_targets(vec![(DEVICE, "Kitchen", handlers)]).await
+    }
+
+    /// One receiver for each of `targets`, the first being [`Ap2::rig`],
+    /// all following the one phone's clock through the one follower.
+    async fn start_targets(targets: Vec<Target>) -> Self {
         use crate::ap2::ptp::{Ptp, Status};
         let any = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
         let clock = ServerClock::new();
@@ -977,12 +1004,18 @@ impl Ap2 {
         let Status::Running { event, general } = *ptp.status() else {
             panic!("{:?}", ptp.status())
         };
-        let follower = ptp.clone();
-        let rig = Rig::start_configured(handlers, move |config| {
-            config.clock = clock;
-            config.ptp = follower;
-        })
-        .await;
+        let mut rigs = Vec::new();
+        for (device, name, handlers) in targets {
+            let follower = ptp.clone();
+            let rig = Rig::start_target(device, name, handlers, move |config| {
+                config.clock = clock;
+                config.ptp = follower;
+            })
+            .await;
+            rigs.push(rig);
+        }
+        let mut rigs = rigs.into_iter();
+        let rig = rigs.next().expect("a target");
         let grandmaster = tokio::spawn(async move {
             let socket = UdpSocket::bind(any).await.unwrap();
             let mut gm = crate::ap2::testing::Grandmaster::new(PHONE_CLOCK);
@@ -994,6 +1027,7 @@ impl Ap2 {
         });
         Self {
             rig,
+            others: rigs.collect(),
             ptp,
             grandmaster,
         }
@@ -1017,6 +1051,9 @@ impl Ap2 {
     async fn shutdown(self) {
         self.grandmaster.abort();
         self.rig.shutdown().await;
+        for rig in self.others {
+            rig.shutdown().await;
+        }
     }
 }
 
@@ -1472,5 +1509,317 @@ async fn an_airplay_2_timeline_pause_and_flush_reach_a_sendspin_player() {
 
     drop((data, phone));
     stream.stop().await;
+    ap2.shutdown().await;
+}
+
+/// Waits up to 5 s for `f`.
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A paired phone, timed by PTP, with a buffered ALAC stream set up and
+/// RECORD sent: playing, as far as the receiver's session goes.
+async fn ap2_playing(rig: &Rig) -> crate::ap2::testing::Controller {
+    use crate::ap2::buffered::TYPE_BUFFERED;
+    let mut phone = paired(rig).await;
+    let local: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+    assert_eq!(phone.setup_timing(&[local]).await.unwrap().status, 200);
+    let setup = phone
+        .setup_stream(TYPE_BUFFERED, 2, &[0x5a; 32], 352)
+        .await
+        .unwrap();
+    assert_eq!(setup.status, 200);
+    let record = phone
+        .request("RECORD", "rtsp://127.0.0.1/1", &[], None)
+        .await
+        .unwrap();
+    assert_eq!(record.status, 200);
+    phone
+}
+
+/// An AirPlay 2 TEARDOWN of everything SETUP set up.
+async fn ap2_teardown(phone: &mut crate::ap2::testing::Controller) {
+    let all = plist::Value::Dictionary(plist::Dictionary::new());
+    let teardown = phone
+        .plist_request("TEARDOWN", "rtsp://127.0.0.1/1", &all)
+        .await
+        .unwrap();
+    assert_eq!(teardown.status, 200);
+}
+
+/// An AirPlay 2 sender's session and metadata reach the router as AirPlay
+/// 1's do, over the encrypted channel: its stream listed once set up, under
+/// the name its SETUP gave; PlayBegin at RECORD; SET_PARAMETER's volume,
+/// track, art and progress through AirPlay 1's parser; GET_PARAMETER's
+/// volume; Paused and Resumed from its rate; and PlayEnd after TEARDOWN.
+#[tokio::test]
+async fn an_airplay_2_senders_session_metadata_and_volume() {
+    use crate::ap2::testing::PHONE_NAME;
+
+    let ap2 = Ap2::start(Vec::new()).await;
+    let rig = &ap2.rig;
+    let mut phone = ap2_playing(rig).await;
+    let sessions = rig.sessions.all();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let session = &sessions[0];
+    assert_eq!(session.sender_name.as_deref(), Some(PHONE_NAME));
+    assert_eq!(session.sender, "127.0.0.1");
+    assert_eq!((session.codec.as_str(), session.encrypted), ("alac", true));
+    let receiver = &rig.receivers.all()[0];
+    assert_eq!(receiver.session.as_ref(), Some(&session.id));
+    assert!(receiver.playing);
+
+    // Metadata, as an iPhone sends it, sealed like every request now.
+    let uri = "rtsp://127.0.0.1/1";
+    let params = |body: &'static str| Some(("text/parameters", body.as_bytes()));
+    for (content_type, body) in [
+        params("volume: -7.500000\r\n").unwrap(),
+        (
+            "application/x-dmap-tagged",
+            &listing("Teardrop", "Massive Attack", "Mezzanine", 330_000)[..],
+        ),
+        ("image/jpeg", &[0xFF, 0xD8, 0xFF, 0xE0, 0, 1, 2][..]),
+        params("progress: 0/44100/441000\r\n").unwrap(),
+    ] {
+        let set = phone
+            .request("SET_PARAMETER", uri, &[], Some((content_type, body)))
+            .await
+            .unwrap();
+        assert_eq!(set.status, 200, "{content_type}");
+    }
+    let volume = phone
+        .request("GET_PARAMETER", uri, &[], params("volume\r\n"))
+        .await
+        .unwrap();
+    assert_eq!(volume.body, b"volume: -7.500000\r\n");
+
+    // Playing, paused, and playing again; the rate's first 1 says nothing.
+    let t = rig.clock.now_us() + 1_000_000;
+    for rate in [1, 0, 1] {
+        let anchor = Some((PHONE_CLOCK, 0, phone_ns(t)));
+        let set = phone.set_rate_anchor(rate, anchor).await.unwrap();
+        assert_eq!(set.status, 200);
+    }
+    rig.until("the resume", |r| {
+        r.events().last() == Some(&MetadataEvent::Resumed)
+    })
+    .await;
+
+    let events = rig.recorder.events();
+    assert_eq!(events[0], MetadataEvent::PlayBegin);
+    assert_eq!(
+        events[1],
+        MetadataEvent::Volume(SenderVolume {
+            level: 75,
+            muted: false
+        })
+    );
+    assert_eq!(
+        events[2],
+        MetadataEvent::Track(TrackInfo {
+            title: Some("Teardrop".into()),
+            artist: Some("Massive Attack".into()),
+            album: Some("Mezzanine".into()),
+            duration: Some(Duration::from_secs(330)),
+        })
+    );
+    assert!(matches!(&events[3], MetadataEvent::Artwork(a) if a.bytes.len() == 7));
+    assert!(
+        matches!(&events[4], MetadataEvent::Progress(p) if p.elapsed == Duration::from_secs(1))
+    );
+    assert_eq!(events[5..], [MetadataEvent::Paused, MetadataEvent::Resumed]);
+
+    // TEARDOWN ends the session, after a moment, and unlists it.
+    ap2_teardown(&mut phone).await;
+    rig.until("the end", |r| {
+        r.events().last() == Some(&MetadataEvent::PlayEnd)
+    })
+    .await;
+    assert!(rig.sessions.all().is_empty());
+    assert!(!rig.receivers.all()[0].playing);
+    drop(phone);
+    ap2.shutdown().await;
+}
+
+/// AirPlay 1 and AirPlay 2 senders to one target take it over from each
+/// other, as two of either protocol do: an old Mac on AirPlay 1 cuts off a
+/// phone on AirPlay 2, and the next AirPlay 2 phone cuts off the Mac. The
+/// newest is listed, and the session goes on throughout: they never mix.
+#[tokio::test]
+async fn airplay_1_and_airplay_2_senders_take_a_target_over_from_each_other() {
+    use crate::ap2::testing::PHONE_NAME;
+    use tokio::io::AsyncReadExt;
+
+    let ap2 = Ap2::start(Vec::new()).await;
+    let rig = &ap2.rig;
+    let mut phone = ap2_playing(rig).await;
+    let listed = |codec: &str| {
+        let sessions = rig.sessions.all();
+        sessions.len() == 1
+            && sessions[0].codec == codec
+            && rig.receivers.all()[0].session.as_ref() == Some(&sessions[0].id)
+    };
+    eventually("the phone listed", || listed("alac")).await;
+
+    // The Mac, on AirPlay 1: the phone is cut off.
+    let mut mac = Phone::connect(rig.addr).await;
+    mac.start().await;
+    let options = tokio::time::timeout(
+        Duration::from_secs(2),
+        phone.request("OPTIONS", "*", &[], None),
+    )
+    .await
+    .expect("the phone is cut off");
+    assert!(options.is_err(), "the phone is still answered");
+    eventually("the Mac listed", || {
+        listed("alac") && rig.sessions.all()[0].sender_name.as_deref() != Some(PHONE_NAME)
+    })
+    .await;
+
+    // A phone on AirPlay 2 again: the Mac is cut off.
+    let mut again = ap2_playing(rig).await;
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(2), mac.rtsp.read(&mut byte))
+        .await
+        .expect("the Mac is cut off");
+    assert!(matches!(read, Ok(0) | Err(_)));
+    eventually("the phone listed again", || {
+        listed("alac") && rig.sessions.all()[0].sender_name.as_deref() == Some(PHONE_NAME)
+    })
+    .await;
+
+    // Past either one's end: one session throughout.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(rig.recorder.events(), [MetadataEvent::PlayBegin]);
+    assert_eq!(rig.points(Series::Takeover).len(), 2);
+
+    ap2_teardown(&mut again).await;
+    rig.until("the end", |r| {
+        r.events().last() == Some(&MetadataEvent::PlayEnd)
+    })
+    .await;
+    drop((phone, again));
+    ap2.shutdown().await;
+}
+
+/// iOS multi-select: one phone ticks two targets, which is two AirPlay 2
+/// sessions, one to each, on its one PTP timeline. Each target is its own
+/// player, playing its own session: both speakers get the same audio at
+/// identical stamps, and ending one session leaves the other playing.
+#[tokio::test]
+async fn a_multi_selected_phone_plays_each_target_as_its_own_session() {
+    use crate::ap2::buffered::TYPE_BUFFERED;
+    use crate::ap2::testing::DataSender;
+
+    let audio = AirplayAudio::new();
+    let ap2 = Ap2::start_targets(vec![
+        (DEVICE, "Kitchen", vec![audio.clone()]),
+        ("den", "Den", vec![audio.clone()]),
+    ])
+    .await;
+    let rigs = [&ap2.rig, &ap2.others[0]];
+    let clock = rigs[0].clock;
+    let local: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+    let shk = [0x5a; 32];
+
+    let mut speakers = Vec::new();
+    let mut streams = Vec::new();
+    let mut phones = Vec::new();
+    for (rig, name) in rigs.iter().zip(["Kitchen", "Den"]) {
+        audio.started(&ReceiverInfo::native(
+            rig.device,
+            name.into(),
+            rig.addr.port(),
+            None,
+        ));
+        let source = audio.source(rig.device).unwrap().unwrap();
+        let stream = tas_sendspin::AudioStream::start(clock, source).unwrap();
+        let speaker = FakeSpeaker::new(clock, rig.device);
+        stream.add_player(speaker.conn());
+        speakers.push(speaker);
+        streams.push(stream);
+        let mut phone = paired(rig).await;
+        assert_eq!(phone.setup_timing(&[local]).await.unwrap().status, 200);
+        phones.push(phone);
+    }
+    let map = ap2.mapped().await;
+    let mut data = Vec::new();
+    for (rig, phone) in rigs.iter().zip(&mut phones) {
+        let setup = phone
+            .setup_stream(TYPE_BUFFERED, 2, &shk, 352)
+            .await
+            .unwrap();
+        let port = stream_port(&setup, "dataPort");
+        let mut sender = DataSender::connect(rig.addr, port, &shk, 0).await.unwrap();
+        // Eight seconds, the same to each, as the phone sends it.
+        for i in 0..1000 {
+            sender
+                .send(&alac_packet(&tone(352, i * 352)), 352)
+                .await
+                .unwrap();
+        }
+        data.push(sender);
+        let record = phone
+            .request("RECORD", "rtsp://127.0.0.1/1", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(record.status, 200);
+    }
+    // Two sessions, one on each receiver.
+    for rig in rigs {
+        assert_eq!(rig.sessions.all().len(), 1);
+        assert!(rig.receivers.all()[0].playing);
+    }
+
+    // Both anchored as the phone anchors them: frame 0 at one PTP time.
+    let t = clock.now_us() + 2_000_000;
+    for phone in &mut phones {
+        phone
+            .set_rate_anchor(1, Some((PHONE_CLOCK, 0, phone_ns(t))))
+            .await
+            .unwrap();
+    }
+    let kitchen = chunks(&mut speakers[0], 10).await;
+    let den = chunks(&mut speakers[1], 10).await;
+    assert_placed(&kitchen, anchored(&map, 0, t, 0));
+    assert_eq!(
+        kitchen[..10],
+        den[..10],
+        "the same audio at the same stamps"
+    );
+    for speaker in &speakers {
+        assert_eq!(added_latency_us(speaker, clock.now_us()), 0);
+    }
+
+    // Unticking the kitchen ends its session only.
+    ap2_teardown(&mut phones[0]).await;
+    rigs[0]
+        .until("the kitchen's end", |r| {
+            r.events().last() == Some(&MetadataEvent::PlayEnd)
+        })
+        .await;
+    assert!(rigs[0].sessions.all().is_empty());
+    assert_eq!(rigs[1].recorder.events(), [MetadataEvent::PlayBegin]);
+    assert_eq!(rigs[1].sessions.all().len(), 1);
+    assert!(rigs[1].receivers.all()[0].playing);
+    // The den goes on, on the timeline it started on: a whole number of
+    // frames after its first chunk, still ahead of time.
+    speakers[1].audio();
+    let later = chunks(&mut speakers[1], 10).await;
+    let (first, _) = later[0];
+    assert!(first > clock.now_us(), "still ahead of time");
+    let frames = ((first - den[0].0) as f64 * 0.048).round() as i64;
+    let on_time = den[0].0 + frames * 1_000_000 / 48_000;
+    assert!((first - on_time).abs() <= 1, "{first} is off the timeline");
+    assert_placed(&later, first);
+
+    drop((data, phones));
+    for stream in streams {
+        stream.stop().await;
+    }
     ap2.shutdown().await;
 }

@@ -5,6 +5,7 @@
 //! `timingPeerInfo` to follow, which go to the process' PTP follower
 //! ([`Ptp::follow`]). We answer with our own `timingPeerInfo` and an
 //! `eventPort`, and serve the event channel there ([`events`](super::events)).
+//! Its `name` is what the sender calls itself.
 //!
 //! **Phase 2** (`streams`) is the audio: a stream of `type` 103 (buffered)
 //! with `ct` (the codec), `shk` (its key) and `spf`. We answer with a TCP
@@ -12,6 +13,8 @@
 //! data channel ([`buffered`](super::buffered)). Realtime audio (`type`
 //! 96) is refused, and so is buffered audio when the follower couldn't
 //! follow phase 1's peers: without PTP there is nothing to play it by.
+//! A stream set up is the sender taking the target over, as AirPlay 1's
+//! ANNOUNCE is ([`crate::raop`]).
 //!
 //! The TCP ports come from [`NativeConfig::tcp_ports`] and the UDP one
 //! from [`NativeConfig::udp_ports`], so a firewall can let them in.
@@ -111,6 +114,8 @@ pub struct Stream {
 #[derive(Debug, Default)]
 pub struct Session {
     timing: Timing,
+    /// What the sender calls itself: phase 1's `name`.
+    sender_name: Option<String>,
     events: Option<Task>,
     stream: Option<Stream>,
 }
@@ -119,6 +124,11 @@ impl Session {
     /// The stream phase 2 set up, while it lasts.
     pub fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
+    }
+
+    /// What the sender called itself in phase 1, if it did.
+    pub fn sender_name(&self) -> Option<&str> {
+        self.sender_name.as_deref()
     }
 
     /// Answers a SETUP, either phase, on a connection paired with `keys`.
@@ -152,6 +162,9 @@ impl Session {
         keys: &Keys,
         dict: &Dictionary,
     ) -> Result<Dictionary, u16> {
+        if let Some(name) = dict.get("name").and_then(Value::as_string) {
+            self.sender_name = Some(name.to_owned());
+        }
         let protocol = dict.get("timingProtocol").and_then(Value::as_string);
         self.timing = if protocol == Some("PTP") {
             let peers = dict
@@ -317,13 +330,18 @@ impl Session {
     /// TEARDOWN: of the stream when `body` names `streams`, else of
     /// everything SETUP set up. Returns whether it was everything.
     pub fn teardown(&mut self, body: &[u8]) -> bool {
-        let streams_only = dictionary(body).is_some_and(|d| d.contains_key("streams"));
+        let streams_only = is_streams(body);
         self.stream = None;
         if !streams_only {
             *self = Self::default();
         }
         !streams_only
     }
+}
+
+/// Whether a SETUP with this body is its second phase, the streams.
+pub fn is_streams(body: &[u8]) -> bool {
+    dictionary(body).is_some_and(|d| d.contains_key("streams"))
 }
 
 fn dictionary(body: &[u8]) -> Option<Dictionary> {

@@ -50,7 +50,7 @@ use super::clock::{self, SyncPacket, Timeline};
 use super::crypto::{self, AudioCipher};
 use super::playout::{Inserted, Note, Played, Playout, RESEND_WINDOW};
 use super::rtsp::{self, Request, Response};
-use super::{AIRTUNES_VERSION, Receiver, bind_udp, params, rtp};
+use super::{AIRTUNES_VERSION, Receiver, Sender, bind_udp, client_name, params, rtp};
 use crate::ap2;
 use crate::ap2::channel::{Role, SecureRead, SecureWrite, encrypt_reader};
 use crate::audio::AIRPLAY_FORMAT;
@@ -205,23 +205,16 @@ impl Connection {
                     user_agent = req.header("User-Agent").unwrap_or_default(),
                     "AirPlay sender announced a stream"
                 );
-                let session = tas_proto::Session {
-                    id: self.receiver.session_id(self.id),
-                    receiver: self.receiver.id.clone(),
-                    sender: self.peer.to_string(),
-                    sender_name: req
-                        .header("X-Apple-Client-Name")
-                        .or_else(|| req.header("User-Agent"))
-                        .map(str::to_owned),
+                let sender = Sender {
+                    peer: self.peer,
+                    name: client_name(req),
                     codec: match announce.codec {
                         Codec::Alac(_) => "alac",
                         Codec::L16 => "l16",
-                    }
-                    .into(),
+                    },
                     encrypted: announce.cipher.is_some(),
-                    since_us: self.receiver.now_us(),
                 };
-                self.receiver.take_over(self.id, session);
+                self.receiver.take_over(self.id, sender);
                 self.stream = None;
                 self.announce = Some(announce);
                 Response::ok()
@@ -282,7 +275,29 @@ impl Connection {
             probe: self.receiver.probe.clone(),
             clock: config.clock,
         };
-        self.ap2.setup(ctx, req).await
+        let response = self.ap2.setup(ctx, req).await;
+        // Its streams set up: this sender plays now, as AirPlay 1's does
+        // once it announces.
+        if response.status == 200
+            && ap2::setup::is_streams(&req.body)
+            && let Some(stream) = self.ap2.session().stream()
+        {
+            let sender = Sender {
+                peer: self.peer,
+                name: self
+                    .ap2
+                    .session()
+                    .sender_name()
+                    .map(str::to_owned)
+                    .or_else(|| client_name(req)),
+                codec: stream.codec.name(),
+                // Its audio is sealed with shk, its control channel with
+                // the pairing's keys.
+                encrypted: true,
+            };
+            self.receiver.take_over(self.id, sender);
+        }
+        response
     }
 
     /// AirPlay 2's TEARDOWN: of the stream, or of the session, which then

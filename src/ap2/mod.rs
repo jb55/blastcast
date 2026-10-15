@@ -22,9 +22,10 @@
 //!
 //! A sender's AirPlay 2 requests arrive on the AirPlay 1 receiver's
 //! connection: [`handles`] tells them apart and a [`Connection`] answers
-//! them, so the AirPlay 1 path is left as it is. Until AirPlay 2's
-//! sessions, metadata and volume reach the router as AirPlay 1's do, a
-//! target only advertises AirPlay 2 when
+//! them, so the AirPlay 1 path is left as it is, and the session, its
+//! takeover and its metadata are the receiver's, shared by both
+//! ([`crate::raop`]). Until a real phone has played on it, a target only
+//! advertises AirPlay 2 when
 //! [`NativeConfig::airplay2`](crate::raop::NativeConfig::airplay2) says
 //! so, since a phone that sees AirPlay 2 uses it and can't fall back.
 //!
