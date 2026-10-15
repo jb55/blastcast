@@ -8,9 +8,9 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
+use blastcast::ServerClock;
 use harness::noise::NoiseSource;
 use harness::{FakePlayer, Spec, format};
-use tas_audio::ServerClock;
 use tas_core::player::{PlaybackState, PlayerType};
 use tas_core::state::StateStore;
 use tas_core::syncgroup::SyncGroups;

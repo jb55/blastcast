@@ -6,8 +6,8 @@
 //! Encoded in pure Rust (`opus-pure`); the tests decode the packets with
 //! libopus, which is what real players (sendspin-go, ESPHome) run.
 
+use blastcast::{AudioError, SESSION_FORMAT};
 use opus_pure::Application;
-use tas_audio::{AudioError, SESSION_FORMAT};
 
 use super::whole_chunk;
 use crate::protocol::{Codec, StreamFormat};

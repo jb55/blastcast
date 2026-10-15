@@ -1,7 +1,8 @@
 //! PCM: session audio resampled to the player's rate if that differs, then
 //! packed as s16le or s24le.
 
-use tas_audio::{AudioError, SESSION_FORMAT, StreamResampler, pcm};
+use blastcast::{AudioError, SESSION_FORMAT};
+use blastcast_audio::{StreamResampler, pcm};
 
 use super::BIT_DEPTHS;
 use crate::protocol::{Codec, StreamFormat};

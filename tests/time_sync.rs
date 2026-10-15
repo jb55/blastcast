@@ -7,8 +7,8 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
+use blastcast::ServerClock;
 use futures_util::{SinkExt, StreamExt};
-use tas_audio::ServerClock;
 use tas_core::PlayerRegistry;
 use tas_sendspin::protocol::{ClientHello, ClientMessage, ClientTime, ServerMessage, ServerTime};
 use tas_sendspin::{SendspinServer, ServerConfig};

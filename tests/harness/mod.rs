@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use base64::Engine;
+use blastcast::ServerClock;
 use futures_util::{SinkExt, StreamExt};
-use tas_audio::ServerClock;
 use tas_sendspin::protocol::binary::AUDIO_CHUNK;
 use tas_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, ClientTime, Codec, HeaderLayout,

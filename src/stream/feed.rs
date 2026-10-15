@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tas_audio::{Item, SESSION_FORMAT, TimedSource};
+use blastcast::{Item, SESSION_FORMAT, TimedSource};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -202,12 +202,13 @@ async fn read(
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use tas_audio::{AudioError, PcmChunk, SineSource};
+    use blastcast::{AudioError, PcmChunk};
+    use blastcast_audio::SineSource;
 
     use super::*;
 
     fn untimed(source: SineSource) -> Box<dyn TimedSource> {
-        Box::new(tas_audio::source::Untimed(source))
+        Box::new(blastcast::Untimed(source))
     }
 
     async fn frames(feed: &mut Feed) -> Vec<usize> {
@@ -231,7 +232,7 @@ mod tests {
 
     #[async_trait]
     impl TimedSource for Stamped {
-        fn format(&self) -> tas_audio::AudioFormat {
+        fn format(&self) -> blastcast::AudioFormat {
             SESSION_FORMAT
         }
 
@@ -333,7 +334,7 @@ mod tests {
         struct Flushing(u8);
         #[async_trait]
         impl TimedSource for Flushing {
-            fn format(&self) -> tas_audio::AudioFormat {
+            fn format(&self) -> blastcast::AudioFormat {
                 SESSION_FORMAT
             }
             async fn next(&mut self) -> Result<Option<Item>, AudioError> {

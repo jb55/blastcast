@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use blastcast::TimedSource;
 use bytes::Bytes;
-use tas_audio::TimedSource;
 use tas_core::{CommandError, PlayerControl, SourceMetadata};
 
 use crate::connection::Connection;

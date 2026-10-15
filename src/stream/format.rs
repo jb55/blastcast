@@ -1,7 +1,7 @@
 //! Choosing the format a player is sent: from its hello's list, and again
 //! when it asks for another with `stream/request-format`.
 
-use tas_audio::SESSION_FORMAT;
+use blastcast::SESSION_FORMAT;
 
 use super::encode::can_encode;
 use crate::protocol::{Codec, PlayerSupport, RequestFormatPlayer, StreamFormat};

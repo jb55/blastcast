@@ -8,7 +8,8 @@ publish.workspace = true
 
 [dependencies]
 tas-core.workspace = true
-tas-audio.workspace = true
+blastcast.workspace = true
+blastcast-audio.workspace = true
 blastcast-mdns.workspace = true
 tas-proto.workspace = true
 tas-telemetry.workspace = true

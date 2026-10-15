@@ -4,7 +4,7 @@
 //! peak and can't mistake a skew of a whole period for none.
 
 use async_trait::async_trait;
-use tas_audio::{AudioError, LiveSource, PcmChunk, SESSION_FORMAT, ServerClock, Timeline};
+use blastcast::{AudioError, LiveSource, PcmChunk, SESSION_FORMAT, ServerClock, Timeline};
 
 /// Noise in 20 ms chunks, delivered in real time on the server clock like
 /// a capture device (or AirPlay) delivers audio.
@@ -38,7 +38,7 @@ impl NoiseSource {
 
 #[async_trait]
 impl LiveSource for NoiseSource {
-    fn format(&self) -> tas_audio::AudioFormat {
+    fn format(&self) -> blastcast::AudioFormat {
         SESSION_FORMAT
     }
 

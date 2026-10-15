@@ -5,7 +5,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tas_audio::{AudioFormat, LiveSource, PcmChunk, SineSource};
+use blastcast::{AudioFormat, LiveSource, PcmChunk};
+use blastcast_audio::SineSource;
 
 use super::*;
 use crate::connection::Queues;
@@ -817,7 +818,7 @@ async fn a_shift_and_a_seek_are_marked_on_the_stream() {
 struct Scripted {
     clock: ServerClock,
     format: AudioFormat,
-    items: VecDeque<(i64, tas_audio::Item)>,
+    items: VecDeque<(i64, blastcast::Item)>,
     /// Its [`TimedSource::trim_lead`].
     trim_lead: Option<i64>,
 }
@@ -847,7 +848,7 @@ impl Scripted {
             let at = t0 + (k * frames as u64 * 1_000_000 / rate) as i64;
             self.items.push_back((
                 at - lead_us,
-                tas_audio::Item::Chunk {
+                blastcast::Item::Chunk {
                     pcm: PcmChunk::new(self.format, vec![0.0; frames * 2]),
                     play_at_us: Some(at),
                 },
@@ -857,7 +858,7 @@ impl Scripted {
     }
 
     fn flush(mut self, at_us: i64) -> Self {
-        self.items.push_back((at_us, tas_audio::Item::Flush));
+        self.items.push_back((at_us, blastcast::Item::Flush));
         self
     }
 
@@ -876,7 +877,7 @@ impl TimedSource for Scripted {
         self.trim_lead
     }
 
-    async fn next(&mut self) -> Result<Option<tas_audio::Item>, AudioError> {
+    async fn next(&mut self) -> Result<Option<blastcast::Item>, AudioError> {
         let Some((at, item)) = self.items.pop_front() else {
             return Ok(None);
         };

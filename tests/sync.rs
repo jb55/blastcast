@@ -16,10 +16,10 @@ mod harness;
 use std::sync::Arc;
 use std::time::Duration;
 
+use blastcast::ServerClock;
 use harness::noise::NoiseSource;
 use harness::playout::{self, Playout};
 use harness::{FakePlayer, Spec, format};
-use tas_audio::ServerClock;
 use tas_core::PlayerRegistry;
 use tas_sendspin::protocol::{Codec, RequestFormatPlayer};
 use tas_sendspin::{SendspinServer, ServerConfig};

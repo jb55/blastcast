@@ -4,7 +4,7 @@
 //!
 //! An [`AudioStream`] runs one source on its own task and sends it to
 //! every player added to it. A source is read in 20 ms chunks and each chunk
-//! is placed once on the stream's [`Timeline`](tas_audio::Timeline), so
+//! is placed once on the stream's [`Timeline`](blastcast::Timeline), so
 //! every player gets the same play time for the same audio. That is what
 //! keeps a group in sync later.
 //!
@@ -102,13 +102,11 @@ mod format;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use tas_audio::{
-    AudioError, IntoTimed, SESSION_FORMAT, ServerClock, Span, TimedSource, Timeline,
-    timed_to_session_format,
-};
+use blastcast::{AudioError, IntoTimed, SESSION_FORMAT, ServerClock, Span, TimedSource, Timeline};
 #[cfg(doc)]
-use tas_audio::{Item, LiveSource};
+use blastcast::{Item, LiveSource};
+use blastcast_audio::timed_to_session_format;
+use bytes::Bytes;
 use tas_proto::Series;
 use tas_telemetry::Probe;
 use tokio::sync::{mpsc, oneshot, watch};

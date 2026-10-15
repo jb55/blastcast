@@ -4,12 +4,13 @@
 //! Frames are independent, so a player joining mid-stream decodes from
 //! the first one it gets. Encoded with flacenc, which is pure Rust.
 
+use blastcast::{AudioError, SESSION_FORMAT};
+use blastcast_audio::pcm;
 use flacenc::bitsink::MemSink;
 use flacenc::component::{BitRepr, Stream, StreamInfo};
 use flacenc::config;
 use flacenc::error::{Verified, Verify};
 use flacenc::source::{Fill, FrameBuf};
-use tas_audio::{AudioError, SESSION_FORMAT, pcm};
 
 use super::{BIT_DEPTHS, whole_chunk};
 use crate::protocol::{Codec, StreamFormat};

@@ -13,7 +13,7 @@ mod pcm;
 use std::borrow::Cow;
 
 use base64::Engine;
-use tas_audio::{AudioError, SESSION_FORMAT};
+use blastcast::{AudioError, SESSION_FORMAT};
 
 pub use flac::FlacEncoder;
 pub use opus::OpusEncoder;

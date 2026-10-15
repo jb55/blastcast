@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use tas_audio::ServerClock;
+use blastcast::ServerClock;
 
 use crate::connection::{Connection, Queues};
 use crate::protocol::binary::AUDIO_CHUNK;

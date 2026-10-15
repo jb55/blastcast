@@ -6,8 +6,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use blastcast::{SESSION_FORMAT, ServerClock};
+use blastcast_audio::SineSource;
 use futures_util::{SinkExt, StreamExt};
-use tas_audio::{SESSION_FORMAT, ServerClock, SineSource};
 use tas_core::PlayerRegistry;
 use tas_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, HeaderLayout, PlayerSupport,

@@ -2,7 +2,8 @@
 
 use std::time::Duration;
 
-use tas_audio::{AudioFormat, LiveSource, SESSION_FORMAT, SineSource, to_session_format};
+use blastcast::{AudioFormat, LiveSource, SESSION_FORMAT};
+use blastcast_audio::{SineSource, to_session_format};
 
 use std::sync::Mutex;
 
