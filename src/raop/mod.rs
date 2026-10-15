@@ -18,10 +18,11 @@
 //!
 //! **The sender's timeline is kept** ([`clock`]): its NTP clock mapped onto
 //! the server clock and its latest sync packet, so each chunk handed over
-//! carries the server-clock time the sender means it to play. The handler
-//! downstream can't use that yet (`LiveSource` is untimed), so the audio
-//! is still handed over as it plays out here, the latency after it
-//! arrived; taking the stamp is headway:tune-assistant/pact-jeans-tube.
+//! carries the server-clock time the sender means it to play, and the
+//! Sendspin stream places it there ([`crate::audio`]). A `FLUSH` is handed
+//! over in line with the audio ([`ReceiverHandler::flush`]). The audio is
+//! still handed over as it plays out here, the latency after it arrived;
+//! handing it over on arrival is headway:tune-assistant/autumn-food-bar.
 //!
 //! **A session** is what shairport-sync's active state was, and what
 //! [`MetadataEvent::PlayBegin`] and [`MetadataEvent::PlayEnd`] bracket: it
@@ -340,6 +341,10 @@ impl Receiver {
 
     pub(crate) fn audio(&self, chunk: &PcmChunk, play_at_us: Option<i64>) {
         self.handler.audio(&self.info, chunk, play_at_us);
+    }
+
+    pub(crate) fn flush(&self) {
+        self.handler.flush(&self.info);
     }
 
     fn now_us(&self) -> i64 {

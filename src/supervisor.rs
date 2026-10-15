@@ -139,6 +139,11 @@ pub trait ReceiverHandler: Send + Sync + 'static {
     /// means its first frame to play, on the server clock, once the
     /// receiver knows ([`crate::raop::clock`]).
     fn audio(&self, _receiver: &ReceiverInfo, _chunk: &PcmChunk, _play_at_us: Option<i64>) {}
+    /// A native receiver's sender flushed (`FLUSH`, a pause or a seek):
+    /// drop what was handed over and hasn't played. It comes in line with
+    /// [`audio`](Self::audio): every chunk after it is from after the
+    /// flush.
+    fn flush(&self, _receiver: &ReceiverInfo) {}
     /// The run ended; its fifos are about to be removed.
     fn stopped(&self, _receiver: &ReceiverInfo) {}
 }
@@ -161,6 +166,9 @@ impl ReceiverHandler for Vec<Arc<dyn ReceiverHandler>> {
     fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, play_at_us: Option<i64>) {
         self.iter()
             .for_each(|h| h.audio(receiver, chunk, play_at_us));
+    }
+    fn flush(&self, receiver: &ReceiverInfo) {
+        self.iter().for_each(|h| h.flush(receiver));
     }
     fn stopped(&self, receiver: &ReceiverInfo) {
         self.iter().for_each(|h| h.stopped(receiver));

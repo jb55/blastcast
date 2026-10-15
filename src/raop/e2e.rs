@@ -24,7 +24,9 @@ use super::crypto::tests::{encrypt_payload, public_key};
 use super::params::tests::listing;
 use super::rtsp::{self, Response};
 use super::*;
+use crate::audio::AirplayAudio;
 use crate::metadata::{SenderVolume, TrackInfo};
+use tas_sendspin::testing::FakeSpeaker;
 
 #[derive(Default)]
 struct Recorder {
@@ -72,6 +74,12 @@ const DEVICE: &str = "kitchen";
 
 impl Rig {
     async fn start() -> Self {
+        Self::start_with(Vec::new()).await
+    }
+
+    /// A receiver whose audio and events go to `handlers` as well as the
+    /// recorder.
+    async fn start_with(handlers: Vec<Arc<dyn ReceiverHandler>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let recorder = Arc::new(Recorder::default());
@@ -89,7 +97,9 @@ impl Rig {
         );
         let info = ReceiverInfo::native(DEVICE, "Kitchen".into(), addr.port(), None);
         let (stop, mut stopped) = watch::channel(false);
-        let handler = recorder.clone();
+        let mut all: Vec<Arc<dyn ReceiverHandler>> = vec![recorder.clone()];
+        all.extend(handlers);
+        let handler: Arc<dyn ReceiverHandler> = Arc::new(all);
         let task = tokio::spawn(async move {
             serve(config, info, handler, listener, Some(50), &mut stopped).await
         });
@@ -230,6 +240,100 @@ async fn chunks_carry_the_senders_play_time() {
     assert!(lead > 1_000_000, "{lead} µs");
     sender.teardown().await;
     rig.shutdown().await;
+}
+
+/// The phone's timeline reaches a Sendspin player: our sender anchors frame
+/// r0 at server-clock time t, and the player gets r0's audio stamped t plus
+/// the latency the stream added, then the rest contiguous. A FLUSH reaches
+/// it as `stream/clear` at once, with none of the flushed audio after it,
+/// and the next anchor places the timeline afresh.
+#[tokio::test]
+async fn a_senders_timeline_and_flush_reach_a_sendspin_player() {
+    let audio = AirplayAudio::new();
+    let rig = Rig::start_with(vec![audio.clone()]).await;
+    audio.started(&ReceiverInfo::native(DEVICE, "Kitchen".into(), 7000, None));
+    let source = audio.source(DEVICE).unwrap().unwrap();
+    let stream = tas_sendspin::AudioStream::start(rig.clock, source).unwrap();
+    let mut speaker = FakeSpeaker::new(rig.clock, "kitchen");
+    stream.add_player(speaker.conn());
+
+    let ntp = NtpClock::new(rig.clock);
+    let mut sender = RaopSession::connect(rig.addr, ntp, -15.0).await.unwrap();
+    let t = rig.clock.now_us() + 2_500_000;
+    sender.anchor(t).await.unwrap();
+    sender.push(&tone(44_100, 0)).await.unwrap();
+    sender.finish().await.unwrap();
+
+    let first = chunks(&mut speaker, 10).await;
+    let added_us = added_latency_us(&speaker, rig.clock.now_us());
+    assert_eq!(added_us, 0, "two seconds of lead need no more");
+    assert_placed(&first, t + added_us);
+    assert_eq!(speaker.control(), ["start"]);
+
+    // Most of the second is still to play: the flush drops it.
+    let flushed_at = rig.clock.now_us();
+    assert!(flushed_at < t + 500_000, "flushed too late to tell");
+    sender.flush().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut control = Vec::new();
+    while !control.contains(&"clear") {
+        assert!(Instant::now() < deadline, "no stream/clear: {control:?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        control.extend(speaker.control());
+    }
+    // The chunks sent before the clear are the player's to drop; none of
+    // the flushed audio may come after it.
+    speaker.audio();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(speaker.audio(), [], "the flushed tail still came");
+
+    let t2 = rig.clock.now_us() + 2_200_000;
+    sender.anchor(t2).await.unwrap();
+    sender.push(&tone(44_100 / 2, 0)).await.unwrap();
+    sender.finish().await.unwrap();
+    let second = chunks(&mut speaker, 10).await;
+    assert_placed(&second, t2 + added_latency_us(&speaker, rig.clock.now_us()));
+
+    sender.teardown().await;
+    stream.stop().await;
+    rig.shutdown().await;
+}
+
+/// The first `n` audio chunks the speaker gets, within 5 s.
+async fn chunks(speaker: &mut FakeSpeaker, n: usize) -> Vec<(i64, usize)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut got = Vec::new();
+    while got.len() < n {
+        assert!(Instant::now() < deadline, "{} chunks of {n}", got.len());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        got.extend(speaker.audio());
+    }
+    got
+}
+
+fn added_latency_us(speaker: &FakeSpeaker, now: i64) -> i64 {
+    let stats = speaker.conn().stats().snapshot(now, 0);
+    (stats.stream.expect("streamed to").added_latency_ms * 1000.0) as i64
+}
+
+/// The first chunk plays at `at` and every one after it where the frames
+/// before it end.
+fn assert_placed(chunks: &[(i64, usize)], at: i64) {
+    // The clock map's error on localhost, as above.
+    let (first, _) = chunks[0];
+    assert!(
+        (first - at).abs() < 500,
+        "first chunk at {first}, sent for {at}"
+    );
+    let mut frames = 0;
+    for &(ts, n) in chunks {
+        let want = first + frames * 1_000_000 / 48_000;
+        assert!(
+            (ts - want).abs() <= 1,
+            "{ts} after {frames} frames, not {want}"
+        );
+        frames += n as i64;
+    }
 }
 
 /// A sender that does what an iPhone does, one request at a time.

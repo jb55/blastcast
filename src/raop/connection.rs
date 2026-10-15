@@ -491,6 +491,9 @@ impl Stream {
             let mut ingest = self.shared.lock();
             ingest.playout.flush(before);
             ingest.highest = None;
+            // Under the lock the playout hands audio over in, so no chunk
+            // from before the flush can follow it.
+            self.shared.receiver.flush();
             std::mem::replace(&mut ingest.paused, true)
         };
         self.shared.queued.notify_one();
@@ -663,15 +666,13 @@ async fn play_out(shared: Arc<Shared>) {
             }
             None => shared.queued.notified().await,
         }
-        let due: Vec<_> = {
-            let mut ingest = shared.lock();
-            let due = ingest.playout.pop_due(Instant::now());
-            ingest.note();
-            due.into_iter()
-                .map(|p| (ingest.timeline.play_at_us(p.rtp), p.frames))
-                .collect()
-        };
-        for (play_at_us, frames) in due {
+        // Handed over under the lock, so a flush can't come between taking
+        // a chunk out and handing it over.
+        let mut ingest = shared.lock();
+        let due = ingest.playout.pop_due(Instant::now());
+        ingest.note();
+        for p in due {
+            let (play_at_us, frames) = (ingest.timeline.play_at_us(p.rtp), p.frames);
             if let Some(at) = play_at_us
                 && lead_logged.is_none_or(|t| t.elapsed() >= LEAD_LOG_INTERVAL)
             {

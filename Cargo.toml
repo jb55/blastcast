@@ -30,6 +30,7 @@ tracing.workspace = true
 [dev-dependencies]
 alac-encoder.workspace = true
 tas-airplay-out.workspace = true
+tas-sendspin = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [lints]

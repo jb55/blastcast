@@ -525,7 +525,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use tas_audio::LiveSource;
+    use tas_audio::{Item, TimedSource};
     use tas_core::player::PlayerState;
     use tas_core::{ImageSource, PlayerControl, PlayerFeature};
     use tokio::io::AsyncWriteExt;
@@ -536,7 +536,7 @@ mod tests {
     use crate::testing::{item, mkfifo};
 
     /// Where a fake player keeps the source it was handed.
-    type Slot = Arc<Mutex<Option<Box<dyn LiveSource>>>>;
+    type Slot = Arc<Mutex<Option<Box<dyn TimedSource>>>>;
 
     /// A player that records what it is asked and keeps the source it was
     /// given. Its stop takes a while, as a real one can.
@@ -554,7 +554,7 @@ mod tests {
 
     #[async_trait]
     impl PlayerControl for Fake {
-        async fn play_source(&self, source: Box<dyn LiveSource>) -> Result<(), CommandError> {
+        async fn play_source(&self, source: Box<dyn TimedSource>) -> Result<(), CommandError> {
             self.record("play_source".into());
             *self.source.lock().unwrap() = Some(source);
             Ok(())
@@ -704,7 +704,7 @@ mod tests {
             self.registry.get(id).unwrap()
         }
 
-        fn source(&self, id: &str) -> Option<Box<dyn LiveSource>> {
+        fn source(&self, id: &str) -> Option<Box<dyn TimedSource>> {
             self.sources[id].lock().unwrap().take()
         }
     }
@@ -745,12 +745,17 @@ mod tests {
         fifo.write_all(&[0x00, 0x40, 0x00, 0x40].repeat(1408))
             .await
             .unwrap();
-        let chunk = tokio::time::timeout(Duration::from_secs(5), source.next_chunk())
+        let next = tokio::time::timeout(Duration::from_secs(5), source.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(chunk.format, tas_audio::SESSION_FORMAT);
+        // shairport's audio carries no play time.
+        let Item::Chunk { pcm, play_at_us } = next else {
+            panic!("expected audio, got {next:?}");
+        };
+        assert_eq!(pcm.format, tas_audio::SESSION_FORMAT);
+        assert_eq!(play_at_us, None);
 
         // The first volume is the receiver's own starting level: skipped.
         rig.pvol(-24.0);
@@ -802,7 +807,7 @@ mod tests {
         assert_eq!(rig.router.claim("kitchen").await, None);
         // The stream ended with the session.
         let ended = tokio::time::timeout(Duration::from_secs(5), async {
-            while source.next_chunk().await.unwrap().is_some() {}
+            while !matches!(source.next().await.unwrap(), None | Some(Item::End)) {}
         })
         .await;
         assert!(ended.is_ok(), "the stream never ended");

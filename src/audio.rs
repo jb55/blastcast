@@ -1,6 +1,14 @@
-//! Each receiver's PCM, handed to whoever plays it as a [`LiveSource`]: a
+//! Each receiver's PCM, handed to whoever plays it as a [`TimedSource`]: a
 //! native receiver's as it hands it over ([`ReceiverHandler::audio`]), or
 //! shairport-sync's, read off its audio fifo.
+//!
+//! **A native receiver's audio keeps its play time**: each chunk is
+//! stamped with when the sender means it to play, on the server clock, so
+//! the stream places it on the sender's timeline rather than when it got
+//! here. Its `FLUSH` ([`ReceiverHandler::flush`]) is an [`Item::Flush`] in
+//! line with the audio, so whatever the stream holds of what came before
+//! is dropped at once rather than played out. shairport-sync's audio has
+//! no play time: its chunks are unstamped, placed as they arrive.
 //!
 //! [`AirplayAudio`] is a [`ReceiverHandler`]: when a shairport run starts
 //! it opens that run's audio fifo and reads it until the run stops, **whether or not
@@ -23,7 +31,7 @@
 //! for. MA writes a second of silence into the fifo there, to wake an
 //! ffmpeg blocked reading it; nothing here blocks on the fifo, so ending
 //! the stream closes its channel instead, and the session's pending
-//! `next_chunk` returns `None` at once.
+//! `next` returns `None` at once.
 //!
 //! Only audio passes through: nothing is kept past the chunk in flight.
 
@@ -32,7 +40,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
-use tas_audio::{AudioError, AudioFormat, LiveSource, PcmChunk, pcm, to_session_format};
+use tas_audio::{
+    AudioError, AudioFormat, Item, PcmChunk, TimedSource, pcm, timed_to_session_format,
+};
 use tokio::io::AsyncReadExt;
 use tokio::net::unix::pipe;
 use tokio::sync::mpsc;
@@ -53,7 +63,7 @@ const FRAME_BYTES: usize = 4;
 /// read normally returns one write; this only bounds a backlog.
 const READ_BYTES: usize = 16 * 1024;
 
-/// Chunks queued for a stream that isn't keeping up: about 1 s of
+/// Items queued for a stream that isn't keeping up: about 1 s of
 /// shairport's 352-frame writes. Past it, chunks are dropped rather than
 /// letting the reader, and so shairport, wait.
 const STREAM_QUEUE: usize = 128;
@@ -81,19 +91,48 @@ impl Drop for Reader {
 /// Where a receiver's audio goes: the stream handed out, if any.
 #[derive(Default)]
 struct Slot {
-    stream: Mutex<Option<mpsc::Sender<PcmChunk>>>,
+    stream: Mutex<Option<Stream>>,
     /// Chunks are being dropped, and that has been logged.
     overflowing: AtomicBool,
 }
 
+/// The stream handed out.
+struct Stream {
+    tx: mpsc::Sender<Item>,
+    /// A flush that found the queue full, owed ahead of the next item.
+    flush_owed: bool,
+}
+
+impl Stream {
+    /// Queues `item`, after any flush owed. A flush is never dropped: one
+    /// that doesn't fit is owed instead, so nothing that came after it can
+    /// overtake it.
+    fn try_send(&mut self, item: Item) -> Result<(), TrySendError<Item>> {
+        if matches!(item, Item::Flush) {
+            self.flush_owed = true;
+        }
+        if self.flush_owed {
+            self.tx.try_send(Item::Flush)?;
+            self.flush_owed = false;
+        }
+        match item {
+            Item::Flush => Ok(()),
+            item => self.tx.try_send(item),
+        }
+    }
+}
+
 impl Slot {
-    /// Passes `chunk` to the stream, or drops it when nobody is listening
-    /// or the listener is behind.
-    fn send(&self, target_id: &str, chunk: PcmChunk) {
+    /// Passes `item` to the stream, or drops it when nobody is listening
+    /// or, for audio, when the listener is behind.
+    fn send(&self, target_id: &str, item: Item) {
         let mut stream = lock(&self.stream);
-        let Some(tx) = stream.as_ref() else { return };
-        match tx.try_send(chunk) {
+        let Some(s) = stream.as_mut() else { return };
+        let flush = matches!(item, Item::Flush);
+        match s.try_send(item) {
             Ok(()) => self.overflowing.store(false, Ordering::Relaxed),
+            // An owed flush goes later.
+            Err(TrySendError::Full(_)) if flush => {}
             Err(TrySendError::Full(_)) => {
                 if !self.overflowing.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
@@ -105,6 +144,13 @@ impl Slot {
             Err(TrySendError::Closed(_)) => *stream = None,
         }
     }
+
+    /// `target_id`'s receiver, if it is running.
+    fn of(audio: &AirplayAudio, target_id: &str) -> Option<Arc<Slot>> {
+        lock(&audio.receivers)
+            .get(target_id)
+            .map(|r| r.slot.clone())
+    }
 }
 
 impl AirplayAudio {
@@ -112,12 +158,13 @@ impl AirplayAudio {
         Arc::default()
     }
 
-    /// `target_id`'s AirPlay audio from now on, in the session format.
-    /// `None` when its receiver isn't running. Ends any stream handed out
-    /// before for the same target.
-    pub fn source(&self, target_id: &str) -> Option<Result<Box<dyn LiveSource>, AudioError>> {
+    /// `target_id`'s AirPlay audio from now on, in the session format,
+    /// with each chunk's play time kept through the resampling. `None` when
+    /// its receiver isn't running. Ends any stream handed out before for
+    /// the same target.
+    pub fn source(&self, target_id: &str) -> Option<Result<Box<dyn TimedSource>, AudioError>> {
         let raw = self.subscribe(target_id)?;
-        Some(to_session_format(Box::new(raw)))
+        Some(timed_to_session_format(Box::new(raw)))
     }
 
     /// Ends `target_id`'s stream, once what was already read has been
@@ -135,12 +182,15 @@ impl AirplayAudio {
         lock(&self.receivers).contains_key(target_id)
     }
 
-    fn subscribe(&self, target_id: &str) -> Option<FifoSource> {
+    fn subscribe(&self, target_id: &str) -> Option<Received> {
         let receivers = lock(&self.receivers);
         let reader = receivers.get(target_id)?;
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
-        *lock(&reader.slot.stream) = Some(tx);
-        Some(FifoSource { chunks: rx })
+        *lock(&reader.slot.stream) = Some(Stream {
+            tx,
+            flush_owed: false,
+        });
+        Some(Received { items: rx })
     }
 }
 
@@ -178,15 +228,19 @@ impl ReceiverHandler for AirplayAudio {
         lock(&self.receivers).insert(id.clone(), Reader { slot, task });
     }
 
-    /// The play time is dropped here: [`LiveSource`] has no timestamps,
-    /// so the stream plays the audio as it arrives (taking it is
-    /// headway:tune-assistant/pact-jeans-tube).
-    fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, _play_at_us: Option<i64>) {
-        let slot = lock(&self.receivers)
-            .get(&receiver.target_id)
-            .map(|r| r.slot.clone());
-        if let Some(slot) = slot {
-            slot.send(&receiver.target_id, chunk.clone());
+    fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, play_at_us: Option<i64>) {
+        if let Some(slot) = Slot::of(self, &receiver.target_id) {
+            let item = Item::Chunk {
+                pcm: chunk.clone(),
+                play_at_us,
+            };
+            slot.send(&receiver.target_id, item);
+        }
+    }
+
+    fn flush(&self, receiver: &ReceiverInfo) {
+        if let Some(slot) = Slot::of(self, &receiver.target_id) {
+            slot.send(&receiver.target_id, Item::Flush);
         }
     }
 
@@ -223,33 +277,33 @@ async fn read(target_id: String, mut fifo: pipe::Receiver, slot: Arc<Slot>) {
         if whole > 0 && lock(&slot.stream).is_some() {
             let mut samples = Vec::with_capacity(whole / 2);
             pcm::s16le_to_f32(&buf[..whole], &mut samples);
-            slot.send(&target_id, PcmChunk::new(AIRPLAY_FORMAT, samples));
+            let item = Item::Chunk {
+                pcm: PcmChunk::new(AIRPLAY_FORMAT, samples),
+                play_at_us: None,
+            };
+            slot.send(&target_id, item);
         }
         buf.copy_within(whole..len, 0);
     }
 }
 
 /// One stream of a receiver's audio, as it was handed over.
-struct FifoSource {
-    chunks: mpsc::Receiver<PcmChunk>,
+struct Received {
+    items: mpsc::Receiver<Item>,
 }
 
 #[async_trait]
-impl LiveSource for FifoSource {
+impl TimedSource for Received {
     fn format(&self) -> AudioFormat {
         AIRPLAY_FORMAT
-    }
-
-    fn is_live(&self) -> bool {
-        true
     }
 
     fn kind(&self) -> &'static str {
         "airplay"
     }
 
-    async fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError> {
-        Ok(self.chunks.recv().await)
+    async fn next(&mut self) -> Result<Option<Item>, AudioError> {
+        Ok(self.items.recv().await)
     }
 }
 
@@ -294,7 +348,7 @@ mod tests {
                 .unwrap()
         }
 
-        fn raw(&self) -> FifoSource {
+        fn raw(&self) -> Received {
             self.audio.subscribe("ss-kitchen").unwrap()
         }
     }
@@ -303,26 +357,41 @@ mod tests {
         samples.iter().flat_map(|s| s.to_le_bytes()).collect()
     }
 
+    /// The next item, which must come within 5 s.
+    async fn next(source: &mut dyn TimedSource) -> Option<Item> {
+        tokio::time::timeout(Duration::from_secs(5), source.next())
+            .await
+            .expect("nothing came")
+            .unwrap()
+    }
+
+    /// The next chunk and its play time.
+    async fn chunk_of(source: &mut dyn TimedSource) -> (PcmChunk, Option<i64>) {
+        match next(source).await {
+            Some(Item::Chunk { pcm, play_at_us }) => {
+                assert_eq!(pcm.format, source.format());
+                assert_eq!(pcm.samples.len() % 2, 0, "a chunk split a frame");
+                (pcm, play_at_us)
+            }
+            other => panic!("expected audio, got {other:?}"),
+        }
+    }
+
     /// Pulls chunks until `want` samples have arrived.
-    async fn samples(source: &mut dyn LiveSource, want: usize) -> Vec<f32> {
+    async fn samples(source: &mut dyn TimedSource, want: usize) -> Vec<f32> {
         let mut out = Vec::new();
         while out.len() < want {
-            let chunk = tokio::time::timeout(Duration::from_secs(5), source.next_chunk())
-                .await
-                .expect("no audio")
-                .unwrap()
-                .expect("stream ended early");
-            assert_eq!(chunk.format, source.format());
-            assert_eq!(chunk.samples.len() % 2, 0, "a chunk split a frame");
-            out.extend(chunk.samples);
+            out.extend(chunk_of(source).await.0.samples);
         }
         out
     }
 
-    async fn ended(source: &mut dyn LiveSource) -> bool {
+    /// Whether the stream ends next: `None`, or the resampler's
+    /// [`Item::End`].
+    async fn ended(source: &mut dyn TimedSource) -> bool {
         matches!(
-            tokio::time::timeout(Duration::from_secs(5), source.next_chunk()).await,
-            Ok(Ok(None))
+            tokio::time::timeout(Duration::from_secs(5), source.next()).await,
+            Ok(Ok(None | Some(Item::End)))
         )
     }
 
@@ -449,12 +518,59 @@ mod tests {
         // Nobody listening yet: dropped.
         audio.audio(&info, &chunk(0.2), None);
         let mut source = audio.subscribe("ss-kitchen").unwrap();
-        audio.audio(&info, &chunk(0.3), Some(1));
-        assert_eq!(samples(&mut source, 704).await, vec![0.3; 704]);
+        audio.audio(&info, &chunk(0.3), Some(1_000));
+        audio.audio(&info, &chunk(0.4), None);
+        // Each with the play time it came with.
+        let (pcm, play_at_us) = chunk_of(&mut source).await;
+        assert_eq!((pcm.samples, play_at_us), (vec![0.3; 704], Some(1_000)));
+        let (pcm, play_at_us) = chunk_of(&mut source).await;
+        assert_eq!((pcm.samples, play_at_us), (vec![0.4; 704], None));
         assert!(audio.end_stream("ss-kitchen"));
         assert!(ended(&mut source).await);
         audio.stopped(&info);
         assert!(!audio.is_reading("ss-kitchen"));
+    }
+
+    /// A FLUSH is an item in line with the audio, between what came before
+    /// it and what came after.
+    #[tokio::test]
+    async fn a_flush_comes_in_line_with_the_audio() {
+        let info = ReceiverInfo::native("ss-kitchen", "Kitchen".into(), 7000, None);
+        let audio = AirplayAudio::new();
+        let chunk = |v: f32| PcmChunk::new(AIRPLAY_FORMAT, vec![v; 352 * 2]);
+        // Nobody listening: nothing to flush.
+        audio.started(&info);
+        audio.flush(&info);
+        let mut source = audio.subscribe("ss-kitchen").unwrap();
+        audio.audio(&info, &chunk(0.1), Some(1_000));
+        audio.flush(&info);
+        audio.audio(&info, &chunk(0.2), Some(9_000));
+        assert_eq!(chunk_of(&mut source).await.1, Some(1_000));
+        assert_eq!(next(&mut source).await, Some(Item::Flush));
+        assert_eq!(chunk_of(&mut source).await.1, Some(9_000));
+    }
+
+    /// A stream that has fallen behind loses audio, never a flush: one that
+    /// finds the queue full goes ahead of the next item that fits.
+    #[tokio::test]
+    async fn a_flush_is_never_dropped() {
+        let info = ReceiverInfo::native("ss-kitchen", "Kitchen".into(), 7000, None);
+        let audio = AirplayAudio::new();
+        let chunk = |v: f32| PcmChunk::new(AIRPLAY_FORMAT, vec![v; 4]);
+        audio.started(&info);
+        let mut source = audio.subscribe("ss-kitchen").unwrap();
+        for _ in 0..STREAM_QUEUE {
+            audio.audio(&info, &chunk(0.1), None);
+        }
+        audio.flush(&info);
+        // Still full: dropped, and the flush still owed.
+        audio.audio(&info, &chunk(0.2), None);
+        for _ in 0..STREAM_QUEUE {
+            assert_eq!(chunk_of(&mut source).await.0.samples, [0.1; 4]);
+        }
+        audio.audio(&info, &chunk(0.3), Some(5));
+        assert_eq!(next(&mut source).await, Some(Item::Flush));
+        assert_eq!(chunk_of(&mut source).await.1, Some(5));
     }
 
     #[tokio::test]
@@ -506,7 +622,7 @@ mod tests {
         let total_out = WRITES * WRITE_FRAMES * 48_000 / 44_100 - 1200;
         let mut arrivals = Vec::new();
         while out_frames < total_out {
-            let chunk = source.next_chunk().await.unwrap().unwrap();
+            let (chunk, _) = chunk_of(&mut *source).await;
             out_frames += chunk.frames();
             arrivals.push((out_frames, began.elapsed()));
         }
