@@ -248,3 +248,93 @@ impl Controller {
         self.request(method, uri, &[], Some((BPLIST, &bytes))).await
     }
 }
+
+/// A PTP grandmaster for tests, standing in for the phone's clock: it
+/// writes the Announce, Sync and Follow_Up messages [`super::ptp`]
+/// follows, and sends them to its ports.
+#[derive(Debug, Clone)]
+pub struct Grandmaster {
+    /// Its clock id: the timeline id a SETRATEANCHORTIME names.
+    pub clock: u64,
+    pub announce: super::ptp::Announce,
+    sequence: u16,
+}
+
+impl Grandmaster {
+    /// Clock `clock`, announcing itself as an iPhone does: priorities 248,
+    /// so a HomePod's 128 beats it.
+    pub fn new(clock: u64) -> Self {
+        Self {
+            clock,
+            announce: super::ptp::Announce {
+                priority1: 248,
+                class: 248,
+                accuracy: 0xfe,
+                variance: 0xffff,
+                priority2: 248,
+                grandmaster: clock,
+                steps_removed: 0,
+            },
+            sequence: 0,
+        }
+    }
+
+    fn message(&self, two_step: bool, body: super::ptp::Body) -> Vec<u8> {
+        super::ptp::Message {
+            source: super::ptp::PortIdentity {
+                clock: self.clock,
+                port: 1,
+            },
+            sequence: self.sequence,
+            domain: 0,
+            two_step,
+            correction_ns: 0,
+            body,
+        }
+        .to_bytes()
+    }
+
+    /// Its Announce, for the general port.
+    pub fn announce(&self) -> Vec<u8> {
+        self.message(false, super::ptp::Body::Announce(self.announce))
+    }
+
+    /// A two-step Sync that leaves at `sent_ns` on its clock: the Sync,
+    /// for the event port, and its Follow_Up, for the general port.
+    pub fn sync(&mut self, sent_ns: i128) -> (Vec<u8>, Vec<u8>) {
+        self.sequence = self.sequence.wrapping_add(1);
+        let at = super::ptp::Timestamp {
+            secs: (sent_ns / 1_000_000_000) as u64,
+            nanos: (sent_ns % 1_000_000_000) as u32,
+        };
+        // A two-step Sync's own timestamp is rough; here, a µs early.
+        let rough = super::ptp::Timestamp {
+            nanos: at.nanos.saturating_sub(1_000),
+            ..at
+        };
+        (
+            self.message(true, super::ptp::Body::Sync(rough)),
+            self.message(false, super::ptp::Body::FollowUp(at)),
+        )
+    }
+
+    /// Sends a Sync leaving at `sent_ns` and its Follow_Up from `socket`
+    /// to a follower's `event` and `general` ports, and an Announce first
+    /// when `announce`.
+    pub async fn send(
+        &mut self,
+        socket: &tokio::net::UdpSocket,
+        event: SocketAddr,
+        general: SocketAddr,
+        sent_ns: i128,
+        announce: bool,
+    ) -> io::Result<()> {
+        if announce {
+            socket.send_to(&self.announce(), general).await?;
+        }
+        let (sync, follow_up) = self.sync(sent_ns);
+        socket.send_to(&sync, event).await?;
+        socket.send_to(&follow_up, general).await?;
+        Ok(())
+    }
+}

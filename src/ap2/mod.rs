@@ -12,10 +12,12 @@
 //! - [`channel`]: those keys, and the ChaCha20-Poly1305 framing the
 //!   connection switches to after pairing.
 //! - [`fairplay`]: `/fp-setup`, answered with fixed bytes.
+//! - [`ptp`]: the process' one PTP follower, which puts each phone's
+//!   timeline on the server clock as a blastcast clock map.
 //!
 //! A sender's AirPlay 2 requests arrive on the AirPlay 1 receiver's
 //! connection: [`handles`] tells them apart and a [`Connection`] answers
-//! them, so the AirPlay 1 path is left as it is. PTP and buffered audio
+//! them, so the AirPlay 1 path is left as it is. SETUP and buffered audio
 //! come in later steps; until they do, a target only advertises AirPlay 2
 //! when [`NativeConfig::airplay2`](crate::raop::NativeConfig::airplay2)
 //! says so, since a phone that sees AirPlay 2 uses it and can't fall back.
@@ -30,6 +32,7 @@ pub mod fairplay;
 pub mod identity;
 pub mod info;
 pub mod pairing;
+pub mod ptp;
 pub mod srp;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

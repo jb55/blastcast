@@ -122,6 +122,10 @@ pub struct NativeConfig {
     /// AirPlay 2 can pair and play: a phone that sees it uses it rather
     /// than AirPlay 1. `GET /info` is answered either way.
     pub airplay2: bool,
+    /// The process' PTP follower, which AirPlay 2 SETUP follows a phone's
+    /// timing with ([`crate::ap2::ptp::Ptp::bind`]). Off by default, as in
+    /// tests, so buffered audio is refused.
+    pub ptp: crate::ap2::ptp::Ptp,
 }
 
 /// The UDP ports streams use by default: three a stream, so ten at once.
@@ -146,6 +150,7 @@ impl NativeConfig {
             sessions: Roster::default(),
             identity: crate::ap2::Identity::generate(),
             airplay2: false,
+            ptp: crate::ap2::ptp::Ptp::off(),
         }
     }
 }
