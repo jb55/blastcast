@@ -28,6 +28,10 @@
 //!   reports itself unavailable for a moment, which moves it out of its
 //!   group, stopped, the way a Sendspin speaker leaves when its output is
 //!   taken.
+//! - **What it reports**: the RAOP session's state on the speaker's entry
+//!   in the [`Roster`], and to the Sendspin server's telemetry, under the
+//!   player id, what the session reports and marks for each gap filled
+//!   with silence and each re-anchor.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -36,19 +40,21 @@ use std::time::Duration;
 
 use futures_channel::mpsc;
 use futures_util::StreamExt;
+use tas_proto::{Series, Speaker, SpeakerSession, SpeakerState};
 use tas_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, ConnectionReason, DeviceInfo,
     HeaderLayout, PlayerCommand, PlayerCommandKind, PlayerStateReport, PlayerSupport,
     PlayerSyncState, ServerMessage, StreamFormat, binary, roles,
 };
 use tas_sendspin::{Disconnect, Frame, SendspinServer};
+use tas_telemetry::{Probe, Roster};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 use crate::device::RaopDevice;
 use crate::rtp::NtpClock;
-use crate::session::{RaopSession, SAMPLE_RATE, SessionError, volume_db};
+use crate::session::{RaopSession, SAMPLE_RATE, SessionError, frames_us, volume_db};
 
 /// The audio the bridge asks to be kept queued. RAOP sends
 /// [`LATENCY_FRAMES`](crate::session::LATENCY_FRAMES) ahead.
@@ -128,12 +134,14 @@ pub fn hello(device: &RaopDevice) -> ClientHello {
 
 /// Runs the bridge for `device` until `stop` turns true or the server
 /// drops the connection, and returns how the connection ended. `volume`
-/// is where it starts and is kept up to date.
+/// is where it starts and is kept up to date. Its session goes on the
+/// device's entry in `speakers`, if it has one.
 pub async fn run(
     server: Arc<SendspinServer>,
     device: RaopDevice,
     ntp: NtpClock,
     volume: Arc<std::sync::Mutex<Volume>>,
+    speakers: Roster<Speaker>,
     mut stop: watch::Receiver<bool>,
 ) -> Disconnect {
     let (to_server, from_bridge) = mpsc::unbounded::<Result<Frame, Infallible>>();
@@ -154,6 +162,9 @@ pub async fn run(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut bridge = Bridge {
+        probe: server.config().telemetry.probe(&device.player_id),
+        speakers,
+        shown: None,
         device,
         ntp,
         to_server,
@@ -167,6 +178,7 @@ pub async fn run(
     bridge.report(PlayerSyncState::Synchronized);
     bridge.run(from_server, &mut stop).await;
     bridge.shut_down().await;
+    bridge.show();
     // Dropping the sender ends the server's read of us.
     drop(bridge);
     connection.await.unwrap_or_else(|e| {
@@ -195,6 +207,10 @@ enum Output {
 
 struct Bridge {
     device: RaopDevice,
+    probe: Probe,
+    speakers: Roster<Speaker>,
+    /// The session state on the speaker's entry.
+    shown: Option<SpeakerState>,
     ntp: NtpClock,
     to_server: mpsc::UnboundedSender<Result<Frame, Infallible>>,
     volume: Arc<std::sync::Mutex<Volume>>,
@@ -250,7 +266,29 @@ impl Bridge {
                     }
                 }
             }
+            self.show();
         }
+    }
+
+    /// Puts the session's state on the speaker's entry, if it changed.
+    fn show(&mut self) {
+        let (state, latency) = match &self.output {
+            Output::Idle => (None, None),
+            Output::Connecting { .. } => (Some(SpeakerState::Connecting), None),
+            Output::Playing(s) => (Some(SpeakerState::Playing), s.audio_latency()),
+            Output::Lingering(s, _) => (Some(SpeakerState::Lingering), s.audio_latency()),
+        };
+        if state == self.shown {
+            return;
+        }
+        self.shown = state;
+        let session = state.map(|state| SpeakerSession {
+            state,
+            since_us: self.ntp.server_clock().now_us(),
+            audio_latency_us: latency.map(|f| frames_us(i64::from(f)) as i64),
+        });
+        self.speakers
+            .modify(&self.device.player_id, |s| s.session = session);
     }
 
     async fn on_frame(&mut self, frame: Frame) {
@@ -430,7 +468,8 @@ impl Bridge {
                 let (addr, ntp) = (self.device.addr, self.ntp);
                 let db = volume_db(self.level.level, self.level.muted);
                 tracing::info!(addr = %addr, "connecting to the airplay speaker");
-                let task = tokio::spawn(RaopSession::connect(addr, ntp, db));
+                let probe = self.probe.clone();
+                let task = tokio::spawn(RaopSession::connect_with(addr, ntp, db, probe));
                 let mut held = VecDeque::new();
                 held.push_back((at_us, samples));
                 self.output = Output::Connecting { task, held };
@@ -542,12 +581,14 @@ async fn feed(session: &mut RaopSession, at_us: i64, samples: &[i16]) -> Result<
         session.push(samples).await
     } else if off > 0 && off <= MAX_FILL_FRAMES {
         tracing::debug!(frames = off, "filling a gap in the stream with silence");
+        session.mark(Series::Silence, frames_us(off));
         session.push(&vec![0; off as usize * 2]).await?;
         session.push(samples).await
     } else if off < 0 && -off < frames {
         session.push(&samples[(-off) as usize * 2..]).await
     } else {
         tracing::debug!(frames = off, "the stream jumped; re-anchoring");
+        session.mark(Series::Reanchor, frames_us(off));
         session.flush().await?;
         session.anchor(at_us).await?;
         session.push(samples).await

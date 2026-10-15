@@ -12,11 +12,13 @@ use tas_airplay_out::{AirplayOutputs, RaopDevice};
 use tas_audio::{SESSION_FORMAT, SineSource};
 use tas_core::player::PlaybackState;
 use tas_core::{PlayerCommand, PlayerRegistry};
+use tas_proto::{Series, SpeakerState};
 use tas_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, ConnectionReason, HeaderLayout,
     PlayerStateReport, PlayerSupport, PlayerSyncState, StreamFormat, binary, roles,
 };
 use tas_sendspin::{Frame, SendspinServer, ServerConfig};
+use tas_telemetry::{Point, Telemetry};
 
 const WAIT: Duration = Duration::from_secs(10);
 const AP: &str = "apa1b2c3d4e5f6";
@@ -26,11 +28,15 @@ struct Setup {
     server: Arc<SendspinServer>,
     outputs: Arc<AirplayOutputs>,
     speaker: FakeSpeaker,
+    hub: Telemetry,
 }
 
 async fn setup() -> Setup {
     let registry = Arc::new(PlayerRegistry::default());
-    let server = SendspinServer::new(ServerConfig::new("tas", "Tune Assistant"), registry.clone());
+    let mut config = ServerConfig::new("tas", "Tune Assistant");
+    config.telemetry = Telemetry::new();
+    let hub = config.telemetry.clone();
+    let server = SendspinServer::new(config, registry.clone());
     let outputs = AirplayOutputs::with_local_addrs(server.clone(), vec![]);
     let speaker = FakeSpeaker::start().await;
     outputs.add(device(speaker.addr()));
@@ -39,6 +45,7 @@ async fn setup() -> Setup {
         server,
         outputs,
         speaker,
+        hub,
     };
     s.eventually("the speaker is an available player", |s| {
         s.registry.get(AP).is_some_and(|p| p.available)
@@ -54,6 +61,25 @@ impl Setup {
             assert!(tokio::time::Instant::now() < deadline, "never: {what}");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// Every point of `series` on the airplay speaker.
+    fn points(&self, series: Series) -> Vec<Point> {
+        let now = self.server.config().clock.now_us();
+        self.hub
+            .subscribe(now)
+            .history
+            .into_iter()
+            .filter(|t| t.series == series && &*t.entity == AP)
+            .flat_map(|t| t.points)
+            .collect()
+    }
+
+    /// The airplay speaker's RAOP session state, as `/v1/ws` lists it.
+    fn session_state(&self) -> Option<SpeakerState> {
+        let all = self.outputs.roster().all();
+        let speaker = all.iter().find(|s| s.id == AP).expect("listed");
+        speaker.session.map(|s| s.state)
     }
 }
 
@@ -198,6 +224,31 @@ async fn plays_a_stream_and_lingers_after_it() {
         assert!(loud > 20_000, "it is the sine, not silence");
         assert!(!log.syncs.is_empty());
     }
+    // What the session reports: the speaker's latency, its anchor, and
+    // the packets it sends again when asked.
+    let latency = s.points(Series::AudioLatency);
+    assert_eq!(latency.len(), 1);
+    assert_eq!(latency[0].value, 250_000.0, "11 025 frames");
+    let anchors = s.points(Series::Anchor);
+    assert_eq!(anchors.len(), 1, "{anchors:?}");
+    let first = s.speaker.log().packets[0].header.seq;
+    s.speaker.ask_resend(first, 2).await;
+    s.eventually("the resend counted", |s| {
+        s.points(Series::Resent)
+            .last()
+            .is_some_and(|p| p.value == 2.0)
+    })
+    .await;
+    let roster = s.outputs.roster().all();
+    let session = roster[0].session.expect("a session");
+    assert_eq!(session.audio_latency_us, Some(250_000));
+    assert!(
+        matches!(
+            session.state,
+            SpeakerState::Playing | SpeakerState::Lingering
+        ),
+        "{session:?}"
+    );
     // A volume change while the session is open goes to the speaker.
     s.registry
         .execute(AP, PlayerCommand::VolumeSet(20))
@@ -216,6 +267,9 @@ async fn plays_a_stream_and_lingers_after_it() {
         .await;
     // It ran out rather than stopped, so there was nothing to flush.
     assert!(!s.speaker.log().methods().contains(&"FLUSH"));
+    assert!(s.points(Series::Flush).is_empty());
+    s.eventually("the session unlisted", |s| s.session_state().is_none())
+        .await;
 }
 
 #[tokio::test]
@@ -352,6 +406,14 @@ async fn a_stop_mid_stream_goes_quiet_at_once() {
     let stopped = tokio::time::Instant::now();
     s.registry.execute(AP, PlayerCommand::Stop).await.unwrap();
     s.goes_quiet(stopped).await;
+    // The flush is a mark, as the stream ends.
+    assert_eq!(s.points(Series::Flush).len(), 1);
+    let ended = s.points(Series::StreamEnd);
+    let flushed = s.points(Series::Flush)[0].t_us;
+    assert!(
+        ended.iter().any(|p| (flushed - p.t_us).abs() < 500_000),
+        "{ended:?} {flushed}"
+    );
 }
 
 #[tokio::test]

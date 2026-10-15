@@ -20,6 +20,10 @@
 //! as iTunes sends them, however early it was pushed. A Sendspin group
 //! hands the bridge seconds of audio at once when it starts, and a burst
 //! that size overruns a speaker's socket buffer.
+//!
+//! **What it reports**, to the [`Probe`] it is connected with: the
+//! speaker's `Audio-Latency`, each anchor and flush as a mark, and the
+//! packets sent again on the speaker's asking, as a running count.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
@@ -28,6 +32,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tas_audio::ServerClock;
+use tas_proto::Series;
+use tas_telemetry::Probe;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -95,6 +101,11 @@ impl Anchor {
     }
 }
 
+/// `frames` at the stream's rate, in µs.
+pub(crate) fn frames_us(frames: i64) -> f64 {
+    frames as f64 * 1e6 / f64::from(SAMPLE_RATE)
+}
+
 /// Whole frames in `us` microseconds, rounded down.
 fn frames_at(us: i64) -> i64 {
     (i128::from(us) * i128::from(SAMPLE_RATE)).div_euclid(1_000_000) as i64
@@ -106,6 +117,8 @@ struct Shared {
     /// The next sync packet is the stream's first.
     first_sync: bool,
     resend: VecDeque<(u16, Vec<u8>)>,
+    /// Packets sent again this session.
+    resent: u64,
 }
 
 pub struct RaopSession {
@@ -130,6 +143,7 @@ pub struct RaopSession {
     marker: bool,
     /// The speaker's own `Audio-Latency`, in frames, if it said.
     audio_latency: Option<u32>,
+    probe: Probe,
 }
 
 impl std::fmt::Debug for RaopSession {
@@ -149,6 +163,16 @@ impl RaopSession {
         addr: SocketAddr,
         ntp: NtpClock,
         volume: f32,
+    ) -> Result<Self, SessionError> {
+        Self::connect_with(addr, ntp, volume, Probe::default()).await
+    }
+
+    /// As [`RaopSession::connect`], reporting to `probe`.
+    pub async fn connect_with(
+        addr: SocketAddr,
+        ntp: NtpClock,
+        volume: f32,
+        probe: Probe,
     ) -> Result<Self, SessionError> {
         let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -232,12 +256,18 @@ impl RaopSession {
             )
             .await
             .map_err(auth)?;
-        let audio_latency = record.header("Audio-Latency").and_then(|v| v.parse().ok());
+        let audio_latency: Option<u32> =
+            record.header("Audio-Latency").and_then(|v| v.parse().ok());
+        if let Some(frames) = audio_latency {
+            let us = frames_us(i64::from(frames));
+            probe.sample(Series::AudioLatency, ntp.server_clock().now_us(), us);
+        }
 
         let shared = Arc::new(Mutex::new(Shared {
             anchor: None,
             first_sync: true,
             resend: VecDeque::with_capacity(RESEND_RING),
+            resent: 0,
         }));
         let control_to = SocketAddr::new(peer, control_port);
         let (outbox, queued) = mpsc::unbounded_channel();
@@ -257,6 +287,7 @@ impl RaopSession {
                 control_to,
                 ntp,
                 shared.clone(),
+                probe.clone(),
             )),
         ];
         let mut session = Self {
@@ -276,6 +307,7 @@ impl RaopSession {
             pending: Vec::with_capacity(FRAMES_PER_PACKET * 2),
             marker: true,
             audio_latency,
+            probe,
         };
         session.set_volume(volume).await?;
         tracing::debug!(
@@ -292,6 +324,17 @@ impl RaopSession {
     /// one.
     pub fn audio_latency(&self) -> Option<u32> {
         self.audio_latency
+    }
+
+    /// Packets sent again this session, on the speaker's asking.
+    pub fn resent(&self) -> u64 {
+        self.lock().resent
+    }
+
+    /// Marks `kind` on the speaker now.
+    pub fn mark(&self, kind: Series, detail: f64) {
+        self.probe
+            .mark(kind, self.ntp.server_clock().now_us(), detail);
     }
 
     /// The RTP time of the next frame pushed.
@@ -320,6 +363,7 @@ impl RaopSession {
             at_us,
         };
         self.lock().anchor = Some(anchor);
+        self.mark(Series::Anchor, at_us as f64);
         send_sync(&self.control, self.control_to, &self.ntp, &self.shared).await?;
         Ok(())
     }
@@ -386,6 +430,7 @@ impl RaopSession {
             shared.first_sync = true;
             shared.resend.clear();
         }
+        self.mark(Series::Flush, 0.0);
         self.marker = true;
         let info = format!("seq={};rtptime={rtp}", self.seq);
         self.rtsp
@@ -519,6 +564,7 @@ async fn run_control(
     control_to: SocketAddr,
     ntp: NtpClock,
     shared: Arc<Mutex<Shared>>,
+    probe: Probe,
 ) {
     let mut tick = tokio::time::interval(SYNC_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -538,16 +584,19 @@ async fn run_control(
                 let Some((seq, count)) = rtp::parse_resend_request(&buf[..n]) else {
                     continue;
                 };
-                let packets: Vec<Vec<u8>> = {
-                    let shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                    (0..count)
+                let (packets, resent): (Vec<Vec<u8>>, u64) = {
+                    let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    let packets: Vec<Vec<u8>> = (0..count)
                         .filter_map(|i| {
                             let want = seq.wrapping_add(i);
                             shared.resend.iter().find(|(s, _)| *s == want)
                         })
                         .map(|(_, p)| rtp::resend_reply(p))
-                        .collect()
+                        .collect();
+                    shared.resent += packets.len() as u64;
+                    (packets, shared.resent)
                 };
+                probe.sample(Series::Resent, ntp.server_clock().now_us(), resent as f64);
                 tracing::trace!(seq, count, found = packets.len(), "resend request");
                 // Answered on the control port, as libraop does.
                 for packet in packets {

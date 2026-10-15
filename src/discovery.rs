@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tas_mdns::{BrowseEvent, Discovered, Mdns};
+use tas_proto::Speaker;
 use tas_sendspin::SendspinServer;
+use tas_telemetry::Roster;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -45,6 +47,8 @@ pub struct AirplayOutputs {
     volumes: Mutex<BTreeMap<String, Arc<Mutex<Volume>>>>,
     /// Adverts already logged as unusable, so a rebrowse doesn't repeat it.
     skipped: Mutex<BTreeSet<String>>,
+    /// Every speaker with a bridge, for `/v1/ws`.
+    roster: Roster<Speaker>,
 }
 
 impl std::fmt::Debug for AirplayOutputs {
@@ -74,7 +78,13 @@ impl AirplayOutputs {
             running: Mutex::new(BTreeMap::new()),
             volumes: Mutex::new(BTreeMap::new()),
             skipped: Mutex::new(BTreeSet::new()),
+            roster: Roster::default(),
         })
+    }
+
+    /// Every speaker with a bridge running, and its RAOP session's state.
+    pub fn roster(&self) -> &Roster<Speaker> {
+        &self.roster
     }
 
     /// The NTP clock every bridge's sessions send: the server clock.
@@ -134,6 +144,13 @@ impl AirplayOutputs {
             model = device.model,
             "airplay speaker"
         );
+        self.roster.set(Speaker {
+            id: device.player_id.clone(),
+            name: device.name.clone(),
+            address: device.addr.to_string(),
+            model: device.model.clone(),
+            session: None,
+        });
         let (stop, stopped) = watch::channel(false);
         let volume = lock(&self.volumes)
             .entry(device.player_id.clone())
@@ -147,6 +164,7 @@ impl AirplayOutputs {
                 device.clone(),
                 self.ntp,
                 volume,
+                self.roster.clone(),
                 stopped,
             )
             .instrument(span),
@@ -159,6 +177,7 @@ impl AirplayOutputs {
         lock(&self.skipped).remove(fullname);
         if let Some(gone) = lock(&self.running).remove(fullname) {
             tracing::info!(name = gone.device.name, "airplay speaker gone");
+            self.roster.remove(&gone.device.player_id);
             let _ = gone.stop.send(true);
         }
     }
@@ -174,6 +193,7 @@ impl AirplayOutputs {
         for r in all {
             let _ = r.task.await;
         }
+        self.roster.retain(|_| false);
     }
 }
 
@@ -184,6 +204,7 @@ async fn keep_running(
     device: RaopDevice,
     ntp: NtpClock,
     volume: Arc<Mutex<Volume>>,
+    roster: Roster<Speaker>,
     mut stopped: watch::Receiver<bool>,
 ) {
     loop {
@@ -192,6 +213,7 @@ async fn keep_running(
             device.clone(),
             ntp,
             volume.clone(),
+            roster.clone(),
             stopped.clone(),
         )
         .await;
