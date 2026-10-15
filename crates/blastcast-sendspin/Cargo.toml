@@ -1,0 +1,49 @@
+[package]
+name = "blastcast-sendspin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+blastcast.workspace = true
+blastcast-audio.workspace = true
+blastcast-mdns.workspace = true
+blastcast-telemetry = { workspace = true, features = ["hub"] }
+aes-gcm.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chacha20poly1305.workspace = true
+crypto-bigint.workspace = true
+flacenc.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+image.workspace = true
+opus-pure.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+x25519-dalek.workspace = true
+
+[features]
+# `testing`: an in-memory speaker for other crates' tests.
+testing = []
+
+[dev-dependencies]
+# Its own `testing` module, for the integration tests.
+blastcast-sendspin = { workspace = true, features = ["testing"] }
+claxon.workspace = true
+futures-channel.workspace = true
+opus.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
