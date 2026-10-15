@@ -129,10 +129,6 @@ pub struct NativeConfig {
     /// timing with ([`crate::ap2::ptp::Ptp::bind`]). Off by default, as in
     /// tests, so buffered audio is refused.
     pub ptp: crate::ap2::ptp::Ptp,
-    /// Where AirPlay 2's decoded audio goes, each packet's with its RTP
-    /// time, until headway:tune-assistant/express-bone-jungle makes it a
-    /// timed source: a test's sink. Dropped when `None`.
-    pub ap2_audio: Option<tokio::sync::mpsc::Sender<crate::ap2::buffered::Decoded>>,
 }
 
 /// The UDP ports streams use by default: three a stream, so ten at once.
@@ -164,7 +160,6 @@ impl NativeConfig {
             identity: crate::ap2::Identity::generate(),
             airplay2: false,
             ptp: crate::ap2::ptp::Ptp::off(),
-            ap2_audio: None,
         }
     }
 }
@@ -488,6 +483,17 @@ impl Receiver {
                 me.event(MetadataEvent::PlayEnd);
             }
         }));
+    }
+}
+
+/// An AirPlay 2 stream hands its audio over as an AirPlay 1 stream does.
+impl crate::ap2::hold::Sink for Receiver {
+    fn audio(&self, chunk: &PcmChunk, play_at_us: Option<i64>) {
+        Receiver::audio(self, chunk, play_at_us);
+    }
+
+    fn flush(&self) {
+        Receiver::flush(self);
     }
 }
 

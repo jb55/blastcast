@@ -1,8 +1,8 @@
 //! A sender for tests, standing in for a phone's AirPlay 2 controller: it
 //! connects, reads `/info`, pairs (transient pair-setup or pair-verify),
 //! runs `/fp-setup`, sends any request to any URI, encrypted once paired,
-//! runs SETUP's two phases, opens the event channel, and streams buffered
-//! audio on the data channel. Built with the `testing` feature for other
+//! runs SETUP's two phases, opens the event channel, streams buffered
+//! audio on the data channel, and anchors and flushes it. Built with the `testing` feature for other
 //! crates' tests, such as an interop harness.
 
 use std::io;
@@ -305,6 +305,61 @@ impl Controller {
         );
         self.plist_request(
             "SETUP",
+            "rtsp://127.0.0.1/1",
+            &plist::Value::Dictionary(body),
+        )
+        .await
+    }
+
+    /// SETRATEANCHORTIME: `rate` (1 plays, 0 pauses), and when `anchor`
+    /// is given, frame `rtp` playing at `ns` on PTP timeline `timeline`:
+    /// `(timeline, rtp, ns)`.
+    pub async fn set_rate_anchor(
+        &mut self,
+        rate: u64,
+        anchor: Option<(u64, u32, i128)>,
+    ) -> io::Result<Response> {
+        let mut body = plist::Dictionary::new();
+        body.insert("rate".into(), plist::Value::from(rate));
+        if let Some((timeline, rtp, ns)) = anchor {
+            let (secs, frac) = super::hold::network_time(ns);
+            body.insert("networkTimeSecs".into(), plist::Value::from(secs));
+            body.insert("networkTimeFrac".into(), plist::Value::from(frac));
+            body.insert("networkTimeTimelineID".into(), plist::Value::from(timeline));
+            body.insert("networkTimeFlags".into(), plist::Value::from(0u64));
+            body.insert("rtpTime".into(), plist::Value::from(u64::from(rtp)));
+        }
+        self.plist_request(
+            "SETRATEANCHORTIME",
+            "rtsp://127.0.0.1/1",
+            &plist::Value::Dictionary(body),
+        )
+        .await
+    }
+
+    /// FLUSHBUFFERED: RTP times `from` (everything before, when `None`) up
+    /// to `until`, with the sequence numbers a phone sends beside them,
+    /// `(seq, rtp)` each.
+    pub async fn flush_buffered(
+        &mut self,
+        from: Option<(u32, u32)>,
+        until: (u32, u32),
+    ) -> io::Result<Response> {
+        let mut body = plist::Dictionary::new();
+        if let Some((seq, ts)) = from {
+            body.insert("flushFromSeq".into(), plist::Value::from(u64::from(seq)));
+            body.insert("flushFromTS".into(), plist::Value::from(u64::from(ts)));
+        }
+        body.insert(
+            "flushUntilSeq".into(),
+            plist::Value::from(u64::from(until.0)),
+        );
+        body.insert(
+            "flushUntilTS".into(),
+            plist::Value::from(u64::from(until.1)),
+        );
+        self.plist_request(
+            "FLUSHBUFFERED",
             "rtsp://127.0.0.1/1",
             &plist::Value::Dictionary(body),
         )

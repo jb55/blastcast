@@ -17,12 +17,14 @@
 //! - [`setup`]: SETUP's two phases, timing then streams, and the session
 //!   they leave: the PTP peers followed, the [`events`] channel, and the
 //!   [`buffered`] audio's data channel, decrypted and decoded.
+//! - [`hold`]: that audio held by when it plays, and handed to the
+//!   receiver as it falls due, as SETRATEANCHORTIME and FLUSHBUFFERED say.
 //!
 //! A sender's AirPlay 2 requests arrive on the AirPlay 1 receiver's
 //! connection: [`handles`] tells them apart and a [`Connection`] answers
-//! them, so the AirPlay 1 path is left as it is. Playing the decoded audio
-//! on its timeline comes in a later step; until it does, a target only
-//! advertises AirPlay 2 when
+//! them, so the AirPlay 1 path is left as it is. Until AirPlay 2's
+//! sessions, metadata and volume reach the router as AirPlay 1's do, a
+//! target only advertises AirPlay 2 when
 //! [`NativeConfig::airplay2`](crate::raop::NativeConfig::airplay2) says
 //! so, since a phone that sees AirPlay 2 uses it and can't fall back.
 //!
@@ -35,6 +37,7 @@ pub mod buffered;
 pub mod channel;
 pub mod events;
 pub mod fairplay;
+pub mod hold;
 pub mod identity;
 pub mod info;
 pub mod pairing;
@@ -176,12 +179,12 @@ impl Connection {
     }
 
     /// A TEARDOWN: of the stream, when `body` names `streams`, else of
-    /// everything SETUP set up.
-    pub fn teardown(&mut self, body: &[u8]) {
-        self.session.teardown(body);
+    /// everything SETUP set up. Returns whether it was everything.
+    pub fn teardown(&mut self, body: &[u8]) -> bool {
+        self.session.teardown(body)
     }
 
-    /// Answers an AirPlay 2 request to `device`, SETUP aside.
+    /// Answers an AirPlay 2 request to `device`, SETUP and TEARDOWN aside.
     pub fn answer(&mut self, device: &Device, req: &Request) -> Response {
         match (req.method.as_str(), req.uri.as_str()) {
             ("GET", "/info") => Response::ok().body(BPLIST, info::info_plist(device)),
@@ -205,10 +208,8 @@ impl Connection {
                 }
             },
             ("SETPEERS" | "SETPEERSX", _) => self.session.set_peers(&req.body),
-            ("TEARDOWN", _) => {
-                self.session.teardown(&req.body);
-                Response::ok()
-            }
+            ("SETRATEANCHORTIME", _) => self.session.command(&req.body, hold::Command::rate),
+            ("FLUSHBUFFERED", _) => self.session.command(&req.body, hold::Command::flush),
             (method, uri) => {
                 tracing::debug!(method, uri, "AirPlay 2 request not handled yet");
                 Response::new(501)

@@ -32,6 +32,7 @@ use tas_sendspin::testing::FakeSpeaker;
 struct Recorder {
     events: Mutex<Vec<MetadataEvent>>,
     samples: Mutex<Vec<f32>>,
+    flushes: Mutex<usize>,
     /// Each chunk's frame count and play time, and when it was handed
     /// over.
     stamps: Mutex<Vec<(usize, Option<i64>, Instant)>>,
@@ -48,6 +49,9 @@ impl ReceiverHandler for Recorder {
             .extend_from_slice(&chunk.samples);
         let stamp = (chunk.frames(), play_at_us, Instant::now());
         self.stamps.lock().unwrap().push(stamp);
+    }
+    fn flush(&self, _: &ReceiverInfo) {
+        *self.flushes.lock().unwrap() += 1;
     }
 }
 
@@ -93,8 +97,7 @@ impl Rig {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let recorder = Arc::new(Recorder::default());
-        let clock = ServerClock::new();
-        let mut config = NativeConfig::new("server", clock, None);
+        let mut config = NativeConfig::new("server", ServerClock::new(), None);
         config.latency = Duration::from_millis(100);
         config.end_after = Duration::from_millis(300);
         // Tests run side by side; any port will do.
@@ -102,6 +105,7 @@ impl Rig {
         config.tcp_ports = None;
         config.telemetry = Telemetry::new();
         configure(&mut config);
+        let clock = config.clock;
         let (hub, receivers, sessions) = (
             config.telemetry.clone(),
             config.receivers.clone(),
@@ -949,22 +953,87 @@ async fn an_airplay_2_sender_pairs_and_talks_encrypted() {
     rig.shutdown().await;
 }
 
-/// A receiver that can play AirPlay 2 audio: a PTP follower on loopback,
-/// and the decoded audio on a channel.
-async fn ap2_rig() -> (
-    Rig,
-    tokio::sync::mpsc::Receiver<crate::ap2::buffered::Decoded>,
-) {
-    let any = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
-    let ptp =
-        crate::ap2::ptp::Ptp::bind_to(ServerClock::new(), Telemetry::default(), any, any).await;
-    let (audio, decoded) = tokio::sync::mpsc::channel(64);
-    let rig = Rig::start_configured(Vec::new(), move |config| {
-        config.ptp = ptp;
-        config.ap2_audio = Some(audio);
-    })
-    .await;
-    (rig, decoded)
+/// The phone's PTP clock: its id, and how far ahead of the server clock
+/// it runs.
+const PHONE_CLOCK: u64 = 0x66aa_bbff_fecc_ddee;
+const PHONE_OFFSET_US: i64 = 123_456_789_000;
+
+/// A receiver that can play AirPlay 2 audio, its audio and events going to
+/// `handlers` as well as the recorder: a PTP follower on loopback, on the
+/// rig's clock, and the phone's grandmaster syncing it every 20 ms until
+/// [`Ap2::mapped`].
+struct Ap2 {
+    rig: Rig,
+    ptp: crate::ap2::ptp::Ptp,
+    grandmaster: JoinHandle<()>,
+}
+
+impl Ap2 {
+    async fn start(handlers: Vec<Arc<dyn ReceiverHandler>>) -> Self {
+        use crate::ap2::ptp::{Ptp, Status};
+        let any = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let clock = ServerClock::new();
+        let ptp = Ptp::bind_to(clock, Telemetry::default(), any, any).await;
+        let Status::Running { event, general } = *ptp.status() else {
+            panic!("{:?}", ptp.status())
+        };
+        let follower = ptp.clone();
+        let rig = Rig::start_configured(handlers, move |config| {
+            config.clock = clock;
+            config.ptp = follower;
+        })
+        .await;
+        let grandmaster = tokio::spawn(async move {
+            let socket = UdpSocket::bind(any).await.unwrap();
+            let mut gm = crate::ap2::testing::Grandmaster::new(PHONE_CLOCK);
+            loop {
+                let sent = i128::from(clock.now_us() + PHONE_OFFSET_US) * 1000;
+                gm.send(&socket, event, general, sent, true).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        Self {
+            rig,
+            ptp,
+            grandmaster,
+        }
+    }
+
+    /// The phone's clock map, once the follower has one; the grandmaster
+    /// stops there, so it stays put and stamps can be checked exactly.
+    async fn mapped(&self) -> blastcast::ClockMap {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(map) = self.ptp.map(PHONE_CLOCK) {
+                self.grandmaster.abort();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return self.ptp.map(PHONE_CLOCK).unwrap_or(map);
+            }
+            assert!(Instant::now() < deadline, "no PTP map");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn shutdown(self) {
+        self.grandmaster.abort();
+        self.rig.shutdown().await;
+    }
+}
+
+/// The phone's PTP time, in ns, of server time `at_us`.
+fn phone_ns(at_us: i64) -> i128 {
+    i128::from(at_us + PHONE_OFFSET_US) * 1000
+}
+
+/// When frame `frame` plays on the server clock, by an anchor putting
+/// frame `rtp` at server time `at_us` through `map`.
+fn anchored(map: &blastcast::ClockMap, rtp: u32, at_us: i64, frame: u32) -> i64 {
+    let anchor = blastcast::Anchor {
+        frame: u64::from(rtp),
+        remote_us: at_us + PHONE_OFFSET_US,
+        rate: 44_100,
+    };
+    anchor.play_at_us(u64::from(frame), map)
 }
 
 async fn paired(rig: &Rig) -> crate::ap2::testing::Controller {
@@ -973,15 +1042,6 @@ async fn paired(rig: &Rig) -> crate::ap2::testing::Controller {
         .unwrap();
     phone.pair_setup("3939").await.unwrap();
     phone
-}
-
-async fn decoded(
-    audio: &mut tokio::sync::mpsc::Receiver<crate::ap2::buffered::Decoded>,
-) -> crate::ap2::buffered::Decoded {
-    tokio::time::timeout(Duration::from_secs(5), audio.recv())
-        .await
-        .expect("decoded audio in time")
-        .expect("the channel is open")
 }
 
 /// The first stream's `key` in a phase 2 reply.
@@ -1040,19 +1100,22 @@ fn best_snr(got: &[f64], want: impl Fn(usize) -> f64) -> f64 {
 }
 
 /// SETUP in both phases, the event channel, and buffered audio in each
-/// codec: decrypted, decoded and handed on in order with its RTP time.
+/// codec: decrypted, decoded and handed on in order, once anchored,
+/// stamped where the anchor puts it.
 #[tokio::test]
 async fn an_airplay_2_sender_streams_alac_and_aac() {
     use crate::ap2::buffered::TYPE_BUFFERED;
     use crate::ap2::setup::AUDIO_BUFFER_SIZE;
     use crate::ap2::testing::{DataSender, reply_plist};
 
-    let (rig, mut audio) = ap2_rig().await;
-    let mut phone = paired(&rig).await;
+    let ap2 = Ap2::start(Vec::new()).await;
+    let rig = &ap2.rig;
+    let mut phone = paired(rig).await;
     let local: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
 
     let timing = phone.setup_timing(&[local]).await.unwrap();
     assert_eq!(timing.status, 200);
+    let map = ap2.mapped().await;
     let reply = reply_plist(&timing).unwrap();
     let event_port = reply["eventPort"].as_unsigned_integer().unwrap() as u16;
     assert_ne!(event_port, 0);
@@ -1091,17 +1154,39 @@ async fn an_airplay_2_sender_streams_alac_and_aac() {
     for samples in &sent {
         data.send(&alac_packet(samples), 352).await.unwrap();
     }
-    for (i, samples) in sent.iter().enumerate() {
-        let got = decoded(&mut audio).await;
-        assert_eq!((got.seq, got.rtp), (i as u32, 1000 + 352 * i as u32));
-        assert_eq!(&got.frames, samples, "packet {i}");
-    }
-    // RECORD is answered, as a phone sends it.
+    // Held until anchored.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(rig.recorder.samples().is_empty());
+    // RECORD is answered, as a phone sends it, and frame 1000 is anchored
+    // a second from now.
     let record = phone
         .request("RECORD", "rtsp://127.0.0.1/1", &[], None)
         .await
         .unwrap();
     assert_eq!(record.status, 200);
+    let t = rig.clock.now_us() + 1_000_000;
+    let rate = phone
+        .set_rate_anchor(1, Some((PHONE_CLOCK, 1000, phone_ns(t))))
+        .await
+        .unwrap();
+    assert_eq!(rate.status, 200);
+    let sent = sent.concat();
+    rig.until("the ALAC", |r| r.samples().len() >= sent.len())
+        .await;
+    assert_eq!(s16(&rig.recorder.samples()), sent, "lossless, in order");
+    // Each chunk stamped where the anchor puts its first frame, to the
+    // µs it rounds to, and handed over as soon as it was anchored: the
+    // whole second of lead.
+    let mut frame = 1000;
+    for (n, stamp, handed) in rig.recorder.stamps.lock().unwrap().clone() {
+        let want = anchored(&map, 1000, t, frame);
+        assert_eq!(stamp, Some(want), "frame {frame}");
+        let lead = want - rig.clock.us_at(handed);
+        assert!(lead > 900_000, "frame {frame}: handed over {lead} µs ahead");
+        frame += n as u32;
+    }
+    assert!((anchored(&map, 1000, t, 1000) - t).abs() < 5_000);
+    let alac = sent.len();
 
     // The stream torn down, and one of AAC-LC set up on the same session.
     let mut only_streams = plist::Dictionary::new();
@@ -1125,6 +1210,11 @@ async fn an_airplay_2_sender_streams_alac_and_aac() {
     let mut data = DataSender::connect(rig.addr, port, &shk, 50_000)
         .await
         .unwrap();
+    let t = rig.clock.now_us() + 1_000_000;
+    phone
+        .set_rate_anchor(1, Some((PHONE_CLOCK, 50_000, phone_ns(t))))
+        .await
+        .unwrap();
     // ffmpeg's 0.5 s of a 440 Hz sine on the left and 660 Hz on the
     // right, at 1/8 of full scale.
     let frames = adts_frames(include_bytes!("../../testdata/sine-440-660.aac"));
@@ -1132,20 +1222,17 @@ async fn an_airplay_2_sender_streams_alac_and_aac() {
     for frame in &frames {
         data.send(frame, 1024).await.unwrap();
     }
-    let mut pcm = Vec::new();
-    for i in 0..frames.len() {
-        let got = decoded(&mut audio).await;
-        assert_eq!(got.rtp, 50_000 + 1024 * i as u32);
-        assert_eq!(got.frames.len(), 2 * 1024);
-        pcm.extend(got.frames);
-    }
+    let want = alac + frames.len() * 2 * 1024;
+    rig.until("the AAC", |r| r.samples().len() >= want).await;
+    let pcm = rig.recorder.samples()[alac..].to_vec();
+    assert_eq!(pcm.len(), want - alac);
     // AAC is lossy: the source, within its tolerance.
     for (channel, hz) in [(0, 440.0), (1, 660.0)] {
         let got: Vec<f64> = pcm
             .iter()
             .skip(channel)
             .step_by(2)
-            .map(|&s| f64::from(s) / 32_768.0)
+            .map(|&s| f64::from(s))
             .collect();
         let want = |n: usize| 0.125 * (2.0 * std::f64::consts::PI * hz * n as f64 / 44_100.0).sin();
         let snr = best_snr(&got, want);
@@ -1153,7 +1240,7 @@ async fn an_airplay_2_sender_streams_alac_and_aac() {
     }
 
     drop((data, events, phone));
-    rig.shutdown().await;
+    ap2.shutdown().await;
 }
 
 /// What a test's log says, by every task on its thread.
@@ -1197,14 +1284,15 @@ async fn airplay_2_setup_refuses_what_it_cant_play() {
     use crate::ap2::testing::{Controller, DataSender};
 
     let (logs, _guard) = Logs::capture();
-    let (rig, mut audio) = ap2_rig().await;
+    let ap2 = Ap2::start(Vec::new()).await;
+    let rig = &ap2.rig;
     let local: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
     let shk = [0x5a; 32];
 
     // Not before pairing, and no stream before its timing.
     let mut stranger = Controller::connect(rig.addr).await.unwrap();
     assert_eq!(stranger.setup_timing(&[local]).await.unwrap().status, 455);
-    let mut phone = paired(&rig).await;
+    let mut phone = paired(rig).await;
     let early = phone
         .setup_stream(TYPE_BUFFERED, 2, &shk, 352)
         .await
@@ -1251,12 +1339,12 @@ async fn airplay_2_setup_refuses_what_it_cant_play() {
     let _ = tokio::time::timeout(Duration::from_secs(5), data.closed())
         .await
         .expect("the data channel closed");
-    assert!(audio.try_recv().is_err());
+    assert!(rig.recorder.samples().is_empty());
     assert!(logs.contains("wrong shk"));
     let options = phone.request("OPTIONS", "*", &[], None).await.unwrap();
     assert_eq!(options.status, 200);
     drop((stranger, phone));
-    rig.shutdown().await;
+    ap2.shutdown().await;
 
     // Without PTP, the timing phase is answered and its audio refused.
     let rig = Rig::start().await;
@@ -1270,4 +1358,119 @@ async fn airplay_2_setup_refuses_what_it_cant_play() {
     assert!(logs.contains("no PTP timing"));
     drop(phone);
     rig.shutdown().await;
+}
+
+/// Waits until the speaker is sent `stream/clear`, and drops what it was
+/// sent before it.
+async fn cleared(speaker: &mut FakeSpeaker) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut control = Vec::new();
+    while !control.contains(&"clear") {
+        assert!(Instant::now() < deadline, "no stream/clear: {control:?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        control.extend(speaker.control());
+    }
+    speaker.audio();
+}
+
+/// An AirPlay 2 phone's timeline reaches a Sendspin player: with 2 s of
+/// lead and the player's 250 ms send-ahead the stream adds no latency, and
+/// the audio plays where the anchor puts it. Rate 0 clears the player and
+/// nothing is sent while paused; rate 1 at the frame it paused on picks up
+/// at the new time, contiguous. FLUSHBUFFERED clears it too, and what
+/// follows the flush plays where the anchor puts it.
+#[tokio::test]
+async fn an_airplay_2_timeline_pause_and_flush_reach_a_sendspin_player() {
+    use crate::ap2::buffered::TYPE_BUFFERED;
+    use crate::ap2::testing::DataSender;
+
+    let audio = AirplayAudio::new();
+    let ap2 = Ap2::start(vec![audio.clone()]).await;
+    let rig = &ap2.rig;
+    audio.started(&ReceiverInfo::native(DEVICE, "Kitchen".into(), 7000, None));
+    let source = audio.source(DEVICE).unwrap().unwrap();
+    let stream = tas_sendspin::AudioStream::start(rig.clock, source).unwrap();
+    let mut speaker = FakeSpeaker::new(rig.clock, "kitchen");
+    stream.add_player(speaker.conn());
+
+    let mut phone = paired(rig).await;
+    let local: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+    assert_eq!(phone.setup_timing(&[local]).await.unwrap().status, 200);
+    let map = ap2.mapped().await;
+    let shk = [0x5a; 32];
+    let setup = phone
+        .setup_stream(TYPE_BUFFERED, 2, &shk, 352)
+        .await
+        .unwrap();
+    let port = stream_port(&setup, "dataPort");
+    let mut data = DataSender::connect(rig.addr, port, &shk, 0).await.unwrap();
+    // Eight seconds, sent at once, as a phone sends buffered audio.
+    for i in 0..1000 {
+        data.send(&alac_packet(&tone(352, i * 352)), 352)
+            .await
+            .unwrap();
+    }
+    let rate = |playing| if playing { 1 } else { 0 };
+
+    let t = rig.clock.now_us() + 2_000_000;
+    phone
+        .set_rate_anchor(rate(true), Some((PHONE_CLOCK, 0, phone_ns(t))))
+        .await
+        .unwrap();
+    let first = chunks(&mut speaker, 10).await;
+    let added_us = added_latency_us(&speaker, rig.clock.now_us());
+    assert_eq!(added_us, 0, "two seconds of lead need no more");
+    assert_placed(&first, anchored(&map, 0, t, 0));
+    assert_eq!(speaker.control(), ["start"]);
+
+    // Paused a third of a second in.
+    tokio::time::sleep_until(rig.clock.instant_at(t + 300_000)).await;
+    let paused_at = rig.clock.now_us();
+    let paused = ((paused_at - anchored(&map, 0, t, 0)) * 44_100 / 1_000_000) as u32;
+    phone
+        .set_rate_anchor(
+            rate(false),
+            Some((PHONE_CLOCK, paused, phone_ns(paused_at))),
+        )
+        .await
+        .unwrap();
+    cleared(&mut speaker).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(speaker.audio(), [], "sent while paused");
+
+    // Resumed where it paused, two seconds from now.
+    let t2 = rig.clock.now_us() + 2_000_000;
+    phone
+        .set_rate_anchor(rate(true), Some((PHONE_CLOCK, paused, phone_ns(t2))))
+        .await
+        .unwrap();
+    let second = chunks(&mut speaker, 10).await;
+    assert_eq!(added_latency_us(&speaker, rig.clock.now_us()), 0);
+    assert_placed(&second, anchored(&map, paused, t2, paused));
+
+    // Everything to two seconds past the pause flushed: the player is
+    // cleared, and the audio from there plays where the anchor puts it.
+    let until = paused + 88_200;
+    let flush = phone.flush_buffered(None, (0, until)).await.unwrap();
+    assert_eq!(flush.status, 200);
+    cleared(&mut speaker).await;
+    let third = chunks(&mut speaker, 10).await;
+    assert_eq!(added_latency_us(&speaker, rig.clock.now_us()), 0);
+    assert_placed(&third, anchored(&map, paused, t2, until));
+
+    // Each of it marked on the receiver.
+    let rates: Vec<f64> = rig.points(Series::Rate).iter().map(|p| p.value).collect();
+    assert_eq!(rates, [1.0, 0.0, 1.0]);
+    let flushed = rig.points(Series::Flushed);
+    assert_eq!(flushed.len(), 1);
+    assert!(flushed[0].value > 1_000_000.0, "{:?}", flushed[0]);
+    assert_eq!(rig.points(Series::Flush).len(), 2);
+    assert_eq!(*rig.recorder.flushes.lock().unwrap(), 2);
+    assert!(!rig.points(Series::Lead).is_empty());
+    assert!(!rig.points(Series::Buffered).is_empty());
+    assert_eq!(rig.points(Series::Sync).len(), 3);
+
+    drop((data, phone));
+    stream.stop().await;
+    ap2.shutdown().await;
 }

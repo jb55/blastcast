@@ -163,6 +163,7 @@ impl Connection {
         };
         let response = match req.method.as_str() {
             "SETUP" if ap2::handles(req) => self.ap2_setup(req).await,
+            "TEARDOWN" if ap2::handles(req) => self.ap2_teardown(req),
             _ if ap2::handles(req) => self.ap2.answer(&self.receiver.ap2, req),
             "OPTIONS" => Response::ok().header("Public", PUBLIC),
             "ANNOUNCE" => self.announce(req),
@@ -277,15 +278,28 @@ impl Connection {
             tcp_ports: config.tcp_ports.as_ref(),
             udp_ports: config.udp_ports.as_ref(),
             ptp: &config.ptp,
-            audio: config.ap2_audio.clone(),
+            sink: self.receiver.clone(),
+            probe: self.receiver.probe.clone(),
+            clock: config.clock,
         };
         self.ap2.setup(ctx, req).await
     }
 
+    /// AirPlay 2's TEARDOWN: of the stream, or of the session, which then
+    /// ends as AirPlay 1's does.
+    fn ap2_teardown(&mut self, req: &Request) -> Response {
+        if self.ap2.teardown(&req.body) {
+            self.receiver.release(self.id);
+        }
+        Response::ok()
+    }
+
     fn record(&mut self) -> Response {
         if self.ap2.session().stream().is_some() {
-            // AirPlay 2's RECORD starts nothing: its audio is already
-            // flowing, and SETRATEANCHORTIME says when it plays.
+            // AirPlay 2's RECORD starts the session and nothing else: its
+            // audio is already flowing, and SETRATEANCHORTIME says when it
+            // plays.
+            self.receiver.begin(self.id);
             return Response::ok();
         }
         let Some(stream) = &self.stream else {

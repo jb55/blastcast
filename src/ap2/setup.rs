@@ -18,6 +18,8 @@
 //!
 //! SETPEERS and SETPEERSX change the peers followed; TEARDOWN with
 //! `streams` ends the stream and without them the session.
+//! SETRATEANCHORTIME and FLUSHBUFFERED go to the stream's [`hold`], which
+//! hands its audio to the receiver as it falls due.
 //!
 //! Ported from `openairplay2` 0.5's session.rs (MIT, Copyright (c) 2026
 //! Stefan Arentz), with the stream checks from shairplay 0.10's
@@ -29,22 +31,31 @@
 use std::io;
 use std::net::IpAddr;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use plist::{Dictionary, Value};
+use tas_audio::ServerClock;
+use tas_telemetry::Probe;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use super::buffered::{self, AudioKey, Codec, Decoded, Decoder, TYPE_BUFFERED, TYPE_REALTIME};
+use super::hold::{self, Command, Sink};
 use super::ptp::{self, Follow, Ptp};
 use super::{BPLIST, Keys, events};
 use crate::raop::rtsp::{Request, Response};
 use crate::raop::{bind_tcp, bind_udp};
 
 /// What we let the sender push ahead, as openairplay2 and shairport-sync
-/// do: the most it may have sent and we not yet played.
+/// do: the most it may have sent and we not yet played. The [`hold`]
+/// keeps this many bytes of it decoded, at most.
 pub const AUDIO_BUFFER_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Decoded packets between the data channel and the hold: few, so a full
+/// hold stops the reading at once.
+const DECODED_QUEUE: usize = 16;
 
 /// What SETUP needs from the connection and the receiver.
 pub struct Context<'a> {
@@ -55,8 +66,11 @@ pub struct Context<'a> {
     pub tcp_ports: Option<&'a RangeInclusive<u16>>,
     pub udp_ports: Option<&'a RangeInclusive<u16>>,
     pub ptp: &'a Ptp,
-    /// Where the decoded audio goes; dropped when `None`.
-    pub audio: Option<mpsc::Sender<Decoded>>,
+    /// Where the audio goes as it falls due: the receiver.
+    pub sink: Arc<dyn Sink>,
+    /// The receiver's telemetry, timed on `clock`.
+    pub probe: Probe,
+    pub clock: ServerClock,
 }
 
 /// A connection's timing, from phase 1.
@@ -82,13 +96,15 @@ impl Drop for Task {
     }
 }
 
-/// A buffered stream: its data and control channels.
+/// A buffered stream: its data and control channels, and the hold its
+/// audio waits in.
 #[derive(Debug)]
 pub struct Stream {
     pub codec: Codec,
     pub data_port: u16,
     pub control_port: u16,
-    _tasks: [Task; 2],
+    hold: mpsc::UnboundedSender<Command>,
+    _tasks: [Task; 3],
 }
 
 /// What SETUP has set up on one connection.
@@ -266,6 +282,22 @@ impl Session {
         Ok(out)
     }
 
+    /// SETRATEANCHORTIME or FLUSHBUFFERED (`command` reads which from
+    /// `body`), for the stream's hold.
+    pub fn command(&self, body: &[u8], command: fn(&[u8]) -> Option<Command>) -> Response {
+        let Some(command) = command(body) else {
+            tracing::debug!(len = body.len(), "an AirPlay 2 request we can't read");
+            return Response::new(400);
+        };
+        match &self.stream {
+            Some(stream) => {
+                let _ = stream.hold.send(command);
+            }
+            None => tracing::debug!(?command, "AirPlay 2 request without a stream"),
+        }
+        Response::ok()
+    }
+
     /// SETPEERS or SETPEERSX: the peers PTP follows are these now.
     pub fn set_peers(&self, body: &[u8]) -> Response {
         let Ok(value) = Value::from_reader(io::Cursor::new(body)) else {
@@ -283,13 +315,14 @@ impl Session {
     }
 
     /// TEARDOWN: of the stream when `body` names `streams`, else of
-    /// everything SETUP set up.
-    pub fn teardown(&mut self, body: &[u8]) {
+    /// everything SETUP set up. Returns whether it was everything.
+    pub fn teardown(&mut self, body: &[u8]) -> bool {
         let streams_only = dictionary(body).is_some_and(|d| d.contains_key("streams"));
         self.stream = None;
         if !streams_only {
             *self = Self::default();
         }
+        !streams_only
     }
 }
 
@@ -317,9 +350,16 @@ impl Stream {
         let control = bind_udp(ctx.peer, ctx.udp_ports).await?;
         let data_port = data.local_addr()?.port();
         let control_port = control.local_addr()?.port();
-        let data = tokio::spawn(
-            read_data(data, ctx.peer, key, decoder, ctx.audio.clone()).in_current_span(),
-        );
+        let (decoded, held) = mpsc::channel(DECODED_QUEUE);
+        let (commands, received) = mpsc::unbounded_channel();
+        let out = hold::Out {
+            sink: ctx.sink.clone(),
+            ptp: ctx.ptp.clone(),
+            clock: ctx.clock,
+            probe: ctx.probe.clone(),
+        };
+        let hold = tokio::spawn(hold::run(held, received, out).in_current_span());
+        let data = tokio::spawn(read_data(data, ctx.peer, key, decoder, decoded).in_current_span());
         let control = tokio::spawn(
             async move {
                 // Nothing a buffered stream needs comes here; read it so it
@@ -335,7 +375,8 @@ impl Stream {
             codec,
             data_port,
             control_port,
-            _tasks: [Task(data), Task(control)],
+            hold: commands,
+            _tasks: [Task(data), Task(control), Task(hold)],
         })
     }
 }
@@ -346,7 +387,7 @@ async fn read_data(
     peer: IpAddr,
     key: AudioKey,
     mut decoder: Decoder,
-    out: Option<mpsc::Sender<Decoded>>,
+    out: mpsc::Sender<Decoded>,
 ) {
     loop {
         let (tcp, from) = match listener.accept().await {
@@ -361,7 +402,7 @@ async fn read_data(
             continue;
         }
         tracing::debug!("AirPlay 2 data channel open");
-        match buffered::receive(tcp, &key, &mut decoder, out.clone()).await {
+        match buffered::receive(tcp, &key, &mut decoder, Some(out.clone())).await {
             Ok(tally) => tracing::debug!(?tally, "AirPlay 2 data channel closed"),
             Err(e) => tracing::warn!(error = %e, "AirPlay 2 data channel ended"),
         }
