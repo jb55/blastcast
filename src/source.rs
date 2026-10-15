@@ -16,6 +16,13 @@ pub trait LiveSource: Send {
     /// The format of every chunk this source yields.
     fn format(&self) -> AudioFormat;
 
+    /// The format the audio arrived in, before any conversion: what a
+    /// [`format`](Self::format)-changing wrapper, such as a resampler, was
+    /// given. Only shown, as [`kind`](Self::kind) is.
+    fn source_format(&self) -> AudioFormat {
+        self.format()
+    }
+
     /// Whether audio arrives in real time. A live source gets no extra lead.
     fn is_live(&self) -> bool;
 
@@ -34,6 +41,10 @@ pub trait LiveSource: Send {
 impl<S: LiveSource + ?Sized> LiveSource for Box<S> {
     fn format(&self) -> AudioFormat {
         (**self).format()
+    }
+
+    fn source_format(&self) -> AudioFormat {
+        (**self).source_format()
     }
 
     fn is_live(&self) -> bool {
