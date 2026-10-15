@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use tas_mdns::{BrowseEvent, Discovered, Mdns};
+use blastcast_mdns::{BrowseEvent, Discovered, Mdns};
 use tas_proto::Speaker;
 use tas_sendspin::SendspinServer;
 use tas_telemetry::Roster;

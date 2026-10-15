@@ -13,7 +13,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use tas_mdns::browse::Discovered;
+use blastcast_mdns::browse::Discovered;
 
 /// The mDNS service type AirPlay 1 receivers advertise.
 pub const RAOP_SERVICE_TYPE: &str = "_raop._tcp.local.";
