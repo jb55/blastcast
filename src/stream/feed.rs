@@ -137,8 +137,12 @@ async fn read(
         })
     };
     loop {
+        let item = source.next().await;
+        // Read as of the item it came with: a source's audio can change
+        // hands, as a target's does from an AirPlay 1 phone to an AirPlay 2
+        // one, while the feed waits for it.
         let (live, trim_lead) = (source.is_live(), source.trim_lead());
-        match source.next().await {
+        match item {
             Ok(Some(Item::Chunk { pcm, play_at_us })) => {
                 anchor = match (play_at_us, anchor) {
                     (None, _) => None,
