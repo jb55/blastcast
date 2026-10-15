@@ -18,7 +18,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::Arc;
 
-use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
+use mdns_sd::{IfKind, IfPredicate, ServiceDaemon, ServiceInfo};
 
 pub use browse::{BrowseEvent, Browser, Discovered, SendspinClient};
 pub use service::{Service, TxtEntry};
@@ -278,9 +278,19 @@ fn resolve_interface(wanted: &str) -> Result<IfKind> {
         });
     }
     Ok(match wanted.parse::<IpAddr>() {
-        Ok(ip) => IfKind::Addr(ip),
+        Ok(ip) => IfKind::Predicate(IfPredicate::new(only(ip))),
         Err(_) => IfKind::Name(wanted.to_owned()),
     })
+}
+
+/// Matches the one address `ip`, not the interface it is on. mdns-sd's
+/// `IfKind::Addr` takes every address of `ip`'s interface: on a NIC with a
+/// LAN and a WAN address (monad's eno1 has 192.168.1.68 and 65.7.8.70) it
+/// would query from either, and the speakers drop queries from off their
+/// subnet, and it would publish both, and a phone handed the WAN one can't
+/// connect to a receiver.
+fn only(ip: IpAddr) -> impl Fn(&if_addrs::Interface) -> bool + Send + Sync + 'static {
+    move |i| i.ip() == ip
 }
 
 #[cfg(test)]
@@ -322,10 +332,37 @@ mod tests {
     }
 
     #[test]
-    fn loopback_resolves_by_address() {
+    fn an_address_pins_that_address_not_its_interface() {
         assert!(matches!(
             resolve_interface("127.0.0.1"),
-            Ok(IfKind::Addr(ip)) if ip.is_loopback()
+            Ok(IfKind::Predicate(_))
         ));
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let pinned = only(v4);
+        let lo = |ip: &str| if_addrs::Interface {
+            name: "lo".into(),
+            addr: match ip.parse().unwrap() {
+                IpAddr::V4(ip) => if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                    ip,
+                    netmask: Ipv4Addr::new(255, 0, 0, 0),
+                    prefixlen: 8,
+                    broadcast: None,
+                }),
+                IpAddr::V6(ip) => if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
+                    ip,
+                    netmask: std::net::Ipv6Addr::UNSPECIFIED,
+                    prefixlen: 128,
+                    broadcast: None,
+                }),
+            },
+            index: Some(1),
+            oper_status: if_addrs::IfOperStatus::Up,
+            is_p2p: false,
+        };
+        assert!(pinned(&lo("127.0.0.1")));
+        // Another address on the same interface, as 65.7.8.70 is beside
+        // 192.168.1.68 on monad's eno1.
+        assert!(!pinned(&lo("127.0.0.2")));
+        assert!(!pinned(&lo("::1")));
     }
 }
