@@ -17,5 +17,8 @@ pub use blastcast::{AudioError, clock, format, timeline};
 pub use clock::ServerClock;
 pub use format::{AudioFormat, PcmChunk, SESSION_FORMAT};
 pub use resample::StreamResampler;
-pub use source::{LiveSource, Resampled, SineSource, to_session_format};
+pub use source::{
+    IntoTimed, Item, LiveSource, Resampled, SineSource, TimedResampled, TimedSource, Untimed,
+    timed_to_session_format, to_session_format,
+};
 pub use timeline::{Span, Timeline};
