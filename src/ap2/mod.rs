@@ -7,23 +7,35 @@
 //!   device across restarts.
 //! - [`info`]: the `_airplay._tcp` advert and the `GET /info` binary
 //!   plist, which carry the same fields.
+//! - [`pairing`]: transient `/pair-setup` (SRP, [`srp`], in TLV8, [`tlv`])
+//!   and `/pair-verify`, which end in the connection's [`Keys`].
+//! - [`channel`]: those keys, and the ChaCha20-Poly1305 framing the
+//!   connection switches to after pairing.
+//! - [`fairplay`]: `/fp-setup`, answered with fixed bytes.
 //!
 //! A sender's AirPlay 2 requests arrive on the AirPlay 1 receiver's
-//! connection: [`handles`] tells them apart (`GET /info`, or a binary
-//! plist body) and [`answer`] answers them, so the AirPlay 1 path is left
-//! as it is. Pairing, the encrypted channel, PTP and buffered audio come
-//! in later steps; until pairing does, a target only advertises AirPlay 2
+//! connection: [`handles`] tells them apart and a [`Connection`] answers
+//! them, so the AirPlay 1 path is left as it is. PTP and buffered audio
+//! come in later steps; until they do, a target only advertises AirPlay 2
 //! when [`NativeConfig::airplay2`](crate::raop::NativeConfig::airplay2)
 //! says so, since a phone that sees AirPlay 2 uses it and can't fall back.
 //!
 //! Ported from `openairplay2` 0.5 (MIT, Copyright (c) 2026 Stefan Arentz):
 //! its info.rs (the TXT record and the /info plist) and receiver.rs (the
 //! features mask), with the bits checked against shairplay 0.10's
-//! features.rs.
+//! features.rs. Each module names what else it is ported from.
 
+pub mod channel;
+pub mod fairplay;
 pub mod identity;
 pub mod info;
+pub mod pairing;
+pub mod srp;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+pub mod tlv;
 
+pub use channel::Keys;
 pub use identity::{Device, Identity};
 
 use crate::raop::rtsp::{Request, Response};
@@ -89,23 +101,93 @@ const fn features(bits: &[(u32, &str)]) -> u64 {
     mask
 }
 
-/// Whether `req` is an AirPlay 2 request: `GET /info`, or one with a
-/// binary plist body. An AirPlay 1 sender sends neither.
+/// The `Content-Type` of a pairing body, both ways.
+pub const TLV8: &str = "application/octet-stream";
+
+/// Whether `req` is an AirPlay 2 request: `GET /info`, pairing,
+/// `/fp-setup`, or one with a binary plist body. An AirPlay 1 sender sends
+/// none of them, since its advert offers neither FairPlay (`et=3`) nor a
+/// pairing key.
 pub fn handles(req: &Request) -> bool {
     (req.method == "GET" && req.uri == "/info")
+        || (req.method == "POST"
+            && matches!(
+                req.uri.as_str(),
+                "/pair-setup" | "/pair-verify" | "/fp-setup"
+            ))
         || req
             .header("Content-Type")
             .is_some_and(|t| t.eq_ignore_ascii_case(BPLIST))
 }
 
-/// Answers an AirPlay 2 request to `device`.
-pub fn answer(device: &Device, req: &Request) -> Response {
-    match (req.method.as_str(), req.uri.as_str()) {
-        ("GET", "/info") => Response::ok().body(BPLIST, info::info_plist(device)),
-        (method, uri) => {
-            tracing::debug!(method, uri, "AirPlay 2 request not handled yet");
-            Response::new(501)
+/// One sender's connection, as far as AirPlay 2 goes: its pairing and,
+/// once paired, its keys.
+#[derive(Debug, Default)]
+pub struct Connection {
+    pairing: pairing::Pairing,
+    keys: Option<Keys>,
+    /// Paired by the last answer, so encrypted once it is sent.
+    paired: Option<Keys>,
+}
+
+impl Connection {
+    /// Whether pairing has finished, so the connection is encrypted.
+    pub fn is_paired(&self) -> bool {
+        self.keys.is_some()
+    }
+
+    /// The keys pairing agreed on, for the event channel.
+    pub fn keys(&self) -> Option<&Keys> {
+        self.keys.as_ref()
+    }
+
+    /// The keys to encrypt with from here on, once, when the answer just
+    /// sent finished pairing.
+    pub fn take_paired(&mut self) -> Option<Keys> {
+        let keys = self.paired.take()?;
+        self.keys = Some(keys.clone());
+        Some(keys)
+    }
+
+    /// Answers an AirPlay 2 request to `device`.
+    pub fn answer(&mut self, device: &Device, req: &Request) -> Response {
+        match (req.method.as_str(), req.uri.as_str()) {
+            ("GET", "/info") => Response::ok().body(BPLIST, info::info_plist(device)),
+            ("POST", "/pair-setup" | "/pair-verify") if self.is_paired() => {
+                tracing::debug!(uri = %req.uri, "pairing again on a paired AirPlay 2 connection");
+                Response::new(455)
+            }
+            ("POST", "/pair-setup") => {
+                let step = self.pairing.setup(&req.body);
+                self.pair(step)
+            }
+            ("POST", "/pair-verify") => {
+                let step = self.pairing.verify(device, &req.body);
+                self.pair(step)
+            }
+            ("POST", "/fp-setup") => match fairplay::reply(&req.body) {
+                Some(reply) => Response::ok().body(fairplay::CONTENT_TYPE, reply),
+                None => {
+                    tracing::debug!(len = req.body.len(), "an /fp-setup we don't know");
+                    Response::new(400)
+                }
+            },
+            (method, uri) => {
+                tracing::debug!(method, uri, "AirPlay 2 request not handled yet");
+                Response::new(501)
+            }
         }
+    }
+
+    fn pair(&mut self, step: pairing::Step) -> Response {
+        let reply = match step {
+            pairing::Step::Reply(reply) => reply,
+            pairing::Step::Paired(reply, keys) => {
+                self.paired = Some(keys);
+                reply
+            }
+        };
+        Response::ok().body(TLV8, reply)
     }
 }
 
@@ -135,7 +217,10 @@ mod tests {
     #[test]
     fn airplay_2_requests_are_told_apart() {
         assert!(handles(&request("GET", "/info", None)));
-        assert!(handles(&request("POST", "/pair-setup", Some(BPLIST))));
+        assert!(handles(&request("POST", "/pair-setup", Some(TLV8))));
+        assert!(handles(&request("POST", "/pair-verify", None)));
+        assert!(handles(&request("POST", "/fp-setup", Some(TLV8))));
+        assert!(handles(&request("SETUP", "rtsp://x/1", Some(BPLIST))));
         assert!(!handles(&request("OPTIONS", "*", None)));
         assert!(!handles(&request(
             "SET_PARAMETER",

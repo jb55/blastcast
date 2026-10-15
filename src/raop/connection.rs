@@ -3,6 +3,11 @@
 //! Requests are answered in order. Every answer carries the `CSeq` and,
 //! when the request had an `Apple-Challenge`, the `Apple-Response`.
 //!
+//! An AirPlay 2 sender's requests ([`ap2::handles`]) go to the
+//! connection's [`ap2::Connection`]. Once it has paired, the connection is
+//! encrypted both ways from the next request on, read through the same
+//! [`Request::read`].
+//!
 //! `SETUP` binds three UDP sockets and starts four tasks, which live as
 //! long as the stream:
 //!
@@ -31,7 +36,7 @@ use std::time::Duration;
 use tas_audio::PcmChunk;
 use tas_proto::Series;
 use tas_telemetry::Probe;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -45,6 +50,7 @@ use super::playout::{Inserted, Note, Played, Playout};
 use super::rtsp::{self, Request, Response};
 use super::{AIRTUNES_VERSION, Receiver, bind_udp, params, rtp};
 use crate::ap2;
+use crate::ap2::channel::{Role, SecureRead, SecureWrite, encrypt_reader};
 use crate::audio::AIRPLAY_FORMAT;
 use crate::metadata::MetadataEvent;
 
@@ -78,8 +84,9 @@ pub(crate) async fn run(receiver: Arc<Receiver>, id: u64, tcp: TcpStream, peer: 
             return;
         }
     };
-    let (read, mut write) = tcp.into_split();
-    let mut read = BufReader::new(read);
+    let (read, write) = tcp.into_split();
+    let mut read = BufReader::new(SecureRead::new(read));
+    let mut write = SecureWrite::new(write);
     let mut conn = Connection {
         receiver,
         id,
@@ -88,6 +95,7 @@ pub(crate) async fn run(receiver: Arc<Receiver>, id: u64, tcp: TcpStream, peer: 
         announce: None,
         stream: None,
         volume_db: None,
+        ap2: ap2::Connection::default(),
     };
     tracing::debug!("AirPlay sender connected");
     loop {
@@ -101,9 +109,15 @@ pub(crate) async fn run(receiver: Arc<Receiver>, id: u64, tcp: TcpStream, peer: 
         };
         tracing::trace!(method = %request.method, uri = %request.uri, "AirPlay request");
         let response = conn.answer(&request).await;
-        if let Err(e) = write.write_all(&response.to_bytes()).await {
+        if let Err(e) = write.send(&response.to_bytes()).await {
             tracing::debug!(error = %e, "AirPlay connection ended");
             break;
+        }
+        if let Some(keys) = conn.ap2.take_paired() {
+            let (sealer, opener) = keys.control(Role::Accessory);
+            encrypt_reader(&mut read, opener);
+            write.encrypt(sealer);
+            tracing::debug!("AirPlay 2 connection encrypted");
         }
     }
     tracing::debug!("AirPlay sender disconnected");
@@ -133,12 +147,20 @@ struct Connection {
     stream: Option<Stream>,
     /// The sender's last volume.
     volume_db: Option<f64>,
+    /// Its AirPlay 2 pairing.
+    ap2: ap2::Connection,
 }
 
 impl Connection {
     async fn answer(&mut self, req: &Request) -> Response {
+        // What /info says we are, to an AirPlay 2 sender.
+        let version = if ap2::handles(req) || self.ap2.is_paired() {
+            ap2::SOURCE_VERSION
+        } else {
+            AIRTUNES_VERSION
+        };
         let response = match req.method.as_str() {
-            _ if ap2::handles(req) => ap2::answer(&self.receiver.ap2, req),
+            _ if ap2::handles(req) => self.ap2.answer(&self.receiver.ap2, req),
             "OPTIONS" => Response::ok().header("Public", PUBLIC),
             "ANNOUNCE" => self.announce(req),
             "SETUP" => self.setup(req).await,
@@ -155,7 +177,7 @@ impl Connection {
             }
         };
         let mut response = response
-            .header("Server", format!("AirTunes/{AIRTUNES_VERSION}"))
+            .header("Server", format!("AirTunes/{version}"))
             .header("Audio-Jack-Status", "connected; type=analog");
         if let Some(cseq) = req.header("CSeq") {
             response = response.header("CSeq", cseq);

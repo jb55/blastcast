@@ -1,5 +1,7 @@
-//! RTSP as an AirPlay 1 sender speaks it to us: a request line, headers, a
-//! blank line and a `Content-Length` body, answered in kind.
+//! RTSP as an AirPlay sender speaks it to us: a request line, headers, a
+//! blank line and a `Content-Length` body, answered in kind. AirPlay 2's
+//! encrypted connection reads the same, through
+//! [`SecureRead`](crate::ap2::channel::SecureRead).
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
@@ -29,77 +31,104 @@ pub struct Request {
 impl Request {
     /// The first header named `name`, in any case.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        header(&self.headers, name)
     }
 
     /// Reads the next request, or `None` at a clean end of the stream.
     pub async fn read<R: AsyncBufRead + Unpin>(r: &mut R) -> Result<Option<Self>, RtspError> {
-        let mut line = String::new();
-        let mut read = 0;
-        // Skip blank lines between requests.
-        loop {
-            line.clear();
-            let n = r.read_line(&mut line).await?;
-            if n == 0 {
-                return Ok(None);
-            }
-            read += n;
-            if !line.trim().is_empty() {
-                break;
-            }
-            if read > MAX_HEADER_BYTES {
-                return Err(RtspError::TooLarge);
-            }
-        }
+        let Some(Message {
+            first: line,
+            headers,
+            body,
+        }) = read_message(r).await?
+        else {
+            return Ok(None);
+        };
         let mut parts = line.split_whitespace();
         let (Some(method), Some(uri)) = (parts.next(), parts.next()) else {
             return Err(RtspError::Malformed("request line"));
         };
-        let (method, uri) = (method.to_owned(), uri.to_owned());
-
-        let mut headers = Vec::new();
-        loop {
-            line.clear();
-            let n = r.read_line(&mut line).await?;
-            if n == 0 {
-                return Err(RtspError::Malformed("headers end early"));
-            }
-            read += n;
-            if read > MAX_HEADER_BYTES {
-                return Err(RtspError::TooLarge);
-            }
-            let text = line.trim_end_matches(['\r', '\n']);
-            if text.is_empty() {
-                break;
-            }
-            let Some((k, v)) = text.split_once(':') else {
-                return Err(RtspError::Malformed("header"));
-            };
-            headers.push((k.trim().to_owned(), v.trim().to_owned()));
-        }
-
-        let mut request = Self {
-            method,
-            uri,
+        Ok(Some(Self {
+            method: method.to_owned(),
+            uri: uri.to_owned(),
             headers,
-            body: Vec::new(),
-        };
-        let len: usize = match request.header("Content-Length") {
-            Some(v) => v
-                .parse()
-                .map_err(|_| RtspError::Malformed("Content-Length"))?,
-            None => 0,
-        };
-        if len > MAX_BODY_BYTES {
+            body,
+        }))
+    }
+}
+
+/// A request or response, before its first line is read.
+struct Message {
+    first: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// The next message, or `None` at a clean end of the stream.
+async fn read_message<R: AsyncBufRead + Unpin>(r: &mut R) -> Result<Option<Message>, RtspError> {
+    let mut line = String::new();
+    let mut read = 0;
+    // Skip blank lines between messages.
+    loop {
+        line.clear();
+        let n = r.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        read += n;
+        if !line.trim().is_empty() {
+            break;
+        }
+        if read > MAX_HEADER_BYTES {
             return Err(RtspError::TooLarge);
         }
-        request.body = vec![0; len];
-        r.read_exact(&mut request.body).await?;
-        Ok(Some(request))
     }
+    let first = line.trim_end().to_owned();
+
+    let mut headers = Vec::new();
+    loop {
+        line.clear();
+        let n = r.read_line(&mut line).await?;
+        if n == 0 {
+            return Err(RtspError::Malformed("headers end early"));
+        }
+        read += n;
+        if read > MAX_HEADER_BYTES {
+            return Err(RtspError::TooLarge);
+        }
+        let text = line.trim_end_matches(['\r', '\n']);
+        if text.is_empty() {
+            break;
+        }
+        let Some((k, v)) = text.split_once(':') else {
+            return Err(RtspError::Malformed("header"));
+        };
+        headers.push((k.trim().to_owned(), v.trim().to_owned()));
+    }
+
+    let len: usize = match header(&headers, "Content-Length") {
+        Some(v) => v
+            .parse()
+            .map_err(|_| RtspError::Malformed("Content-Length"))?,
+        None => 0,
+    };
+    if len > MAX_BODY_BYTES {
+        return Err(RtspError::TooLarge);
+    }
+    let mut body = vec![0; len];
+    r.read_exact(&mut body).await?;
+    Ok(Some(Message {
+        first,
+        headers,
+        body,
+    }))
+}
+
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,10 +162,30 @@ impl Response {
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        header(&self.headers, name)
+    }
+
+    /// Reads a response, as a sender does: its headers as they came,
+    /// `Content-Length` among them.
+    pub async fn read<R: AsyncBufRead + Unpin>(r: &mut R) -> Result<Option<Self>, RtspError> {
+        let Some(Message {
+            first: line,
+            headers,
+            body,
+        }) = read_message(r).await?
+        else {
+            return Ok(None);
+        };
+        let status = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or(RtspError::Malformed("status line"))?;
+        Ok(Some(Self {
+            status,
+            headers,
+            body,
+        }))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -215,6 +264,23 @@ SET_PARAMETER rtsp://10.0.0.2/1 RTSP/1.0\r\nCSeq: 2\r\ncontent-length: 18\r\n\r\
             String::from_utf8(r.to_bytes()).unwrap(),
             "RTSP/1.0 200 OK\r\nCSeq: 3\r\nContent-Type: text/parameters\r\n\
 Content-Length: 14\r\n\r\nvolume: -5.0\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_back_the_response_it_writes() {
+        let r = Response::new(404)
+            .header("CSeq", "9")
+            .body("a/b", b"xyz".to_vec());
+        let wire = r.to_bytes();
+        let back = Response::read(&mut BufReader::new(&wire[..]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((back.status, back.get("cseq")), (404, Some("9")));
+        assert_eq!(
+            (back.get("Content-Length"), &back.body[..]),
+            (Some("3"), &b"xyz"[..])
         );
     }
 
