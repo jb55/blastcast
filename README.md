@@ -13,9 +13,14 @@ It is a cargo workspace, one crate per directory under `crates/`:
 | crate | what it holds |
 |---|---|
 | `blastcast` | the timing core: the clock, clock maps, anchors, timed sources, the rate match and the timeline |
+| `blastcast-mdns` | one mDNS responder shared by every protocol: our adverts (any `Service`, with `_sendspin-server._tcp` and `_mass._tcp` built in) and browsing for players |
 
-The protocol crates (`blastcast-mdns`, `blastcast-audio`, `blastcast-sendspin`,
-`blastcast-airplay`, ...) are moving in beside it from tune-assistant-server.
+The other protocol crates (`blastcast-audio`, `blastcast-sendspin`,
+`blastcast-airplay`, ...) are moving in beside them from tune-assistant-server.
+
+`blastcast-mdns`'s `advertise_browse` test advertises and browses over the
+host's real interfaces, so `./scripts/check.sh` needs multicast on the
+machine running it.
 
 The `blastcast` crate's modules:
 
@@ -44,5 +49,6 @@ stream is the sink. It depends on these crates by path, as a sibling checkout
 ./scripts/check.sh   # fmt, clippy with warnings denied, tests, over the workspace
 ```
 
-The history before this repo existed is that of `crates/blastcast` in
-tune-assistant-server, carried over with `git subtree split`.
+The history before this repo existed is that of each crate's directory in
+tune-assistant-server (`crates/blastcast`, `crates/tas-mdns`), carried over
+with `git subtree split`.

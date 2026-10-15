@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use tas_mdns::{BrowseEvent, Mdns, MdnsConfig, Service, TxtEntry};
+use blastcast_mdns::{BrowseEvent, Mdns, MdnsConfig, Service, TxtEntry};
 
 const TEST_TYPE: &str = "_tas-test._tcp.local.";
 const WAIT: Duration = Duration::from_secs(10);
@@ -17,7 +17,10 @@ fn unique(label: &str) -> String {
     format!("{label}-{}-{nanos}", std::process::id())
 }
 
-async fn next_resolved(browser: &mut tas_mdns::Browser, fullname: &str) -> tas_mdns::Discovered {
+async fn next_resolved(
+    browser: &mut blastcast_mdns::Browser,
+    fullname: &str,
+) -> blastcast_mdns::Discovered {
     tokio::time::timeout(WAIT, async {
         loop {
             match browser.next().await.expect("browse ended") {

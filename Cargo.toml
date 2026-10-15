@@ -11,10 +11,15 @@ publish = false
 
 [workspace.dependencies]
 blastcast = { path = "crates/blastcast" }
+blastcast-mdns = { path = "crates/blastcast-mdns" }
 
 async-trait = "0.1"
+if-addrs = "0.15"
+mdns-sd = "0.21"
+serde_json = "1"
 thiserror = "2"
 tokio = "1"
+tracing = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
