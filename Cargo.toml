@@ -1,5 +1,5 @@
 [package]
-name = "tas-sendspin"
+name = "blastcast-sendspin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,6 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-tas-core.workspace = true
 blastcast.workspace = true
 blastcast-audio.workspace = true
 blastcast-mdns.workspace = true
@@ -39,10 +38,11 @@ x25519-dalek.workspace = true
 testing = []
 
 [dev-dependencies]
+# Its own `testing` module, for the integration tests.
+blastcast-sendspin = { workspace = true, features = ["testing"] }
 claxon.workspace = true
 futures-channel.workspace = true
 opus.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

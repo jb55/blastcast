@@ -1,21 +1,23 @@
 //! The Sendspin server against a websocket client on a real socket: the
-//! handshake, registration, the audio gate, client state and commands,
-//! goodbye and replacement.
+//! handshake, the host's players, the audio gate, client state and
+//! commands, goodbye and replacement.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use blastcast::{SESSION_FORMAT, ServerClock};
 use blastcast_audio::SineSource;
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
-use tas_core::{CommandError, PlayerCommand as Cmd, PlayerFeature, PlayerRegistry};
-use tas_sendspin::protocol::{
+use blastcast_sendspin::protocol::{
     ClientGoodbye, ClientHello, ClientMessage, ClientState, ClientTime, ConnectionReason,
     GoodbyeReason, PlaybackState, PlayerCommand, PlayerCommandKind, PlayerStateReport,
     PlayerSupport, PlayerSyncState, ServerCommand, ServerMessage,
 };
-use tas_sendspin::{Disconnect, Frame, PlayerTiming, SendError, SendspinServer, ServerConfig};
+use blastcast_sendspin::testing::RecordingHost;
+use blastcast_sendspin::{
+    CommandError, Disconnect, Frame, NoHost, PlayerTiming, SendError, SendspinServer, ServerConfig,
+};
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -26,22 +28,18 @@ const WAIT: Duration = Duration::from_secs(5);
 
 struct Harness {
     server: Arc<SendspinServer>,
-    registry: Arc<PlayerRegistry>,
+    host: Arc<RecordingHost>,
     url: String,
 }
 
 async fn start(config: ServerConfig) -> Harness {
-    let registry = Arc::new(PlayerRegistry::default());
-    let server = SendspinServer::new(config, registry.clone());
+    let host = RecordingHost::new();
+    let server = SendspinServer::new(config, host.clone());
     // Music Assistant may hold 8927 on the host running the tests.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/sendspin", listener.local_addr().unwrap());
     tokio::spawn(server.clone().serve(listener));
-    Harness {
-        server,
-        registry,
-        url,
-    }
+    Harness { server, host, url }
 }
 
 fn config() -> ServerConfig {
@@ -162,26 +160,22 @@ async fn hello_gets_server_hello_with_the_activated_roles() {
 }
 
 #[tokio::test]
-async fn a_player_is_registered_while_connected() {
+async fn a_player_is_the_hosts_while_connected() {
     let h = start(config()).await;
     let (mut ws, _) = handshake(&h.url, "kitchen", &["player@v1"]).await;
 
-    let player = h.registry.get("kitchen").expect("registered after hello");
-    assert_eq!(player.provider, "sendspin");
+    let player = h.host.get("kitchen").expect("the host's after hello");
     assert_eq!(player.name, "kitchen name");
-    assert!(!player.available, "unavailable until client/state");
+    assert!(!player.status.available, "unavailable until client/state");
 
     send(&mut ws, &synchronized()).await;
     eventually("available after client/state", || {
-        h.registry.get("kitchen").is_some_and(|p| p.available)
+        h.host.is_available("kitchen")
     })
     .await;
 
     ws.close(None).await.unwrap();
-    eventually("unregistered after close", || {
-        !h.registry.contains("kitchen")
-    })
-    .await;
+    eventually("unregistered after close", || !h.host.contains("kitchen")).await;
     assert!(h.server.connection("kitchen").is_none());
 }
 
@@ -194,7 +188,7 @@ async fn a_client_without_the_player_role_is_not_a_player() {
     };
     assert_eq!(hello.active_roles, ["controller@v1"]);
     assert!(h.server.connection("remote").is_some());
-    assert!(!h.registry.contains("remote"));
+    assert!(!h.host.contains("remote"));
 }
 
 #[tokio::test]
@@ -242,10 +236,7 @@ async fn unknown_and_malformed_messages_keep_the_connection() {
         .unwrap();
     ws.send(Message::text("not json")).await.unwrap();
     send(&mut ws, &synchronized()).await;
-    eventually("still served", || {
-        h.registry.get("kitchen").is_some_and(|p| p.available)
-    })
-    .await;
+    eventually("still served", || h.host.is_available("kitchen")).await;
 }
 
 #[tokio::test]
@@ -260,7 +251,7 @@ async fn goodbye_ends_the_connection() {
     )
     .await;
     assert!(closed(&mut ws).await, "the server closes after a goodbye");
-    eventually("unregistered", || !h.registry.contains("kitchen")).await;
+    eventually("unregistered", || !h.host.contains("kitchen")).await;
 }
 
 #[tokio::test]
@@ -274,13 +265,13 @@ async fn a_reconnect_replaces_the_old_connection() {
     assert!(old_conn.is_closed());
     // The old connection's cleanup must not take the new one's player.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(h.registry.contains("kitchen"));
+    assert!(h.host.contains("kitchen"));
     let conn = h.server.connection("kitchen").unwrap();
     assert!(!Arc::ptr_eq(&conn, &old_conn));
 
     send(&mut new, &synchronized()).await;
     eventually("the new connection drives the player", || {
-        h.registry.get("kitchen").is_some_and(|p| p.available)
+        h.host.is_available("kitchen")
     })
     .await;
 }
@@ -340,15 +331,15 @@ async fn pings_and_drops_a_silent_client() {
     assert!(matches!(ping, Some(Ok(Message::Ping(_)))), "{ping:?}");
 
     // A client that stops reading stops answering; it is dropped.
-    eventually("dropped", || !h.registry.contains("kitchen")).await;
+    eventually("dropped", || !h.host.contains("kitchen")).await;
 }
 
 /// `run_connection` over in-memory channels, as a dialer would call it,
 /// reports how the connection ended.
 #[tokio::test]
 async fn run_connection_reports_the_goodbye() {
-    let registry = Arc::new(PlayerRegistry::default());
-    let server = SendspinServer::new(config(), registry.clone());
+    let host = RecordingHost::new();
+    let server = SendspinServer::new(config(), host.clone());
     let (to_server, from_client) = futures_channel::mpsc::unbounded::<Result<Frame, String>>();
     let (to_client, mut from_server) = futures_channel::mpsc::unbounded::<Frame>();
 
@@ -398,7 +389,7 @@ async fn run_connection_reports_the_goodbye() {
     assert_eq!(goodbye, Some(GoodbyeReason::Shutdown));
     assert!(!replaced);
     assert!(!end.should_redial());
-    assert!(!registry.contains("dialed"));
+    assert!(!host.contains("dialed"));
     assert_eq!(from_server.next().await, Some(Frame::Close));
 }
 
@@ -406,7 +397,7 @@ async fn run_connection_reports_the_goodbye() {
 async fn a_silent_connection_is_refused() {
     let mut cfg = config();
     cfg.hello_timeout = Duration::from_millis(50);
-    let server = SendspinServer::new(cfg, Arc::new(PlayerRegistry::default()));
+    let server = SendspinServer::new(cfg, Arc::new(NoHost));
     let (_to_server, from_client) = futures_channel::mpsc::unbounded::<Result<Frame, String>>();
     let (to_client, _from_server) = futures_channel::mpsc::unbounded::<Frame>();
     let end = server
@@ -415,7 +406,7 @@ async fn a_silent_connection_is_refused() {
     assert!(
         matches!(
             end,
-            Disconnect::Refused(tas_sendspin::HandshakeError::Timeout(_))
+            Disconnect::Refused(blastcast_sendspin::HandshakeError::Timeout(_))
         ),
         "{end:?}"
     );
@@ -458,8 +449,8 @@ async fn expect_command(ws: &mut Client) -> PlayerCommand {
     }
 }
 
-/// Volume and mute reach the registry from the player's own reports, and
-/// a command changes nothing until the player echoes the new value.
+/// Volume and mute reach the host from the player's own reports, and a
+/// command changes nothing until the player echoes the new value.
 #[tokio::test]
 async fn volume_and_mute_follow_the_players_reports() {
     let h = start(config()).await;
@@ -473,69 +464,59 @@ async fn volume_and_mute_follow_the_players_reports() {
     )
     .await;
     read_hello(&mut ws).await;
-    let p = h.registry.get("kitchen").unwrap();
-    assert!(p.supports(PlayerFeature::VolumeSet) && p.supports(PlayerFeature::VolumeMute));
+    let status = h.host.get("kitchen").unwrap().status;
+    assert!(status.supports(PlayerCommandKind::Volume));
+    assert!(status.supports(PlayerCommandKind::Mute));
 
+    let volume_is = |level| {
+        let host = h.host.clone();
+        move || {
+            host.get("kitchen")
+                .is_some_and(|p| p.status.available && p.status.volume == Some(level))
+        }
+    };
     send(&mut ws, &state(true, volume(30, false))).await;
-    eventually("volume reported", || {
-        h.registry
-            .get("kitchen")
-            .is_some_and(|p| p.available && p.volume_level == Some(30))
-    })
-    .await;
-    assert_eq!(h.registry.get("kitchen").unwrap().volume_muted, Some(false));
+    eventually("volume reported", volume_is(30)).await;
+    assert_eq!(h.host.get("kitchen").unwrap().status.muted, Some(false));
 
-    h.registry
-        .execute("kitchen", Cmd::VolumeSet(55))
-        .await
-        .unwrap();
+    let player = h.server.player("kitchen").unwrap();
+    player.set_volume(55).unwrap();
     assert_eq!(expect_command(&mut ws).await, PlayerCommand::volume(55));
     assert_eq!(
-        h.registry.get("kitchen").unwrap().volume_level,
+        h.host.get("kitchen").unwrap().status.volume,
         Some(30),
         "unchanged until the player says so"
     );
     // The player settles on its own value; that is the truth.
     send(&mut ws, &state(true, volume(54, false))).await;
-    eventually("echo applied", || {
-        h.registry
-            .get("kitchen")
-            .is_some_and(|p| p.volume_level == Some(54))
-    })
-    .await;
+    eventually("echo applied", volume_is(54)).await;
 
-    h.registry
-        .execute("kitchen", Cmd::VolumeMute(true))
-        .await
-        .unwrap();
+    player.set_muted(true).unwrap();
     assert_eq!(expect_command(&mut ws).await, PlayerCommand::mute(true));
     send(&mut ws, &state(true, volume(54, true))).await;
     eventually("mute applied", || {
-        h.registry
+        h.host
             .get("kitchen")
-            .is_some_and(|p| p.volume_muted == Some(true) && p.volume_level == Some(54))
+            .is_some_and(|p| p.status.muted == Some(true) && p.status.volume == Some(54))
     })
     .await;
 }
 
 #[tokio::test]
-async fn a_player_without_volume_commands_has_no_volume_features() {
+async fn a_player_without_volume_commands_takes_none() {
     let h = start(config()).await;
     let (mut ws, _) = handshake(&h.url, "fixed", &["player@v1"]).await;
     send(&mut ws, &synchronized()).await;
-    eventually("available", || {
-        h.registry.get("fixed").is_some_and(|p| p.available)
-    })
-    .await;
-    let p = h.registry.get("fixed").unwrap();
-    assert!(!p.supports(PlayerFeature::VolumeSet));
-    assert_eq!(p.volume_level, Some(80), "still shown as reported");
-    assert_eq!(
-        h.registry.execute("fixed", Cmd::VolumeSet(10)).await,
+    eventually("available", || h.host.is_available("fixed")).await;
+    let status = h.host.get("fixed").unwrap().status;
+    assert!(!status.supports(PlayerCommandKind::Volume));
+    assert_eq!(status.volume, Some(80), "still reported");
+    assert!(matches!(
+        h.server.player("fixed").unwrap().set_volume(10),
         Err(CommandError::Unsupported {
             command: "volume_set"
         })
-    );
+    ));
 }
 
 /// The timing fields land on the connection for the streamer, and the
@@ -618,26 +599,20 @@ async fn timing_and_the_output_delay_command() {
         conn.player_status().state_commands.is_empty()
     })
     .await;
-    assert_eq!(
+    assert!(matches!(
         player.set_output_delay(25),
         Err(CommandError::Unsupported {
             command: "set_output_delay"
         })
-    );
+    ));
 }
 
-/// A saved static delay goes to the player once its first state lists the
-/// command, and not again when it already has it.
+/// The host's output delay goes to the player once its first state lists
+/// the command, and not again when it already has it.
 #[tokio::test]
-async fn a_saved_output_delay_is_sent_on_connect() {
+async fn the_hosts_output_delay_is_sent_on_connect() {
     let h = start(config()).await;
-    h.registry.configure(
-        "den",
-        tas_core::state::PlayerConfig {
-            output_delay_ms: 150,
-            ..Default::default()
-        },
-    );
+    h.host.set_output_delay("den", 150);
     let report = |ms| PlayerStateReport {
         output_delay_ms: Some(ms),
         supported_commands: Some(vec![PlayerCommandKind::SetOutputDelay]),
@@ -652,7 +627,7 @@ async fn a_saved_output_delay_is_sent_on_connect() {
         PlayerCommand::set_output_delay(150)
     );
     drop(ws);
-    eventually("unregistered", || !h.registry.contains("den")).await;
+    eventually("unregistered", || !h.host.contains("den")).await;
 
     // Reconnecting with it already set: nothing to send, so the next
     // message is the reply to a time request.
@@ -673,10 +648,10 @@ async fn a_saved_output_delay_is_sent_on_connect() {
     ));
 }
 
-/// A player whose output is taken stops getting audio and commands, and
-/// gets them again only once it says it is back.
+/// A player whose output is taken stops getting audio, and gets it again
+/// only once it says it is back.
 #[tokio::test]
-async fn an_unavailable_player_gets_no_audio_or_commands() {
+async fn an_unavailable_player_gets_no_audio() {
     let h = start(config()).await;
     let mut ws = connect(&h.url).await;
     send(
@@ -692,24 +667,17 @@ async fn an_unavailable_player_gets_no_audio_or_commands() {
     assert!(matches!(next(&mut ws).await, Some(Message::Binary(_))));
 
     send(&mut ws, &state(false, volume(50, false))).await;
-    eventually("unavailable in the registry", || {
-        h.registry.get("kitchen").is_some_and(|p| !p.available)
+    eventually("unavailable to the host", || {
+        h.host.get("kitchen").is_some_and(|p| !p.status.available)
     })
     .await;
     assert_eq!(
         conn.send_audio(Bytes::from_static(b"\x04chunk")),
         Err(SendError::Unavailable)
     );
-    assert_eq!(
-        h.registry.execute("kitchen", Cmd::VolumeSet(10)).await,
-        Err(CommandError::Unavailable("kitchen".into()))
-    );
 
     send(&mut ws, &state(true, volume(50, false))).await;
-    eventually("back", || {
-        h.registry.get("kitchen").is_some_and(|p| p.available)
-    })
-    .await;
+    eventually("back", || h.host.is_available("kitchen")).await;
     conn.send_audio(Bytes::from_static(b"\x04again")).unwrap();
     assert_eq!(
         next(&mut ws).await,

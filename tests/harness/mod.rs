@@ -18,13 +18,13 @@ use std::time::Duration;
 
 use base64::Engine;
 use blastcast::ServerClock;
-use futures_util::{SinkExt, StreamExt};
-use tas_sendspin::protocol::binary::AUDIO_CHUNK;
-use tas_sendspin::protocol::{
+use blastcast_sendspin::protocol::binary::AUDIO_CHUNK;
+use blastcast_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, ClientTime, Codec, HeaderLayout,
     PlaybackState, PlayerSupport, RequestFormatPlayer, ServerMessage, ServerTime, StreamFormat,
     StreamRequestFormat, StreamStartPlayer,
 };
+use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;

@@ -5,7 +5,7 @@
 //! A connection's first frame must be `client/hello`. The server answers
 //! `server/hello` with the roles it took, then reads until the client says
 //! `client/goodbye`, closes, or goes quiet for two ping intervals. A client
-//! with the player role is a player in the [`PlayerRegistry`] for as long as
+//! with the player role is a player of the server's [`Host`] for as long as
 //! it is connected; a second connection with the same `client_id` replaces
 //! the first. Every client is in one [`Groups`] group from its hello on.
 //! A controller's `client/command`, every status change and an artwork
@@ -33,31 +33,26 @@ use axum::routing::get;
 use blastcast::ServerClock;
 use blastcast_telemetry::Telemetry;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
-use tas_core::player::DeviceInfo;
-use tas_core::{PlayerFeature, PlayerRegistry, PlayerState};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tracing::Instrument;
 
 use crate::connection::{Connection, Frame, write_loop};
 use crate::group::Groups;
-use crate::membership::Membership;
+use crate::host::Host;
 use crate::player::SendspinPlayer;
 use crate::protocol::{
     ClientHello, ClientMessage, ClientState, ClientTime, ConnectionReason, DecodeError,
-    GoodbyeReason, HeaderLayout, PROTOCOL_VERSION, PlayerCommandKind, Role, ServerHello,
-    ServerMessage, ServerTime, roles,
+    GoodbyeReason, HeaderLayout, PROTOCOL_VERSION, Role, ServerHello, ServerMessage, ServerTime,
+    roles,
 };
 use crate::secure::link::Link;
 use crate::secure::session::{Outcome, Security};
 use crate::secure::trust::{MemoryTrust, Trust};
 use crate::stats::LastError;
-use crate::status::PlayerStatus;
 
 /// Where clients connect, as advertised in the mDNS TXT `path`.
 pub const PATH: &str = "/sendspin";
-/// The `provider` of every player this server registers.
-pub const PROVIDER: &str = "sendspin";
 /// The largest frame a client may send; hellos and states are small.
 pub(crate) const MAX_MESSAGE: usize = 1 << 20;
 /// The departed clients whose last error `/debug` keeps.
@@ -86,7 +81,7 @@ pub struct ServerConfig {
     /// one the audio pipeline paces with.
     pub clock: ServerClock,
     /// The identity, pairings and approvals of encrypted clients. In
-    /// memory unless the server is given the state file.
+    /// memory unless the app keeps them with a [`Trust`] of its own.
     pub trust: Arc<dyn Trust>,
     /// Whether to take the legacy plaintext v1 handshake as well as the
     /// encrypted one, as Music Assistant's `allow_legacy_clients` does.
@@ -187,10 +182,9 @@ impl Disconnect {
 /// Share it as `Arc<SendspinServer>`.
 pub struct SendspinServer {
     config: ServerConfig,
-    registry: Arc<PlayerRegistry>,
+    host: Arc<dyn Host>,
     connections: Mutex<HashMap<String, Arc<Connection>>>,
     groups: Groups,
-    membership: Arc<Membership>,
     /// Clients that disconnected, by `client_id`, for `/debug`.
     departed: Mutex<HashMap<String, Departed>>,
     /// Encrypted clients held at setup, by `client_id`.
@@ -229,16 +223,22 @@ impl fmt::Debug for SendspinServer {
 
 impl SendspinServer {
     /// Call it inside a Tokio runtime: the groups run on a task of their
-    /// own, and so does the mirror of their membership into the registry.
-    pub fn new(config: ServerConfig, registry: Arc<PlayerRegistry>) -> Arc<Self> {
+    /// own. `host` hears about the players; [`NoHost`] hears nothing.
+    ///
+    /// [`NoHost`]: crate::NoHost
+    pub fn new(config: ServerConfig, host: Arc<dyn Host>) -> Arc<Self> {
         let groups = Groups::with_telemetry(config.clock, config.telemetry.clone());
-        let membership = Membership::new(&groups, &registry);
-        tokio::spawn(membership.clone().run());
+        Self::with_groups(config, groups, host)
+    }
+
+    /// With groups made beforehand, for a host that follows them from the
+    /// start (a [`Groups::watch`] it takes before any client connects).
+    /// Make them with the config's clock and telemetry.
+    pub fn with_groups(config: ServerConfig, groups: Groups, host: Arc<dyn Host>) -> Arc<Self> {
         Arc::new(Self {
             groups,
-            membership,
             config,
-            registry,
+            host,
             connections: Mutex::new(HashMap::new()),
             departed: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
@@ -264,15 +264,14 @@ impl SendspinServer {
         axum::serve(listener, app).await
     }
 
-    /// The registry's control for `client_id`'s player, if it is connected
-    /// with the player role.
+    /// `client_id`'s player, if it is connected with the player role.
     pub fn player(&self, client_id: &str) -> Option<SendspinPlayer> {
         let conn = self.connection(client_id)?;
         conn.has_role("player").then(|| self.control(conn))
     }
 
     fn control(&self, conn: Arc<Connection>) -> SendspinPlayer {
-        SendspinPlayer::new(conn, self.groups.clone(), self.membership.clone())
+        SendspinPlayer::new(conn, self.groups.clone())
     }
 
     /// The live connection of `client_id`.
@@ -476,7 +475,7 @@ impl SendspinServer {
             }));
         }
         // Registered before the writer starts, so a client that has its
-        // server/hello is already in the registry.
+        // server/hello is already the host's player.
         self.register(&conn);
         let writer = {
             let conn = conn.clone();
@@ -696,9 +695,9 @@ impl SendspinServer {
         ControlFlow::Continue(())
     }
 
-    /// Merges a `client/state` into the connection's status and mirrors
-    /// it into the registry. The player's report is the truth: volume and
-    /// mute only change here, never when a command is sent.
+    /// Merges a `client/state` into the connection's status and tells the
+    /// host. The player's report is the truth: volume and mute only change
+    /// here, never when a command is sent.
     fn on_client_state(&self, conn: &Arc<Connection>, state: &ClientState) {
         let client_id = conn.client_id();
         let change = conn.apply_state(state);
@@ -718,19 +717,16 @@ impl SendspinServer {
             self.groups.refresh();
         }
         if change.changed && conn.has_role("player") && self.is_current(conn) {
-            let status = conn.player_status();
-            let _ = self
-                .registry
-                .update(client_id, |p| mirror_status(p, &status));
+            self.host.player_status(client_id, &conn.player_status());
         }
     }
 
-    /// Sends the player the static delay its saved config has, once its
+    /// Sends the player the static delay the host has for it, once its
     /// first `client/state` has said which commands it takes. A delay of 0
     /// leaves the player's own.
     fn apply_saved_delay(&self, conn: &Arc<Connection>) {
         let client_id = conn.client_id();
-        let Ok(ms) = u32::try_from(self.registry.config(client_id).output_delay_ms) else {
+        let Some(ms) = self.host.output_delay_ms(client_id) else {
             return;
         };
         if ms == 0 || ms == conn.player_status().timing.output_delay_ms {
@@ -748,7 +744,7 @@ impl SendspinServer {
     }
 
     /// Makes `conn` the connection of its client, closing and unregistering
-    /// any older one, and registers its player.
+    /// any older one, and hands its player to the host.
     fn register(&self, conn: &Arc<Connection>) {
         let client_id = conn.client_id();
         let mut connections = self.lock();
@@ -761,22 +757,10 @@ impl SendspinServer {
         if let Some(old) = old {
             tracing::info!(client_id, "new connection replaces the old one");
             old.close();
-            self.remove_player(client_id);
+            self.remove_player(&old);
         }
         if conn.has_role("player") {
-            // Unavailable until its first client/state says otherwise.
-            let mut state = PlayerState::new(client_id, PROVIDER, conn.name());
-            state.device_info = device_info(client_id, conn.hello().device_info.as_ref());
-            mirror_status(&mut state, &conn.player_status());
-            // Every Sendspin player can sync with every other.
-            state.supported_features.insert(PlayerFeature::SetMembers);
-            state.can_group_with.insert(PROVIDER.to_owned());
-            let control = Arc::new(self.control(conn.clone()));
-            if let Err(e) = self.registry.add(state, control) {
-                tracing::warn!(client_id, error = %e, "can't register the player");
-            }
-            // A reconnect keeps its place in a group.
-            self.membership.sync();
+            self.host.player_connected(self.control(conn.clone()));
         }
     }
 
@@ -793,7 +777,7 @@ impl SendspinServer {
         }
         connections.remove(client_id);
         drop(connections);
-        self.remove_player(client_id);
+        self.remove_player(conn);
         self.depart(conn);
         true
     }
@@ -825,15 +809,10 @@ impl SendspinServer {
         self.departed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Unregisters a player of ours. Another provider's player with the
-    /// same id is left alone.
-    fn remove_player(&self, player_id: &str) {
-        if self
-            .registry
-            .get(player_id)
-            .is_some_and(|p| p.provider == PROVIDER)
-        {
-            self.registry.remove(player_id);
+    /// Tells the host `conn`'s player is gone, if it had one.
+    fn remove_player(&self, conn: &Connection) {
+        if conn.has_role("player") {
+            self.host.player_gone(conn.client_id());
         }
     }
 
@@ -883,57 +862,6 @@ pub(crate) fn check_hello(mut hello: ClientHello) -> Result<ClientHello, Handsha
         hello.name = hello.client_id.clone();
     }
     Ok(hello)
-}
-
-/// Copies what a player reported into its registry state: availability,
-/// volume and mute, and the volume features its commands allow.
-fn mirror_status(p: &mut PlayerState, status: &PlayerStatus) {
-    p.available = status.available;
-    p.volume_level = status.volume;
-    p.volume_muted = status.muted;
-    for (command, feature) in [
-        (PlayerCommandKind::Volume, PlayerFeature::VolumeSet),
-        (PlayerCommandKind::Mute, PlayerFeature::VolumeMute),
-    ] {
-        if status.supports(command) {
-            p.supported_features.insert(feature);
-        } else {
-            p.supported_features.remove(&feature);
-        }
-    }
-}
-
-/// What the player said it is, as MA's Sendspin provider shows it, with
-/// its MAC address from `client/hello`, or its client id if that is one.
-fn device_info(client_id: &str, hello: Option<&crate::protocol::DeviceInfo>) -> DeviceInfo {
-    let mut info = DeviceInfo::default();
-    if let Some(hello) = hello {
-        if let Some(model) = &hello.product_name {
-            info.model = model.clone();
-        }
-        if let Some(manufacturer) = &hello.manufacturer {
-            info.manufacturer = manufacturer.clone();
-        }
-        info.software_version = hello.software_version.clone();
-    }
-    let mac = hello
-        .and_then(|h| h.mac_address.as_deref())
-        .or(Some(client_id))
-        .map(|m| m.to_uppercase().replace('-', ":"))
-        .filter(|m| is_mac(m));
-    if let Some(mac) = mac {
-        info.identifiers.insert("mac_address".into(), mac);
-    }
-    info
-}
-
-/// `AA:BB:CC:DD:EE:FF`.
-fn is_mac(s: &str) -> bool {
-    let parts: Vec<&str> = s.split(':').collect();
-    parts.len() == 6
-        && parts
-            .iter()
-            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Answers a `client/time`. The writer stamps `server_transmitted`.
@@ -986,7 +914,7 @@ mod tests {
     fn server(roles: &[&str]) -> Arc<SendspinServer> {
         let mut config = ServerConfig::new("srv", "Test");
         config.roles = roles.iter().map(|r| r.to_string()).collect();
-        SendspinServer::new(config, Arc::new(PlayerRegistry::default()))
+        SendspinServer::new(config, Arc::new(crate::NoHost))
     }
 
     fn strings(v: &[&str]) -> Vec<String> {
@@ -1028,27 +956,5 @@ mod tests {
         assert!(!ended(Some(GoodbyeReason::AnotherServer), false).should_redial());
         assert!(!ended(Some(GoodbyeReason::UserRequest), false).should_redial());
         assert!(!Disconnect::Refused(HandshakeError::NotHello).should_redial());
-    }
-
-    #[test]
-    fn device_info_is_what_the_player_said() {
-        let hello = crate::protocol::DeviceInfo {
-            product_name: Some("Kitchen Speaker".into()),
-            manufacturer: Some("Acme".into()),
-            software_version: Some("1.2".into()),
-            mac_address: Some("aa-bb-cc-dd-ee-ff".into()),
-        };
-        let info = device_info("kitchen", Some(&hello));
-        assert_eq!(info.model, "Kitchen Speaker");
-        assert_eq!(info.manufacturer, "Acme");
-        assert_eq!(info.software_version.as_deref(), Some("1.2"));
-        assert_eq!(info.identifiers["mac_address"], "AA:BB:CC:DD:EE:FF");
-
-        // Nothing said: MA's defaults, and the client id as the MAC only
-        // if it is one.
-        let info = device_info("kitchen", None);
-        assert_eq!(info, DeviceInfo::default());
-        let info = device_info("02:42:ac:11:00:02", None);
-        assert_eq!(info.identifiers["mac_address"], "02:42:AC:11:00:02");
     }
 }

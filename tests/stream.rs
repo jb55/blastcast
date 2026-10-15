@@ -8,14 +8,13 @@ use std::time::Duration;
 
 use blastcast::{SESSION_FORMAT, ServerClock};
 use blastcast_audio::SineSource;
-use futures_util::{SinkExt, StreamExt};
-use tas_core::PlayerRegistry;
-use tas_sendspin::protocol::{
+use blastcast_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, HeaderLayout, PlayerSupport,
     RequestFormatPlayer, ServerMessage, StreamFormat, StreamRequestFormat,
 };
-use tas_sendspin::stream::DEFAULT_SEND_AHEAD_US;
-use tas_sendspin::{AudioStream, SendspinServer, ServerConfig};
+use blastcast_sendspin::stream::DEFAULT_SEND_AHEAD_US;
+use blastcast_sendspin::{AudioStream, NoHost, SendspinServer, ServerConfig};
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -35,7 +34,7 @@ const PCM_48K_16: StreamFormat = StreamFormat {
 async fn start(clock: ServerClock) -> (Arc<SendspinServer>, String) {
     let mut config = ServerConfig::new("tas-server-id", "Tune Assistant");
     config.clock = clock;
-    let server = SendspinServer::new(config, Arc::new(PlayerRegistry::default()));
+    let server = SendspinServer::new(config, Arc::new(NoHost));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/sendspin", listener.local_addr().unwrap());
     tokio::spawn(server.clone().serve(listener));
@@ -117,7 +116,7 @@ async fn player_with(url: &str, supported_formats: Vec<StreamFormat>) -> Client 
     ws
 }
 
-async fn available(server: &SendspinServer) -> Arc<tas_sendspin::Connection> {
+async fn available(server: &SendspinServer) -> Arc<blastcast_sendspin::Connection> {
     loop {
         match server.connection("ear") {
             Some(conn) if conn.is_available() => break conn,

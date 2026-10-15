@@ -2,9 +2,9 @@
 //! support, merged with every `client/state` since.
 //!
 //! A [`Connection`](crate::Connection) holds one [`PlayerStatus`] in a
-//! watch channel. The server mirrors volume, mute and availability into the
-//! player registry; the streamer reads the timing fields to pick its
-//! send-ahead and subscribes to see them change.
+//! watch channel. The server tells its [`Host`](crate::Host) as it changes;
+//! the streamer reads the timing fields to pick its send-ahead and
+//! subscribes to see them change.
 
 use crate::protocol::{
     ClientHello, ClientState, MAX_OUTPUT_DELAY_MS, PlayerCommandKind, PlayerStateReport,

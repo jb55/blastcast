@@ -2,18 +2,14 @@
 //! key, the long-term PSK of each paired client, which clients the
 //! operator let play unpaired, and the pairings the operator asked for.
 //!
-//! [`Trust`] is implemented over the state file, so `tas sendspin pair`
-//! can ask for a pairing while the server runs, and by [`MemoryTrust`] for
-//! tests and servers with nowhere to keep it.
+//! An app keeps it wherever it keeps its state by implementing [`Trust`];
+//! [`MemoryTrust`] is for tests and servers with nowhere to keep it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use tas_core::state::{SendspinPairing, SendspinPairingRequest, StateStore};
-
-use super::keys::{Identity, PairingToken, b64url, b64url_array};
+use super::keys::{Identity, PairingToken, b64url};
 
 /// A pairing method, as `server/activate` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -244,144 +240,9 @@ impl Trust for MemoryTrust {
     }
 }
 
-/// Trust kept in the state file. Every read picks up a change another
-/// process (`tas sendspin pair`) made to it.
-impl Trust for StateStore {
-    fn identity(&self) -> Identity {
-        self.refresh();
-        let saved = self.read(|s| s.sendspin.identity.clone());
-        if let Some(identity) = saved.as_deref().and_then(Identity::from_b64url) {
-            return identity;
-        }
-        if saved.is_some() {
-            tracing::warn!("the sendspin identity in the state file is unusable; making a new one");
-        }
-        let identity = Identity::generate();
-        let text = identity.to_b64url();
-        match self.update(|s| s.sendspin.identity = Some(text)) {
-            Ok(()) => tracing::info!(server_id = identity.id(), "made a sendspin identity"),
-            Err(e) => tracing::error!(error = %e, "can't save the sendspin identity"),
-        }
-        identity
-    }
-
-    fn long_term_psk(&self, client_id: &str) -> Option<[u8; 32]> {
-        self.refresh();
-        self.read(|s| {
-            let pairing = s.sendspin.pairings.get(client_id)?;
-            b64url_array(&pairing.long_term_psk)
-        })
-    }
-
-    fn pair(&self, client_id: &str, psk: [u8; 32]) -> Result<(), TrustError> {
-        let paired_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        self.update(|s| {
-            s.sendspin.pairings.insert(
-                client_id.to_owned(),
-                SendspinPairing {
-                    long_term_psk: b64url(&psk),
-                    paired_at,
-                },
-            );
-            s.sendspin.approved.retain(|c| c != client_id);
-            s.sendspin.pairing_requests.remove(client_id);
-        })
-        .map_err(|e| TrustError::Save(e.to_string()))
-    }
-
-    fn unpair(&self, client_id: &str) -> Result<bool, TrustError> {
-        self.update(|s| s.sendspin.pairings.remove(client_id).is_some())
-            .map_err(|e| TrustError::Save(e.to_string()))
-    }
-
-    fn is_approved(&self, client_id: &str) -> bool {
-        self.refresh();
-        self.read(|s| s.sendspin.approved.iter().any(|c| c == client_id))
-    }
-
-    fn approve(&self, client_id: &str) -> Result<(), TrustError> {
-        self.update(|s| {
-            if !s.sendspin.approved.iter().any(|c| c == client_id) {
-                s.sendspin.approved.push(client_id.to_owned());
-            }
-        })
-        .map_err(|e| TrustError::Save(e.to_string()))
-    }
-
-    fn revoke(&self, client_id: &str) -> Result<bool, TrustError> {
-        self.update(|s| {
-            let before = s.sendspin.approved.len();
-            s.sendspin.approved.retain(|c| c != client_id);
-            s.sendspin.approved.len() != before
-        })
-        .map_err(|e| TrustError::Save(e.to_string()))
-    }
-
-    fn pairing_request(&self, client_id: &str) -> Option<PairingRequest> {
-        self.refresh();
-        let saved = self.read(|s| s.sendspin.pairing_requests.get(client_id).cloned())?;
-        let request = match PairMethod::from_name(&saved.method)? {
-            PairMethod::PairingPsk => PairingRequest::PairingPsk {
-                pairing_psk: PairingRequest::from_token(saved.secret.as_deref()?)
-                    .ok()
-                    .and_then(|(id, r)| (id == client_id).then_some(r))?
-                    .pairing_psk()?,
-            },
-            PairMethod::StaticCode => PairingRequest::StaticCode {
-                code: saved.secret?,
-            },
-            PairMethod::DynamicCode => PairingRequest::DynamicCode { code: saved.code },
-        };
-        Some(request)
-    }
-
-    fn request_pairing(&self, client_id: &str, request: PairingRequest) -> Result<(), TrustError> {
-        let saved = match &request {
-            PairingRequest::PairingPsk { pairing_psk } => {
-                let client_key = b64url_array(client_id).ok_or_else(|| {
-                    TrustError::Invalid(format!("{client_id} is not an encrypted client's id"))
-                })?;
-                let token = PairingToken::PairingPsk {
-                    client_key,
-                    pairing_psk: *pairing_psk,
-                };
-                SendspinPairingRequest {
-                    method: request.method().name().into(),
-                    secret: Some(token.encode()),
-                    code: None,
-                }
-            }
-            PairingRequest::StaticCode { code } => SendspinPairingRequest {
-                method: request.method().name().into(),
-                secret: Some(code.clone()),
-                code: None,
-            },
-            PairingRequest::DynamicCode { code } => SendspinPairingRequest {
-                method: request.method().name().into(),
-                secret: None,
-                code: code.clone(),
-            },
-        };
-        self.update(|s| {
-            s.sendspin
-                .pairing_requests
-                .insert(client_id.to_owned(), saved);
-        })
-        .map_err(|e| TrustError::Save(e.to_string()))
-    }
-
-    fn end_pairing_request(&self, client_id: &str) -> Result<(), TrustError> {
-        self.update(|s| {
-            s.sendspin.pairing_requests.remove(client_id);
-        })
-        .map_err(|e| TrustError::Save(e.to_string()))
-    }
-}
-
 impl PairingRequest {
-    fn pairing_psk(&self) -> Option<[u8; 32]> {
+    /// A version-0 token's pairing PSK.
+    pub fn pairing_psk(&self) -> Option<[u8; 32]> {
         match self {
             Self::PairingPsk { pairing_psk } => Some(*pairing_psk),
             _ => None,
@@ -393,91 +254,9 @@ impl PairingRequest {
 mod tests {
     use super::*;
 
-    fn check(trust: &dyn Trust) {
-        let id = trust.identity();
-        assert_eq!(trust.identity().id(), id.id(), "the identity is kept");
-
-        let client = Identity::generate().id();
-        assert!(trust.long_term_psk(&client).is_none());
-        trust.approve(&client).unwrap();
-        assert!(trust.is_approved(&client));
-
-        let token = PairingToken::PairingPsk {
-            client_key: b64url_array(&client).unwrap(),
-            pairing_psk: [4; 32],
-        }
-        .encode();
-        let (named, request) = PairingRequest::from_token(&token).unwrap();
-        assert_eq!(named, client);
-        trust.request_pairing(&client, request.clone()).unwrap();
-        assert_eq!(trust.pairing_request(&client), Some(request));
-
-        trust.pair(&client, [9; 32]).unwrap();
-        assert_eq!(trust.long_term_psk(&client), Some([9; 32]));
-        assert!(!trust.is_approved(&client), "pairing ends approval");
-        assert_eq!(trust.pairing_request(&client), None, "and the request");
-
-        trust
-            .request_pairing(&client, PairingRequest::DynamicCode { code: None })
-            .unwrap();
-        assert!(enter_code(trust, &client, "123-456").unwrap());
-        assert_eq!(
-            trust.pairing_request(&client),
-            Some(PairingRequest::DynamicCode {
-                code: Some("123456".into())
-            })
-        );
-        assert!(enter_code(trust, &client, "12345").is_err());
-        trust
-            .request_pairing(&client, PairingRequest::static_code("1234 5678").unwrap())
-            .unwrap();
-        assert!(!enter_code(trust, &client, "123456").unwrap());
-        assert_eq!(
-            trust.pairing_request(&client),
-            Some(PairingRequest::StaticCode {
-                code: "12345678".into()
-            })
-        );
-        trust.end_pairing_request(&client).unwrap();
-        assert_eq!(trust.pairing_request(&client), None);
-
-        assert!(trust.unpair(&client).unwrap());
-        assert!(!trust.unpair(&client).unwrap());
-        assert!(trust.long_term_psk(&client).is_none());
-    }
-
     #[test]
     fn memory_trust() {
-        check(&MemoryTrust::new());
-    }
-
-    #[test]
-    fn state_file_trust_survives_a_restart() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = StateStore::open(tmp.path()).unwrap();
-        check(&store);
-        let client = Identity::generate().id();
-        store.pair(&client, [3; 32]).unwrap();
-        let id = store.identity().id();
-
-        let reopened = StateStore::open(tmp.path()).unwrap();
-        assert_eq!(reopened.identity().id(), id);
-        assert_eq!(reopened.long_term_psk(&client), Some([3; 32]));
-    }
-
-    #[test]
-    fn another_process_can_ask_for_a_pairing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = StateStore::open(tmp.path()).unwrap();
-        let client = Identity::generate().id();
-        assert_eq!(server.pairing_request(&client), None);
-        let cli = StateStore::open(tmp.path()).unwrap();
-        cli.request_pairing(&client, PairingRequest::DynamicCode { code: None })
-            .unwrap();
-        assert_eq!(
-            server.pairing_request(&client),
-            Some(PairingRequest::DynamicCode { code: None })
-        );
+        crate::testing::check_trust(&MemoryTrust::new());
     }
 
     #[test]

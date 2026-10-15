@@ -9,11 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blastcast::ServerClock;
+use blastcast_sendspin::protocol::{ClientGoodbye, ClientMessage, Codec, GoodbyeReason};
+use blastcast_sendspin::{DebugReport, NoHost, SendspinServer, ServerConfig};
 use harness::noise::NoiseSource;
 use harness::{FakePlayer, Spec, format};
-use tas_core::PlayerRegistry;
-use tas_sendspin::protocol::{ClientGoodbye, ClientMessage, Codec, GoodbyeReason};
-use tas_sendspin::{DebugReport, SendspinServer, ServerConfig};
 use tokio::net::TcpListener;
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -39,7 +38,7 @@ async fn the_report_shows_sync_stream_and_departures() {
     config.clock = clock;
     // Often enough for a round trip to come back within the test.
     config.ping_interval = Duration::from_millis(50);
-    let server = SendspinServer::new(config, Arc::new(PlayerRegistry::default()));
+    let server = SendspinServer::new(config, Arc::new(NoHost));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/sendspin", listener.local_addr().unwrap());
     tokio::spawn(server.clone().serve(listener));

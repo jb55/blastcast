@@ -6,16 +6,15 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use image::{ImageFormat, Rgb, RgbImage};
-use tas_core::PlayerRegistry;
-use tas_sendspin::protocol::{
+use blastcast_sendspin::protocol::{
     ArtworkChannelSupport, ArtworkSupport, BinaryFrame, ClientCommand, ClientHello, ClientMessage,
     ClientState, ControllerCommand, ControllerState, HeaderLayout, MediaCommand, PlayerCommandKind,
     PlayerStateReport, PlayerSupport, Progress, RequestFormatArtwork, ServerMessage,
     StreamRequestFormat, binary,
 };
-use tas_sendspin::{SendspinServer, ServerConfig, TrackMetadata};
+use blastcast_sendspin::{NoHost, SendspinServer, ServerConfig, TrackMetadata};
+use futures_util::{SinkExt, StreamExt};
+use image::{ImageFormat, Rgb, RgbImage};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -135,10 +134,7 @@ impl Client {
 }
 
 async fn start() -> Arc<SendspinServer> {
-    SendspinServer::new(
-        ServerConfig::new("srv", "Test"),
-        Arc::new(PlayerRegistry::default()),
-    )
+    SendspinServer::new(ServerConfig::new("srv", "Test"), Arc::new(NoHost))
 }
 
 async fn serve(server: &Arc<SendspinServer>) -> String {

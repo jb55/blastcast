@@ -9,11 +9,11 @@
 //!
 //! Every text frame must decode, and encode back to the same bytes.
 
-use serde_json::Value;
-use tas_sendspin::protocol::{
+use blastcast_sendspin::protocol::{
     BinaryFrame, ClientMessage, Codec, ConnectionReason, DecodeError, HeaderLayout, MediaCommand,
     PlaybackState, PlayerCommand, ServerMessage, StreamFormat, binary,
 };
+use serde_json::Value;
 
 struct Record {
     dir: String,
@@ -274,28 +274,28 @@ fn unknown_values_and_bad_input() {
 
 #[test]
 fn player_command_constructors() {
-    let msg = ServerMessage::Command(tas_sendspin::protocol::ServerCommand {
+    let msg = ServerMessage::Command(blastcast_sendspin::protocol::ServerCommand {
         player: Some(PlayerCommand::volume(150)),
     });
     assert_eq!(
         msg.to_json(),
         r#"{"type":"server/command","payload":{"player":{"command":"volume","volume":100}}}"#
     );
-    let msg = ServerMessage::Command(tas_sendspin::protocol::ServerCommand {
+    let msg = ServerMessage::Command(blastcast_sendspin::protocol::ServerCommand {
         player: Some(PlayerCommand::mute(false)),
     });
     assert_eq!(
         msg.to_json(),
         r#"{"type":"server/command","payload":{"player":{"command":"mute","mute":false}}}"#
     );
-    let msg = ServerMessage::Command(tas_sendspin::protocol::ServerCommand {
+    let msg = ServerMessage::Command(blastcast_sendspin::protocol::ServerCommand {
         player: Some(PlayerCommand::set_output_delay(6000)),
     });
     assert_eq!(
         msg.to_json(),
         r#"{"type":"server/command","payload":{"player":{"command":"set_output_delay","output_delay_ms":5000}}}"#
     );
-    let msg = ServerMessage::Command(tas_sendspin::protocol::ServerCommand {
+    let msg = ServerMessage::Command(blastcast_sendspin::protocol::ServerCommand {
         player: Some(PlayerCommand::set_static_delay(30)),
     });
     assert_eq!(

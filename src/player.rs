@@ -1,30 +1,43 @@
-//! The registry's handle on a Sendspin player.
+//! A handle on a connected Sendspin player.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use blastcast::TimedSource;
 use bytes::Bytes;
-use tas_core::{CommandError, PlayerControl, SourceMetadata};
 
-use crate::connection::Connection;
+use crate::connection::{Connection, SendError};
 use crate::group::{GroupError, Groups, TrackMetadata};
-use crate::membership::Membership;
-use crate::protocol::{PlayerCommand, PlayerCommandKind, Progress, ServerCommand, ServerMessage};
+use crate::protocol::{PlayerCommand, PlayerCommandKind, ServerCommand, ServerMessage};
 
-/// What the [`tas_core::PlayerRegistry`] holds for a connected player:
-/// volume and mute go out on its connection as `server/command`, and
-/// grouping, stop and a live input (its audio, metadata and artwork) go to
-/// its [`Groups`], for the group it is in.
+/// Why a command to a player failed.
+#[derive(Debug, thiserror::Error)]
+pub enum CommandError {
+    /// The player didn't list the command, so it would ignore it.
+    #[error("{command} is not supported by this player")]
+    Unsupported { command: &'static str },
+    #[error(transparent)]
+    Group(#[from] GroupError),
+    #[error(transparent)]
+    Send(#[from] SendError),
+}
+
+/// A connected player, as [`Host::player_connected`] hands it over and
+/// [`SendspinServer::player`] finds it: volume, mute and the output delay
+/// go out on its connection as `server/command`, and stop, a live input
+/// (its audio, metadata and artwork) and grouping go to its [`Groups`],
+/// for the group it is in.
 ///
 /// A volume or mute command only asks. The player answers with a
-/// `client/state` carrying the value it settled on, and that is what the
-/// registry shows. Grouping is mirrored from the groups, once its moves
-/// are done.
+/// `client/state` carrying the value it settled on, which reaches
+/// [`Host::player_status`].
+///
+/// [`Host::player_connected`]: crate::Host::player_connected
+/// [`Host::player_status`]: crate::Host::player_status
+/// [`SendspinServer::player`]: crate::SendspinServer::player
+#[derive(Clone)]
 pub struct SendspinPlayer {
     conn: Arc<Connection>,
     groups: Groups,
-    membership: Arc<Membership>,
 }
 
 impl std::fmt::Debug for SendspinPlayer {
@@ -36,16 +49,16 @@ impl std::fmt::Debug for SendspinPlayer {
 }
 
 impl SendspinPlayer {
-    pub(crate) fn new(conn: Arc<Connection>, groups: Groups, membership: Arc<Membership>) -> Self {
-        Self {
-            conn,
-            groups,
-            membership,
-        }
+    pub(crate) fn new(conn: Arc<Connection>, groups: Groups) -> Self {
+        Self { conn, groups }
     }
 
     pub fn connection(&self) -> &Arc<Connection> {
         &self.conn
+    }
+
+    pub fn client_id(&self) -> &str {
+        self.conn.client_id()
     }
 
     /// Sets the player's output delay, 0-5000 ms, by whichever name the
@@ -63,6 +76,62 @@ impl SendspinPlayer {
             });
         };
         self.send(command)
+    }
+
+    /// Asks the player for a volume, 0-100.
+    pub fn set_volume(&self, level: u8) -> Result<(), CommandError> {
+        self.send_supported(PlayerCommand::volume(level.into()), "volume_set")
+    }
+
+    /// Asks the player to mute or unmute.
+    pub fn set_muted(&self, muted: bool) -> Result<(), CommandError> {
+        self.send_supported(PlayerCommand::mute(muted), "volume_mute")
+    }
+
+    /// Stops the group the player is in. For a member of a bigger group,
+    /// that is the whole group.
+    pub async fn stop(&self) -> Result<(), CommandError> {
+        let group_id = self.group_id()?;
+        Ok(self.groups.stop(&group_id).await?)
+    }
+
+    /// Plays `source` to the group the player is in: for a member of a
+    /// bigger group, the whole group.
+    pub async fn play(&self, source: Box<dyn TimedSource>) -> Result<(), CommandError> {
+        let group_id = self.group_id()?;
+        Ok(self.groups.play(&group_id, source).await?)
+    }
+
+    /// For the metadata clients in the player's group.
+    pub async fn set_metadata(&self, metadata: Option<TrackMetadata>) -> Result<(), CommandError> {
+        let group_id = self.group_id()?;
+        Ok(self.groups.set_metadata(&group_id, metadata).await?)
+    }
+
+    /// For the artwork clients in the player's group.
+    pub async fn set_artwork(&self, image: Option<Bytes>) -> Result<(), CommandError> {
+        let group_id = self.group_id()?;
+        Ok(self.groups.set_artwork(&group_id, image).await?)
+    }
+
+    /// Each of `remove` leaves this player's group for a stopped one of
+    /// its own, and each of `add` joins it, leaving its old group. When
+    /// this player leaves, the group, its stream and its timeline stay with
+    /// the rest, so they play on without a gap. Stops at the first move
+    /// that fails; the moves before it stand.
+    pub async fn set_members(&self, add: &[String], remove: &[String]) -> Result<(), CommandError> {
+        let group_id = self.group_id()?;
+        for id in remove {
+            // Only out of this group: the leader itself, last, hands the
+            // group on, and it plays on for the rest.
+            if self.groups.group_of(id).is_some_and(|g| g.id == group_id) {
+                self.groups.leave(id).await?;
+            }
+        }
+        for id in add {
+            self.groups.join(id, &group_id).await?;
+        }
+        Ok(())
     }
 
     /// Sends `command` if the player listed it; the spec has players ignore
@@ -83,158 +152,12 @@ impl SendspinPlayer {
         self.groups
             .group_of(client_id)
             .map(|g| g.id)
-            .ok_or_else(|| failed(GroupError::NoClient(client_id.into())))
-    }
-
-    async fn move_members(&self, add: &[String], remove: &[String]) -> Result<(), CommandError> {
-        let group_id = self.group_id()?;
-        for id in remove {
-            // Only out of this group: the leader itself, last, hands the
-            // group on, and it plays on for the rest.
-            if self.groups.group_of(id).is_some_and(|g| g.id == group_id) {
-                self.groups.leave(id).await.map_err(failed)?;
-            }
-        }
-        for id in add {
-            self.groups.join(id, &group_id).await.map_err(failed)?;
-        }
-        Ok(())
+            .ok_or_else(|| GroupError::NoClient(client_id.into()).into())
     }
 
     fn send(&self, command: PlayerCommand) -> Result<(), CommandError> {
-        self.conn
-            .send(ServerMessage::Command(ServerCommand {
-                player: Some(command),
-            }))
-            .map_err(|e| CommandError::Failed(e.to_string()))
-    }
-}
-
-#[async_trait]
-impl PlayerControl for SendspinPlayer {
-    async fn set_output_delay(&self, ms: u32) -> Result<(), CommandError> {
-        SendspinPlayer::set_output_delay(self, ms)
-    }
-
-    async fn volume_set(&self, level: u8) -> Result<(), CommandError> {
-        self.send_supported(PlayerCommand::volume(level.into()), "volume_set")
-    }
-
-    async fn volume_mute(&self, muted: bool) -> Result<(), CommandError> {
-        self.send_supported(PlayerCommand::mute(muted), "volume_mute")
-    }
-
-    /// Stops the group the player is in. For a follower that is its
-    /// leader's group, as MA sends a member's stop to its leader.
-    async fn stop(&self) -> Result<(), CommandError> {
-        let group_id = self.group_id()?;
-        self.groups.stop(&group_id).await.map_err(failed)?;
-        self.membership.sync();
-        Ok(())
-    }
-
-    /// Plays `source` to the group the player is in: for a follower, its
-    /// leader's whole group.
-    async fn play_source(&self, source: Box<dyn TimedSource>) -> Result<(), CommandError> {
-        let group_id = self.group_id()?;
-        self.groups.play(&group_id, source).await.map_err(failed)?;
-        self.membership.sync();
-        Ok(())
-    }
-
-    /// For the metadata clients in the player's group.
-    async fn set_source_metadata(
-        &self,
-        metadata: Option<SourceMetadata>,
-    ) -> Result<(), CommandError> {
-        let group_id = self.group_id()?;
-        self.groups
-            .set_metadata(&group_id, metadata.map(track_metadata))
-            .await
-            .map_err(failed)
-    }
-
-    /// For the artwork clients in the player's group.
-    async fn set_source_artwork(&self, image: Option<Arc<[u8]>>) -> Result<(), CommandError> {
-        let group_id = self.group_id()?;
-        self.groups
-            .set_artwork(&group_id, image.map(Bytes::from_owner))
-            .await
-            .map_err(failed)
-    }
-
-    /// Each removed member leaves this player's group for a stopped one of
-    /// its own, and each added one joins it, leaving its old group. When
-    /// this player leaves, the group, its stream and its timeline stay with
-    /// the rest, so they play on without a gap.
-    async fn set_members(&self, add: &[String], remove: &[String]) -> Result<(), CommandError> {
-        let moved = self.move_members(add, remove).await;
-        // Whatever got moved before a failure is mirrored too.
-        self.membership.sync();
-        moved
-    }
-}
-
-/// What a live input says is playing, as the metadata role sends it: the
-/// position as of now, frozen while paused, and 0 for a length it doesn't
-/// know.
-fn track_metadata(m: SourceMetadata) -> TrackMetadata {
-    let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-    TrackMetadata {
-        title: m.title,
-        artist: m.artist,
-        album: m.album,
-        progress: m.elapsed.map(|elapsed| Progress {
-            track_progress: ms(elapsed),
-            track_duration: m.duration.map_or(0, ms),
-            playback_speed: if m.paused { 0 } else { 1000 },
-        }),
-        ..Default::default()
-    }
-}
-
-fn failed(e: GroupError) -> CommandError {
-    CommandError::Failed(e.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::*;
-
-    #[test]
-    fn metadata_carries_the_position_as_of_now() {
-        let m = SourceMetadata {
-            title: Some("Teardrop".into()),
-            artist: Some("Massive Attack".into()),
-            album: Some("Mezzanine".into()),
-            duration: Some(Duration::from_secs(330)),
-            elapsed: Some(Duration::from_millis(61_500)),
-            paused: false,
-        };
-        let t = track_metadata(m.clone());
-        assert_eq!(t.title.as_deref(), Some("Teardrop"));
-        assert_eq!(t.album.as_deref(), Some("Mezzanine"));
-        assert_eq!(
-            t.progress,
-            Some(Progress {
-                track_progress: 61_500,
-                track_duration: 330_000,
-                playback_speed: 1000,
-            })
-        );
-
-        // Paused freezes it; a stream with no end has length 0; no
-        // position, no progress.
-        let paused = track_metadata(SourceMetadata {
-            paused: true,
-            duration: None,
-            ..m.clone()
-        });
-        assert_eq!(paused.progress.unwrap().playback_speed, 0);
-        assert_eq!(paused.progress.unwrap().track_duration, 0);
-        let unknown = track_metadata(SourceMetadata { elapsed: None, ..m });
-        assert_eq!(unknown.progress, None);
+        Ok(self.conn.send(ServerMessage::Command(ServerCommand {
+            player: Some(command),
+        }))?)
     }
 }

@@ -17,12 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blastcast::ServerClock;
+use blastcast_sendspin::protocol::{Codec, RequestFormatPlayer};
+use blastcast_sendspin::{NoHost, SendspinServer, ServerConfig};
 use harness::noise::NoiseSource;
 use harness::playout::{self, Playout};
 use harness::{FakePlayer, Spec, format};
-use tas_core::PlayerRegistry;
-use tas_sendspin::protocol::{Codec, RequestFormatPlayer};
-use tas_sendspin::{SendspinServer, ServerConfig};
 use tokio::net::TcpListener;
 
 /// How long each step of the scenario plays before the next.
@@ -47,7 +46,7 @@ async fn players_stay_within_a_millisecond_through_join_clear_switch_and_leave()
     let clock = ServerClock::new();
     let mut config = ServerConfig::new("tas-server-id", "Tune Assistant");
     config.clock = clock;
-    let server = SendspinServer::new(config, Arc::new(PlayerRegistry::default()));
+    let server = SendspinServer::new(config, Arc::new(NoHost));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/sendspin", listener.local_addr().unwrap());
     tokio::spawn(server.clone().serve(listener));

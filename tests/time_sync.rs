@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blastcast::ServerClock;
+use blastcast_sendspin::protocol::{
+    ClientHello, ClientMessage, ClientTime, ServerMessage, ServerTime,
+};
+use blastcast_sendspin::{NoHost, SendspinServer, ServerConfig};
 use futures_util::{SinkExt, StreamExt};
-use tas_core::PlayerRegistry;
-use tas_sendspin::protocol::{ClientHello, ClientMessage, ClientTime, ServerMessage, ServerTime};
-use tas_sendspin::{SendspinServer, ServerConfig};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
@@ -26,7 +27,7 @@ const WAIT: Duration = Duration::from_secs(5);
 async fn start(clock: ServerClock) -> String {
     let mut config = ServerConfig::new("tas-server-id", "Tune Assistant");
     config.clock = clock;
-    let server = SendspinServer::new(config, Arc::new(PlayerRegistry::default()));
+    let server = SendspinServer::new(config, Arc::new(NoHost));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/sendspin", listener.local_addr().unwrap());
     tokio::spawn(server.serve(listener));

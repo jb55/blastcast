@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blastcast_mdns::SendspinClient;
-use futures_util::{SinkExt, StreamExt};
-use tas_core::PlayerRegistry;
-use tas_sendspin::protocol::{
+use blastcast_sendspin::protocol::{
     ClientGoodbye, ClientHello, ClientMessage, ConnectionReason, GoodbyeReason, ServerMessage,
 };
-use tas_sendspin::{Dialer, DialerConfig, SendspinServer, ServerConfig};
+use blastcast_sendspin::testing::RecordingHost;
+use blastcast_sendspin::{Dialer, DialerConfig, SendspinServer, ServerConfig};
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -126,20 +126,20 @@ fn fast() -> DialerConfig {
 
 struct Harness {
     server: Arc<SendspinServer>,
-    registry: Arc<PlayerRegistry>,
+    host: Arc<RecordingHost>,
     dialer: Arc<Dialer>,
 }
 
 fn start(config: DialerConfig) -> Harness {
-    let registry = Arc::new(PlayerRegistry::default());
+    let host = RecordingHost::new();
     let server = SendspinServer::new(
         ServerConfig::new("tas-server-id", "Tune Assistant"),
-        registry.clone(),
+        host.clone(),
     );
     let dialer = Dialer::new(server.clone(), config);
     Harness {
         server,
-        registry,
+        host,
         dialer,
     }
 }
@@ -159,7 +159,7 @@ async fn dials_a_discovered_player_and_registers_it() {
     h.dialer
         .resolved(&speaker.advert("kitchen._sendspin._tcp.local."));
     let _ws = speaker.handshake("kitchen").await;
-    eventually("player registered", || h.registry.get("kitchen").is_some()).await;
+    eventually("player registered", || h.host.contains("kitchen")).await;
     assert!(h.server.connection("kitchen").is_some());
     assert!(h.dialer.is_active("kitchen._sendspin._tcp.local."));
 }

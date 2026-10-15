@@ -3,28 +3,27 @@
 //! pairing methods with the re-handshake after each, a client that lost
 //! its pairing, `send_ahead` on audio, and `allow_legacy_clients`.
 //!
-//! The client is `tas_sendspin::secure::client`, the protocol's other
+//! The client is `blastcast_sendspin::secure::client`, the protocol's other
 //! half; its crypto is checked against aiosendspin's libraries in the
 //! unit tests, so this checks the two halves' sequencing.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
-use tas_core::PlayerRegistry;
-use tas_sendspin::protocol::binary::{self, AUDIO_CHUNK};
-use tas_sendspin::protocol::{
+use blastcast_sendspin::protocol::binary::{self, AUDIO_CHUNK};
+use blastcast_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, Codec, ConnectionReason, HeaderLayout, PlayerSupport,
     StreamFormat,
 };
-use tas_sendspin::secure::client::{Activated, Client, ClientSpec, Record};
-use tas_sendspin::secure::keys::{Identity, PairingToken};
-use tas_sendspin::secure::noise::Suite;
-use tas_sendspin::secure::session::PskKind;
-use tas_sendspin::secure::trust::{MemoryTrust, PairingRequest, Trust, enter_code};
-use tas_sendspin::{Disconnect, Frame, HandshakeError, SendspinServer, ServerConfig};
+use blastcast_sendspin::secure::client::{Activated, Client, ClientSpec, Record};
+use blastcast_sendspin::secure::keys::{Identity, PairingToken};
+use blastcast_sendspin::secure::noise::Suite;
+use blastcast_sendspin::secure::session::PskKind;
+use blastcast_sendspin::secure::trust::{MemoryTrust, PairingRequest, Trust, enter_code};
+use blastcast_sendspin::{Disconnect, Frame, HandshakeError, NoHost, SendspinServer, ServerConfig};
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -43,7 +42,7 @@ async fn start(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
     config.trust = trust.clone();
     config.hello_timeout = Duration::from_secs(5);
     tweak(&mut config);
-    let server = SendspinServer::new(config, Arc::new(PlayerRegistry::default()));
+    let server = SendspinServer::new(config, Arc::new(NoHost));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/sendspin", listener.local_addr().unwrap());
     tokio::spawn(server.clone().serve(listener));
