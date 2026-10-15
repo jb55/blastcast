@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use blastcast_mdns::{BrowseEvent, Discovered, Mdns};
+use blastcast_sendspin::SendspinServer;
 use blastcast_telemetry::{Roster, Speaker};
-use tas_sendspin::SendspinServer;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -229,7 +229,7 @@ async fn keep_running(
 
 /// Browses `_raop._tcp` and feeds what it finds to `outputs`, for as long
 /// as it runs. The browse restarts every `rebrowse`, as the Sendspin one
-/// does ([`tas_sendspin::dialer::discover`]).
+/// does ([`blastcast_sendspin::dialer::discover`]).
 pub async fn discover(outputs: Arc<AirplayOutputs>, mdns: Mdns, rebrowse: Duration) {
     loop {
         match mdns.browse(RAOP_SERVICE_TYPE) {

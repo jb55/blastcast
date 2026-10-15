@@ -10,7 +10,7 @@ publish.workspace = true
 [dependencies]
 blastcast-mdns.workspace = true
 blastcast-telemetry = { workspace = true, features = ["hub"] }
-tas-sendspin.workspace = true
+blastcast-sendspin.workspace = true
 
 blastcast.workspace = true
 bytes.workspace = true
@@ -25,6 +25,7 @@ tracing.workspace = true
 [dev-dependencies]
 blastcast-audio.workspace = true
 tas-core.workspace = true
+tas-sendspin.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

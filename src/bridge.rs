@@ -38,15 +38,15 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use blastcast_telemetry::{Probe, Roster, Series, Speaker, SpeakerSession, SpeakerState};
-use futures_channel::mpsc;
-use futures_util::StreamExt;
-use tas_sendspin::protocol::{
+use blastcast_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, ConnectionReason, DeviceInfo,
     HeaderLayout, PlayerCommand, PlayerCommandKind, PlayerStateReport, PlayerSupport,
     PlayerSyncState, ServerMessage, StreamFormat, binary, roles,
 };
-use tas_sendspin::{Disconnect, Frame, SendspinServer};
+use blastcast_sendspin::{Disconnect, Frame, SendspinServer};
+use blastcast_telemetry::{Probe, Roster, Series, Speaker, SpeakerSession, SpeakerState};
+use futures_channel::mpsc;
+use futures_util::StreamExt;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
@@ -109,7 +109,7 @@ pub fn hello(device: &RaopDevice) -> ClientHello {
     ClientHello {
         client_id: device.player_id.clone(),
         name: device.name.clone(),
-        version: tas_sendspin::protocol::PROTOCOL_VERSION,
+        version: blastcast_sendspin::protocol::PROTOCOL_VERSION,
         supported_roles: vec![roles::PLAYER_V1.into()],
         device_info: Some(DeviceInfo {
             product_name: Some(device.model.clone().unwrap_or_else(|| "AirPlay".into())),
@@ -246,8 +246,8 @@ impl Bridge {
             match wake {
                 Wake::Stop => {
                     self.send(ClientMessage::Goodbye(
-                        tas_sendspin::protocol::ClientGoodbye {
-                            reason: Some(tas_sendspin::protocol::GoodbyeReason::Shutdown),
+                        blastcast_sendspin::protocol::ClientGoodbye {
+                            reason: Some(blastcast_sendspin::protocol::GoodbyeReason::Shutdown),
                         },
                     ));
                     return;
@@ -414,7 +414,8 @@ impl Bridge {
             }
             PlayerCommandKind::SetOutputDelay | PlayerCommandKind::SetStaticDelay => {
                 if let Some(ms) = command.output_delay_ms.or(command.static_delay_ms) {
-                    self.output_delay_ms = ms.min(tas_sendspin::protocol::MAX_OUTPUT_DELAY_MS);
+                    self.output_delay_ms =
+                        ms.min(blastcast_sendspin::protocol::MAX_OUTPUT_DELAY_MS);
                 }
                 self.report(PlayerSyncState::Synchronized);
                 return;

@@ -18,11 +18,11 @@ use std::time::Duration;
 
 use blastcast::{SESSION_FORMAT, ServerClock};
 use blastcast_audio::SineSource;
+use blastcast_sendspin::ServerConfig;
 use tas_airplay_out::rtp::NtpClock;
 use tas_airplay_out::session::RaopSession;
 use tas_airplay_out::{AirplayOutputs, RaopDevice};
 use tas_core::{PlayerCommand, PlayerRegistry};
-use tas_sendspin::{SendspinServer, ServerConfig};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -170,7 +170,7 @@ async fn shairport_plays_what_we_send_when_we_say() {
 #[ignore = "needs shairport-sync in TAS_SHAIRPORT_SYNC"]
 async fn a_bridged_player_plays_on_shairport() {
     let registry = Arc::new(PlayerRegistry::default());
-    let server = SendspinServer::new(ServerConfig::new("tas", "Tune Assistant"), registry.clone());
+    let server = tas_sendspin::server(ServerConfig::new("tas", "Tune Assistant"), registry.clone());
     let clock = server.config().clock;
     let receiver = shairport(clock).await;
     let outputs = AirplayOutputs::with_local_addrs(server, vec![]);
