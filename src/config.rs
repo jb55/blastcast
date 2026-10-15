@@ -12,6 +12,24 @@ pub const PORT_RANGE: u16 = 1000;
 /// The advertised-name template's default: the player's own name.
 pub const DEFAULT_NAME_TEMPLATE: &str = "{player}";
 
+/// The scheme of every receiver's id. It is Music Assistant's provider
+/// instance id, so a receiver's id is also its source's uri there.
+pub const SOURCE_PROVIDER: &str = "airplay_receiver";
+
+/// The id of `target_id`'s receiver, which its telemetry and status are
+/// keyed by: MA's `AudioSource` uri for it.
+pub fn source_id(target_id: &str) -> String {
+    format!("{SOURCE_PROVIDER}://audio_source/{target_id}")
+}
+
+/// The receiver whose id is `source_id`.
+pub fn target_of(source_id: &str) -> Option<&str> {
+    source_id
+        .strip_prefix(SOURCE_PROVIDER)?
+        .strip_prefix("://audio_source/")
+        .filter(|t| !t.is_empty())
+}
+
 /// Everything that identifies one running receiver. A change to any of it
 /// restarts it; the starting volume is not part of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +62,7 @@ pub fn receiver_ports<'a>(
     let targets: BTreeSet<&str> = targets.into_iter().collect();
     let mut claimed = BTreeSet::new();
     let mut ports = BTreeMap::new();
-    // More targets than ports can only come from a hand-edited state file.
+    // More targets than ports: those after the first 1000 get none.
     for target in targets.into_iter().take(PORT_RANGE.into()) {
         let mut offset = port_hash(server_id, target);
         while !claimed.insert(offset) {

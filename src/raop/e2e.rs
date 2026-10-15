@@ -154,7 +154,7 @@ impl Rig {
 
     /// Every point of `series` the receiver has emitted.
     fn points(&self, series: Series) -> Vec<Point> {
-        let entity = crate::route::source_id(self.device);
+        let entity = crate::config::source_id(self.device);
         self.hub
             .subscribe(self.clock.now_us())
             .history
@@ -693,7 +693,7 @@ async fn a_phones_timeline_and_its_losses_are_telemetry() {
     let mut phone = Phone::connect(rig.addr).await;
     let _time = phone.keep_time(rig.clock, OFFSET_US);
     let [server_port, control_port, _] = phone.start().await;
-    let receiver_id = crate::route::source_id(DEVICE);
+    let receiver_id = crate::config::source_id(DEVICE);
     let sessions = rig.sessions.all();
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     let session = &sessions[0];

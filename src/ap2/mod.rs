@@ -3,8 +3,8 @@
 //! advert on the same port.
 //!
 //! - [`identity`]: each target's Ed25519 key (`pk`) and `pi`, derived from
-//!   one secret kept in the state file, so a phone keeps recognising the
-//!   device across restarts.
+//!   one secret kept in an [`IdentityStore`], so a phone keeps recognising
+//!   the device across restarts.
 //! - [`info`]: the `_airplay._tcp` advert and the `GET /info` binary
 //!   plist, which carry the same fields.
 //! - [`pairing`]: transient `/pair-setup` (SRP, [`srp`], in TLV8, [`tlv`])
@@ -50,7 +50,7 @@ pub mod testing;
 pub mod tlv;
 
 pub use channel::Keys;
-pub use identity::{Device, Identity};
+pub use identity::{Device, Identity, IdentityStore};
 
 use crate::raop::rtsp::{Request, Response};
 

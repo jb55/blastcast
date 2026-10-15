@@ -1,6 +1,6 @@
 //! A native AirPlay 1 (RAOP) receiver.
 //!
-//! One receiver per target, run by the [`crate::supervisor`]: it listens
+//! One receiver per target, run by a [`crate::receiver::Receiver`]: it listens
 //! on the target's port, advertises `_raop._tcp` on the shared mDNS
 //! responder, and tells the [`ReceiverHandler`] what happens: the audio
 //! arrives as [`ReceiverHandler::audio`] and what the sender says as
@@ -85,7 +85,7 @@ use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::config::ReceiverInfo;
 use crate::metadata::MetadataEvent;
-use crate::supervisor::ReceiverHandler;
+use crate::receiver::ReceiverHandler;
 
 /// What senders browse for.
 pub const RAOP_SERVICE_TYPE: &str = "_raop._tcp.local.";
@@ -124,9 +124,9 @@ pub struct NativeConfig {
     pub receivers: Roster<blastcast_telemetry::Receiver>,
     /// Every sender's stream on one.
     pub sessions: Roster<blastcast_telemetry::Session>,
-    /// What each target's AirPlay 2 key and `pi` come from: the one in
-    /// the state file ([`crate::ap2::Identity::load`]), so a phone keeps
-    /// recognising it. A new one each run by default, as in tests.
+    /// What each target's AirPlay 2 key and `pi` come from: the one kept
+    /// in an [`IdentityStore`](crate::ap2::IdentityStore)
+    /// ([`crate::ap2::Identity::load`]), so a phone keeps recognising it. A new one each run by default, as in tests.
     pub identity: crate::ap2::Identity,
     /// Whether each target also advertises `_airplay._tcp`. Off until
     /// AirPlay 2 can pair and play: a phone that sees it uses it rather
@@ -284,7 +284,7 @@ pub async fn serve(
         ),
         _ => None,
     };
-    let id = crate::route::source_id(&info.target_id);
+    let id = crate::config::source_id(&info.target_id);
     config.receivers.set(blastcast_telemetry::Receiver {
         id: id.clone(),
         target: info.target_id.clone(),

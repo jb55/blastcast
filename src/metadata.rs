@@ -25,11 +25,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use tas_core::{Image, ImageSource};
 use tokio::sync::broadcast;
 
 use crate::config::ReceiverInfo;
-use crate::supervisor::ReceiverHandler;
+use crate::receiver::ReceiverHandler;
 
 /// AirPlay 1's RTP clock: progress counts these.
 const RTP_RATE: u64 = 44_100;
@@ -87,15 +86,6 @@ impl Artwork {
             [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
             [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
             _ => None,
-        }
-    }
-
-    /// The image to serve: of [`Self::content_type`], or untyped bytes
-    /// for the client to sniff.
-    pub fn image(&self) -> Image {
-        Image {
-            bytes: self.bytes.clone(),
-            content_type: self.content_type().unwrap_or("application/octet-stream"),
         }
     }
 }
@@ -258,17 +248,15 @@ impl AirplayMetadata {
     pub fn targets(&self) -> Vec<String> {
         lock(&self.receivers).keys().cloned().collect()
     }
-}
 
-/// Serves each receiver's current cover art by its [`Artwork::hash`], for
-/// as long as it is the current one.
-impl ImageSource for AirplayMetadata {
-    fn image(&self, id: &str) -> Option<Image> {
+    /// A receiver's current cover art, by its [`Artwork::hash`], for as
+    /// long as it is the current one: what an image URL serves.
+    pub fn artwork(&self, hash: &str) -> Option<Artwork> {
         lock(&self.receivers)
             .values()
             .filter_map(|now| now.artwork.as_ref())
-            .find(|art| art.hash == id)
-            .map(Artwork::image)
+            .find(|art| art.hash == hash)
+            .cloned()
     }
 }
 
@@ -520,23 +508,26 @@ mod tests {
         let info = receiver();
         meta.started(&info);
         let hash = super::Artwork::new(art()).hash;
-        assert_eq!(meta.image(&hash), None);
+        assert_eq!(meta.artwork(&hash), None);
 
         meta.event(&info, &MetadataEvent::PlayBegin);
         meta.event(&info, &MetadataEvent::Artwork(super::Artwork::new(art())));
-        let image = meta.image(&hash).unwrap();
+        let image = meta.artwork(&hash).unwrap();
         assert_eq!(&image.bytes[..], &art()[..]);
-        assert_eq!(image.content_type, "image/jpeg");
-        assert_eq!(meta.image("0000000000000000"), None);
+        assert_eq!(image.content_type(), Some("image/jpeg"));
+        assert_eq!(meta.artwork("0000000000000000"), None);
 
         // A new image replaces it, at a new id.
         let png = b"\x89PNG\r\n\x1a\n....".to_vec();
         let png_hash = super::Artwork::new(png.clone()).hash;
         meta.event(&info, &MetadataEvent::Artwork(super::Artwork::new(png)));
-        assert_eq!(meta.image(&hash), None);
-        assert_eq!(meta.image(&png_hash).unwrap().content_type, "image/png");
+        assert_eq!(meta.artwork(&hash), None);
+        assert_eq!(
+            meta.artwork(&png_hash).unwrap().content_type(),
+            Some("image/png")
+        );
 
         meta.event(&info, &MetadataEvent::PlayEnd);
-        assert_eq!(meta.image(&png_hash), None);
+        assert_eq!(meta.artwork(&png_hash), None);
     }
 }

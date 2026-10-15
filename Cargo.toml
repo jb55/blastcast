@@ -1,11 +1,14 @@
 [package]
-name = "tas-airplay"
+name = "blastcast-airplay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# A native AirPlay 1 and 2 receiver, into the blastcast timeline. It
+# depends on no tas-* crate (scripts/check.sh), so it moves to blastcast
+# as a directory.
 [dependencies]
 aes.workspace = true
 alac.workspace = true
@@ -19,7 +22,6 @@ ed25519-dalek.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
 plist.workspace = true
-tas-core.workspace = true
 blastcast-audio.workspace = true
 blastcast-mdns.workspace = true
 blastcast-telemetry = { workspace = true, features = ["hub"] }
@@ -41,9 +43,9 @@ testing = []
 
 [dev-dependencies]
 alac-encoder.workspace = true
+# raop/e2e.rs: a RAOP sender into the receiver, and a Sendspin speaker out.
 blastcast-airplay-out.workspace = true
 blastcast-sendspin = { workspace = true, features = ["testing"] }
-tempfile.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]

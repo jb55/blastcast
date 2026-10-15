@@ -54,7 +54,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use crate::config::ReceiverInfo;
-use crate::supervisor::ReceiverHandler;
+use crate::receiver::ReceiverHandler;
 
 /// What a receiver hands over: 44.1 kHz, stereo.
 pub const AIRPLAY_FORMAT: AudioFormat = AudioFormat::new(44_100, 2);
@@ -170,7 +170,7 @@ impl AirplayAudio {
         let raw = self.subscribe(target_id)?;
         let matched = Matched {
             source: RateMatch::new(raw),
-            probe: self.telemetry.probe(&crate::route::source_id(target_id)),
+            probe: self.telemetry.probe(&crate::config::source_id(target_id)),
             clock: self.clock,
             reported: None,
         };
@@ -352,7 +352,7 @@ mod tests {
     }
 
     impl Rig {
-        /// A running receiver, as the supervisor leaves it after calling
+        /// A running receiver, as a [`crate::Receiver`] leaves it after calling
         /// `started`.
         fn start() -> Self {
             let info = ReceiverInfo::new("ss-kitchen", "Kitchen".into(), 7000);
@@ -534,7 +534,7 @@ mod tests {
         }
         // Most of it through the resampler.
         samples(&mut *source, 6000 * 2).await;
-        let entity = crate::route::source_id("ss-kitchen");
+        let entity = crate::config::source_id("ss-kitchen");
         let values = |series| -> Vec<f64> {
             hub.subscribe(clock.now_us())
                 .history

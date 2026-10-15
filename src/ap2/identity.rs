@@ -1,17 +1,25 @@
 //! Who each AirPlay 2 receiver is: an Ed25519 key (`pk`) and a `pi` UUID
 //! per target, which a phone remembers it by.
 //!
-//! Both are derived from one 32-byte secret per server, kept in the state
-//! file's `airplay.secret`, and the target's id. So there is one thing to
-//! keep, a target added later gets its identity without a save, and the
-//! same target on the same server is the same device after a restart, as
-//! its [`device_id`](crate::raop::device_id) already is.
+//! Both are derived from one 32-byte secret per server, kept in an
+//! [`IdentityStore`], and the target's id. So there is one thing to keep,
+//! a target added later gets its identity without a save, and the same
+//! target on the same server is the same device after a restart, as its
+//! [`device_id`](crate::raop::device_id) already is.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha512};
-use tas_core::state::StateStore;
+
+/// Where the server's AirPlay 2 secret is kept between runs, such as a
+/// state file. Without one, every run is a new device to a phone.
+pub trait IdentityStore {
+    /// The secret as [`Identity::to_b64url`] wrote it, if one was saved.
+    fn load(&self) -> Option<String>;
+    /// Keeps `secret`, base64url, for the next run.
+    fn save(&self, secret: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
 
 /// The server's AirPlay 2 secret.
 #[derive(Clone)]
@@ -43,18 +51,16 @@ impl Identity {
     }
 
     /// The one in `store`, or a new one saved there.
-    pub fn load(store: &StateStore) -> Self {
-        store.refresh();
-        let saved = store.read(|s| s.airplay.secret.clone());
+    pub fn load(store: &(impl IdentityStore + ?Sized)) -> Self {
+        let saved = store.load();
         if let Some(identity) = saved.as_deref().and_then(Self::from_b64url) {
             return identity;
         }
         if saved.is_some() {
-            tracing::warn!("the AirPlay identity in the state file is unusable; making a new one");
+            tracing::warn!("the saved AirPlay identity is unusable; making a new one");
         }
         let identity = Self::generate();
-        let text = identity.to_b64url();
-        match store.update(|s| s.airplay.secret = Some(text)) {
+        match store.save(&identity.to_b64url()) {
             Ok(()) => tracing::info!("made an AirPlay identity"),
             Err(e) => tracing::error!(
                 error = %e,
@@ -177,16 +183,25 @@ mod tests {
         assert_eq!(&d.pi[14..15], "4", "a v4 UUID: {}", d.pi);
     }
 
+    /// A store in memory, as a state file would keep it.
+    #[derive(Default)]
+    struct Memory(std::sync::Mutex<Option<String>>);
+
+    impl IdentityStore for Memory {
+        fn load(&self) -> Option<String> {
+            self.0.lock().unwrap().clone()
+        }
+        fn save(&self, secret: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.0.lock().unwrap() = Some(secret.to_owned());
+            Ok(())
+        }
+    }
+
     #[test]
     fn the_identity_survives_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = {
-            let store = StateStore::open(dir.path()).unwrap();
-            let id = Identity::load(&store);
-            assert!(store.read(|s| s.airplay.secret.is_some()));
-            id.device([2; 6], "kitchen", "Kitchen")
-        };
-        let store = StateStore::open(dir.path()).unwrap();
+        let store = Memory::default();
+        let first = Identity::load(&store).device([2; 6], "kitchen", "Kitchen");
+        assert!(store.load().is_some());
         let again = Identity::load(&store).device([2; 6], "kitchen", "Kitchen");
         assert_eq!(first.public_key(), again.public_key());
         assert_eq!(first.pi, again.pi);
@@ -194,15 +209,9 @@ mod tests {
 
     #[test]
     fn an_unusable_secret_is_replaced() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = StateStore::open(dir.path()).unwrap();
-        store
-            .update(|s| s.airplay.secret = Some("not base64url!".into()))
-            .unwrap();
+        let store = Memory::default();
+        store.save("not base64url!").unwrap();
         let id = Identity::load(&store);
-        assert_eq!(
-            store.read(|s| s.airplay.secret.clone()),
-            Some(id.to_b64url())
-        );
+        assert_eq!(store.load(), Some(id.to_b64url()));
     }
 }
