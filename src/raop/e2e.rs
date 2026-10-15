@@ -1,5 +1,5 @@
 //! The receiver end to end, on localhost: driven by our own RAOP sender
-//! (`tas-airplay-out`, as iTunes drives a speaker), and by a hand-rolled
+//! (`blastcast-airplay-out`, as iTunes drives a speaker), and by a hand-rolled
 //! sender that does what an iPhone does and ours doesn't: the challenge,
 //! encrypted compressed ALAC, metadata, a lost packet and a second phone.
 
@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use blastcast::{PcmChunk, ServerClock};
+use blastcast_airplay_out::{NtpClock, RaopSession};
 use blastcast_telemetry::{Point, Series, Telemetry};
 use rsa::Pkcs1v15Sign;
-use tas_airplay_out::{NtpClock, RaopSession};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
@@ -234,7 +234,7 @@ async fn our_own_sender_plays_through_it() {
 }
 
 /// The sender's timeline comes through: it anchors frame r0 at server-clock
-/// time t (its NTP clock is the server clock, as tas-airplay-out's is), and
+/// time t (its NTP clock is the server clock, as blastcast-airplay-out's is), and
 /// the chunk the receiver hands over for r0 is stamped t.
 #[tokio::test]
 async fn chunks_carry_the_senders_play_time() {
@@ -537,7 +537,7 @@ impl Phone {
             let mut buf = [0u8; 64];
             while let Ok((n, from)) = timing.recv_from(&mut buf).await {
                 let now = clock::us_ntp(clock.now_us() + offset_us);
-                if let Some(reply) = tas_airplay_out::rtp::timing_reply(&buf[..n], now) {
+                if let Some(reply) = blastcast_airplay_out::rtp::timing_reply(&buf[..n], now) {
                     let _ = timing.send_to(&reply, from).await;
                 }
             }
@@ -548,7 +548,8 @@ impl Phone {
     fn packet(&mut self, samples: &[i16]) -> (u16, Vec<u8>) {
         let mut payload = alac_packet(samples);
         encrypt_payload(&self.key, &self.iv, &mut payload);
-        let packet = tas_airplay_out::rtp::audio_packet(false, self.seq, self.rtp, 1, &payload);
+        let packet =
+            blastcast_airplay_out::rtp::audio_packet(false, self.seq, self.rtp, 1, &payload);
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
         self.rtp = self.rtp.wrapping_add((samples.len() / 2) as u32);
@@ -587,12 +588,15 @@ async fn an_iphone_like_sender_with_a_lost_packet_and_metadata() {
         .unwrap();
     let (lost_seq, lost_packet) = lost.unwrap();
     assert_eq!(
-        tas_airplay_out::rtp::parse_resend_request(&buf[..n]),
+        blastcast_airplay_out::rtp::parse_resend_request(&buf[..n]),
         Some((lost_seq, 1))
     );
     phone
         .control
-        .send_to(&tas_airplay_out::rtp::resend_reply(&lost_packet), from)
+        .send_to(
+            &blastcast_airplay_out::rtp::resend_reply(&lost_packet),
+            from,
+        )
         .await
         .unwrap();
 
@@ -722,7 +726,8 @@ async fn a_phones_timeline_and_its_losses_are_telemetry() {
 
     // The next frame plays two seconds from now, on the phone's clock.
     let at = rig.clock.now_us() + AHEAD_US;
-    let sync = tas_airplay_out::rtp::sync_packet(true, phone.rtp, clock::us_ntp(at + OFFSET_US), 0);
+    let sync =
+        blastcast_airplay_out::rtp::sync_packet(true, phone.rtp, clock::us_ntp(at + OFFSET_US), 0);
     let control = SocketAddr::new(phone.server.ip(), control_port);
     phone.control.send_to(&sync, control).await.unwrap();
     let synced = rig.until_point(Series::Sync).await;

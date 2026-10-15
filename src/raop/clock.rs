@@ -180,7 +180,7 @@ impl Timeline {
 
 #[cfg(test)]
 mod tests {
-    use tas_airplay_out::rtp as sender;
+    use blastcast_airplay_out::rtp as sender;
 
     use super::*;
 

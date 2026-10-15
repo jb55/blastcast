@@ -41,7 +41,7 @@ testing = []
 
 [dev-dependencies]
 alac-encoder.workspace = true
-tas-airplay-out.workspace = true
+blastcast-airplay-out.workspace = true
 blastcast-sendspin = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true

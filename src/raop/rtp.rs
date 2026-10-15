@@ -8,7 +8,7 @@
 //! - **Timing**: we ask the sender's timing port for its clock, and answer
 //!   it if it asks ours.
 //!
-//! The layouts are the ones `tas-airplay-out` sends (`rtp.rs`), from
+//! The layouts are the ones `blastcast-airplay-out` sends (`rtp.rs`), from
 //! libraop and shairport-sync.
 
 pub const PAYLOAD_AUDIO: u8 = 0x60;
@@ -92,7 +92,7 @@ pub fn timing_reply(request: &[u8], now: u64) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
-    use tas_airplay_out::rtp as sender;
+    use blastcast_airplay_out::rtp as sender;
 
     use super::*;
 
