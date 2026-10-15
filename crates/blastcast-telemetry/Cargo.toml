@@ -1,19 +1,30 @@
 [package]
-name = "tas-telemetry"
+name = "blastcast-telemetry"
+description = "Every timing a protocol measures, kept for a minute and streamed live: the series and status types, and the hub"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# Tokio and tas-proto's series, nothing else: every protocol crate can emit
-# into the hub without depending on another's.
+# The types are serde and nothing else, so a client that only reads them
+# takes `default-features = false` and no runtime. The hub is tokio.
 [dependencies]
-tas-proto.workspace = true
-tokio.workspace = true
+serde.workspace = true
+tokio = { workspace = true, optional = true, features = ["sync"] }
+
+[features]
+default = ["hub"]
+hub = ["dep:tokio"]
 
 [dev-dependencies]
 allocation-counter = "0.8"
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[test]]
+name = "alloc"
+required-features = ["hub"]
 
 [lints]
 workspace = true

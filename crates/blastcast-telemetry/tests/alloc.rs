@@ -2,8 +2,7 @@
 //! allocator that counts this thread's allocations: with the hub off, and
 //! with it on once each ring has filled its window, subscribed or not.
 
-use tas_proto::Series;
-use tas_telemetry::{Probe, Telemetry, WINDOW_US};
+use blastcast_telemetry::{Probe, Series, Telemetry, WINDOW_US};
 
 /// A chunk's worth of points, as a Sendspin player gets them.
 fn chunk(probe: &Probe, t_us: i64) {
