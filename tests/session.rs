@@ -3,11 +3,11 @@
 
 use std::time::Duration;
 
+use blastcast::ServerClock;
 use tas_airplay_out::alac::FRAMES_PER_PACKET;
 use tas_airplay_out::rtp::NtpClock;
 use tas_airplay_out::session::{LATENCY_FRAMES, RaopSession, SessionError};
 use tas_airplay_out::testing::FakeSpeaker;
-use tas_audio::ServerClock;
 
 const WAIT: Duration = Duration::from_secs(5);
 

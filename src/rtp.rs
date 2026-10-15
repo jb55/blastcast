@@ -26,7 +26,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use blastcast::ClockMap;
-use tas_audio::ServerClock;
+use blastcast::ServerClock;
 
 /// Seconds from the NTP epoch (1900) to the Unix one.
 const NTP_UNIX_OFFSET_S: i64 = 2_208_988_800;

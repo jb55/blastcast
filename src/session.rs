@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use tas_audio::ServerClock;
+use blastcast::ServerClock;
 use tas_proto::Series;
 use tas_telemetry::Probe;
 use tokio::net::{TcpStream, UdpSocket};

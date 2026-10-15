@@ -12,8 +12,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use blastcast::ServerClock;
 use tas_airplay_out::{NtpClock, RaopSession};
-use tas_audio::ServerClock;
 
 const RATE: i64 = 44_100;
 const CHUNK: usize = 352;

@@ -6,10 +6,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use blastcast::SESSION_FORMAT;
+use blastcast_audio::SineSource;
 use futures_util::StreamExt;
 use tas_airplay_out::testing::FakeSpeaker;
 use tas_airplay_out::{AirplayOutputs, RaopDevice};
-use tas_audio::{SESSION_FORMAT, SineSource};
 use tas_core::player::PlaybackState;
 use tas_core::{PlayerCommand, PlayerRegistry};
 use tas_proto::{Series, SpeakerState};
