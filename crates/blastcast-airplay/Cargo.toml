@@ -1,0 +1,52 @@
+[package]
+name = "blastcast-airplay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# A native AirPlay 1 and 2 receiver, into the blastcast timeline. It
+# depends on no tas-* crate (scripts/check.sh), so it moves to blastcast
+# as a directory.
+[dependencies]
+aes.workspace = true
+alac.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+blastcast.workspace = true
+cbc.workspace = true
+chacha20poly1305.workspace = true
+crypto-bigint.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+plist.workspace = true
+blastcast-audio.workspace = true
+blastcast-mdns.workspace = true
+blastcast-telemetry = { workspace = true, features = ["hub"] }
+
+rsa.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+symphonia-codec-aac.workspace = true
+symphonia-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+x25519-dalek.workspace = true
+
+[features]
+# ap2::testing: an AirPlay 2 sender that pairs and talks encrypted, for
+# other crates' tests.
+testing = []
+
+[dev-dependencies]
+alac-encoder.workspace = true
+# raop/e2e.rs: a RAOP sender into the receiver, and a Sendspin speaker out.
+blastcast-airplay-out.workspace = true
+blastcast-sendspin = { workspace = true, features = ["testing"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
