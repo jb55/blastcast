@@ -139,6 +139,13 @@ pub trait ReceiverHandler: Send + Sync + 'static {
     /// means its first frame to play, on the server clock, once the
     /// receiver knows ([`crate::raop::clock`]).
     fn audio(&self, _receiver: &ReceiverInfo, _chunk: &PcmChunk, _play_at_us: Option<i64>) {}
+    /// As [`audio`](Self::audio), from a sender whose play times are when
+    /// the audio plays everywhere it plays: an AirPlay 2 phone's, on the
+    /// PTP clock it keeps its own picture and other speakers to. Unlike an
+    /// AirPlay 1 sender's surplus lead, nothing may trim them.
+    fn audio_on_time(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, play_at_us: Option<i64>) {
+        self.audio(receiver, chunk, play_at_us);
+    }
     /// A native receiver's sender flushed (`FLUSH`, a pause or a seek):
     /// drop what was handed over and hasn't played. It comes in line with
     /// [`audio`](Self::audio): every chunk after it is from after the
@@ -166,6 +173,10 @@ impl ReceiverHandler for Vec<Arc<dyn ReceiverHandler>> {
     fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, play_at_us: Option<i64>) {
         self.iter()
             .for_each(|h| h.audio(receiver, chunk, play_at_us));
+    }
+    fn audio_on_time(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, play_at_us: Option<i64>) {
+        self.iter()
+            .for_each(|h| h.audio_on_time(receiver, chunk, play_at_us));
     }
     fn flush(&self, receiver: &ReceiverInfo) {
         self.iter().for_each(|h| h.flush(receiver));

@@ -376,6 +376,12 @@ fn assert_trimmed(lead: i64, trimmed_us: i64) {
     assert!(trimmed_us > 1_500_000, "trimmed {trimmed_us} µs");
 }
 
+/// The stream played an AirPlay 2 sender's audio at its stamps: nothing
+/// added, and its lead, the phone's own, not trimmed.
+fn assert_on_time(speaker: &FakeSpeaker, now: i64) {
+    assert_eq!(offset_us(speaker, now), (0, 0), "added and trimmed µs");
+}
+
 /// The first chunk plays at `at` and every one after it where the frames
 /// before it end, or later by no more than the `added_us` the stream added
 /// for chunks handed over late: with no lead kept past the send-ahead, a
@@ -1454,10 +1460,9 @@ async fn an_airplay_2_timeline_pause_and_flush_reach_a_sendspin_player() {
         .set_rate_anchor(rate(true), Some((PHONE_CLOCK, 0, phone_ns(t))))
         .await
         .unwrap();
-    let first = chunks(&mut speaker, 10).await;
-    let added_us = added_latency_us(&speaker, rig.clock.now_us());
-    assert_eq!(added_us, 0, "two seconds of lead need no more");
-    assert_placed(&first, anchored(&map, 0, t, 0));
+    let (first, _) = chunks(&mut speaker, 10).await;
+    assert_on_time(&speaker, rig.clock.now_us());
+    assert_placed(&first, anchored(&map, 0, t, 0), 0);
     assert_eq!(speaker.control(), ["start"]);
 
     // Paused a third of a second in.
@@ -1481,9 +1486,9 @@ async fn an_airplay_2_timeline_pause_and_flush_reach_a_sendspin_player() {
         .set_rate_anchor(rate(true), Some((PHONE_CLOCK, paused, phone_ns(t2))))
         .await
         .unwrap();
-    let second = chunks(&mut speaker, 10).await;
-    assert_eq!(added_latency_us(&speaker, rig.clock.now_us()), 0);
-    assert_placed(&second, anchored(&map, paused, t2, paused));
+    let (second, _) = chunks(&mut speaker, 10).await;
+    assert_on_time(&speaker, rig.clock.now_us());
+    assert_placed(&second, anchored(&map, paused, t2, paused), 0);
 
     // Everything to two seconds past the pause flushed: the player is
     // cleared, and the audio from there plays where the anchor puts it.
@@ -1491,9 +1496,9 @@ async fn an_airplay_2_timeline_pause_and_flush_reach_a_sendspin_player() {
     let flush = phone.flush_buffered(None, (0, until)).await.unwrap();
     assert_eq!(flush.status, 200);
     cleared(&mut speaker).await;
-    let third = chunks(&mut speaker, 10).await;
-    assert_eq!(added_latency_us(&speaker, rig.clock.now_us()), 0);
-    assert_placed(&third, anchored(&map, paused, t2, until));
+    let (third, _) = chunks(&mut speaker, 10).await;
+    assert_on_time(&speaker, rig.clock.now_us());
+    assert_placed(&third, anchored(&map, paused, t2, until), 0);
 
     // Each of it marked on the receiver.
     let rates: Vec<f64> = rig.points(Series::Rate).iter().map(|p| p.value).collect();
@@ -1783,16 +1788,16 @@ async fn a_multi_selected_phone_plays_each_target_as_its_own_session() {
             .await
             .unwrap();
     }
-    let kitchen = chunks(&mut speakers[0], 10).await;
-    let den = chunks(&mut speakers[1], 10).await;
-    assert_placed(&kitchen, anchored(&map, 0, t, 0));
+    let (kitchen, _) = chunks(&mut speakers[0], 10).await;
+    let (den, _) = chunks(&mut speakers[1], 10).await;
+    assert_placed(&kitchen, anchored(&map, 0, t, 0), 0);
     assert_eq!(
         kitchen[..10],
         den[..10],
         "the same audio at the same stamps"
     );
     for speaker in &speakers {
-        assert_eq!(added_latency_us(speaker, clock.now_us()), 0);
+        assert_on_time(speaker, clock.now_us());
     }
 
     // Unticking the kitchen ends its session only.
@@ -1809,13 +1814,13 @@ async fn a_multi_selected_phone_plays_each_target_as_its_own_session() {
     // The den goes on, on the timeline it started on: a whole number of
     // frames after its first chunk, still ahead of time.
     speakers[1].audio();
-    let later = chunks(&mut speakers[1], 10).await;
+    let (later, _) = chunks(&mut speakers[1], 10).await;
     let (first, _) = later[0];
     assert!(first > clock.now_us(), "still ahead of time");
     let frames = ((first - den[0].0) as f64 * 0.048).round() as i64;
     let on_time = den[0].0 + frames * 1_000_000 / 48_000;
     assert!((first - on_time).abs() <= 1, "{first} is off the timeline");
-    assert_placed(&later, first);
+    assert_placed(&later, first, 0);
 
     drop((data, phones));
     for stream in streams {

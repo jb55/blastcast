@@ -422,6 +422,12 @@ impl Receiver {
         self.handler.audio(&self.info, chunk, play_at_us);
     }
 
+    /// AirPlay 2's audio, whose play times are kept as they are
+    /// ([`ReceiverHandler::audio_on_time`]).
+    pub(crate) fn audio_on_time(&self, chunk: &PcmChunk, play_at_us: Option<i64>) {
+        self.handler.audio_on_time(&self.info, chunk, play_at_us);
+    }
+
     pub(crate) fn flush(&self) {
         self.handler.flush(&self.info);
     }
@@ -527,10 +533,11 @@ impl Receiver {
     }
 }
 
-/// An AirPlay 2 stream hands its audio over as an AirPlay 1 stream does.
+/// An AirPlay 2 stream hands its audio over as an AirPlay 1 stream does,
+/// but on time: its lead is the phone's, not a buffer to trim.
 impl crate::ap2::hold::Sink for Receiver {
     fn audio(&self, chunk: &PcmChunk, play_at_us: Option<i64>) {
-        Receiver::audio(self, chunk, play_at_us);
+        Receiver::audio_on_time(self, chunk, play_at_us);
     }
 
     fn flush(&self) {

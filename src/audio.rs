@@ -18,7 +18,9 @@
 //! rest keep the stamps' spacing. A jump in the stamps, such as the clock
 //! map settling as a session starts, trims again rather than adding the
 //! jump to the lead. Play and pause on the phone take about a quarter
-//! second to be heard, not two seconds.
+//! second to be heard, not two seconds. That is AirPlay 1's: an AirPlay 2
+//! phone's stamps are when it plays its own picture and its other
+//! speakers, so its audio ([`ReceiverHandler::audio_on_time`]) keeps them.
 //!
 //! **The sender's clock is matched to ours** by blastcast's [`RateMatch`]:
 //! a phone's stamps follow its own clock, tens of ppm off ours, and the
@@ -127,6 +129,9 @@ struct Slot {
     stream: Mutex<Option<Stream>>,
     /// Chunks are being dropped, and that has been logged.
     overflowing: AtomicBool,
+    /// The latest audio came on time, from AirPlay 2: its stream keeps its
+    /// stamps rather than trimming their lead.
+    on_time: Arc<AtomicBool>,
 }
 
 /// The stream handed out.
@@ -231,6 +236,25 @@ impl AirplayAudio {
         lock(&self.receivers).contains_key(target_id)
     }
 
+    /// Queues a native receiver's `chunk`, noting whether its stamps are
+    /// to be kept as they are.
+    fn handed_over(
+        &self,
+        receiver: &ReceiverInfo,
+        chunk: &PcmChunk,
+        play_at_us: Option<i64>,
+        on_time: bool,
+    ) {
+        if let Some(slot) = Slot::of(self, &receiver.target_id) {
+            slot.on_time.store(on_time, Ordering::Relaxed);
+            let item = Item::Chunk {
+                pcm: chunk.clone(),
+                play_at_us,
+            };
+            slot.send(&receiver.target_id, item);
+        }
+    }
+
     fn subscribe(&self, target_id: &str) -> Option<Received> {
         let receivers = lock(&self.receivers);
         let reader = receivers.get(target_id)?;
@@ -239,7 +263,10 @@ impl AirplayAudio {
             tx,
             flush_owed: false,
         });
-        Some(Received { items: rx })
+        Some(Received {
+            items: rx,
+            on_time: Arc::clone(&reader.slot.on_time),
+        })
     }
 }
 
@@ -278,13 +305,11 @@ impl ReceiverHandler for AirplayAudio {
     }
 
     fn audio(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, play_at_us: Option<i64>) {
-        if let Some(slot) = Slot::of(self, &receiver.target_id) {
-            let item = Item::Chunk {
-                pcm: chunk.clone(),
-                play_at_us,
-            };
-            slot.send(&receiver.target_id, item);
-        }
+        self.handed_over(receiver, chunk, play_at_us, false);
+    }
+
+    fn audio_on_time(&self, receiver: &ReceiverInfo, chunk: &PcmChunk, play_at_us: Option<i64>) {
+        self.handed_over(receiver, chunk, play_at_us, true);
     }
 
     fn flush(&self, receiver: &ReceiverInfo) {
@@ -339,6 +364,9 @@ async fn read(target_id: String, mut fifo: pipe::Receiver, slot: Arc<Slot>) {
 /// One stream of a receiver's audio, as it was handed over.
 struct Received {
     items: mpsc::Receiver<Item>,
+    /// Its slot's `on_time`: whether the lead may be trimmed. Not the
+    /// slot itself, whose sender would keep this open.
+    on_time: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -352,7 +380,8 @@ impl TimedSource for Received {
     }
 
     fn trim_lead(&self) -> Option<i64> {
-        Some(KEEP_LEAD.as_micros() as i64)
+        let on_time = self.on_time.load(Ordering::Relaxed);
+        (!on_time).then_some(KEEP_LEAD.as_micros() as i64)
     }
 
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
