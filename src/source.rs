@@ -135,6 +135,10 @@ impl<S: LiveSource> LiveSource for Resampled<S> {
         self.format
     }
 
+    fn source_format(&self) -> AudioFormat {
+        self.inner.source_format()
+    }
+
     fn is_live(&self) -> bool {
         self.inner.is_live()
     }
@@ -269,6 +273,7 @@ mod tests {
             .limit_frames(44_100);
         let mut session = to_session_format(Box::new(sine)).unwrap();
         assert_eq!(session.format(), SESSION_FORMAT);
+        assert_eq!(session.source_format(), CD, "what it was given");
         assert!(!session.is_live());
         let frames: usize = drain(&mut *session)
             .await
