@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use tas_audio::{SESSION_FORMAT, SineSource};
+use tas_audio::{AudioFormat, SESSION_FORMAT, SineSource, to_session_format};
 
 use std::sync::Mutex;
 
@@ -182,6 +182,41 @@ async fn a_group_plays_one_timeline_to_all_its_players() {
     groups.play(&group, tone(clock)).await.unwrap();
     let again = groups.get(&group).unwrap().stream.expect("a stream");
     assert_ne!(again.generation, stream.generation, "a new stream");
+}
+
+/// A stream reports the format its source arrived in, not the session
+/// format it was resampled to, on start and on seek.
+#[tokio::test(start_paused = true)]
+async fn a_resampled_stream_reports_its_source_format() {
+    let clock = ServerClock::new();
+    let groups = Groups::new(clock);
+    let (kitchen, _kq) = client(clock, "kitchen");
+    groups.connect(kitchen);
+    sleep_ms(1).await;
+    let group = groups.group_of("kitchen").unwrap().id;
+    let cd = AudioFormat::new(44_100, 2);
+    let resampled =
+        || to_session_format(Box::new(SineSource::new(cd, 440.0).paced(clock))).unwrap();
+
+    let source = resampled();
+    assert_eq!(
+        source.format(),
+        SESSION_FORMAT,
+        "resampled to the session's"
+    );
+    groups.play(&group, source).await.unwrap();
+    let stream = groups.get(&group).unwrap().stream.expect("a stream");
+    assert_eq!(stream.format, cd);
+
+    groups.play(&group, tone(clock)).await.unwrap();
+    let seeked = groups.get(&group).unwrap().stream.expect("a stream");
+    assert_eq!(
+        (seeked.generation, seeked.format),
+        (stream.generation, SESSION_FORMAT)
+    );
+    groups.play(&group, resampled()).await.unwrap();
+    let back = groups.get(&group).unwrap().stream.expect("a stream");
+    assert_eq!((back.generation, back.format), (stream.generation, cd));
 }
 
 /// The card's test: two players in one group stay in sync while one joins

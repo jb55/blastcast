@@ -76,7 +76,8 @@ pub struct StreamInfo {
     /// The source's [`LiveSource::kind`].
     pub source: &'static str,
     pub live: bool,
-    /// The source's format, before it is resampled to the session's.
+    /// The source's [`LiveSource::source_format`]: its format before it is
+    /// resampled to the session's.
     pub format: AudioFormat,
     /// Server-clock µs.
     pub started_us: i64,
@@ -843,7 +844,7 @@ impl Actor {
         let generation = self.next_generation;
         self.next_generation += 1;
         let ops = self.ops.clone();
-        let (kind, live, format) = (source.kind(), source.is_live(), source.format());
+        let (kind, live, format) = (source.kind(), source.is_live(), source.source_format());
         let group = self.group_mut(group_id)?;
         if let Some(playing) = &mut group.stream {
             playing.stream.seek(source)?;
