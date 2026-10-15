@@ -8,18 +8,17 @@ use std::time::Duration;
 
 use blastcast::SESSION_FORMAT;
 use blastcast_audio::SineSource;
+use blastcast_telemetry::{Point, Series, SpeakerState, Telemetry};
 use futures_util::StreamExt;
 use tas_airplay_out::testing::FakeSpeaker;
 use tas_airplay_out::{AirplayOutputs, RaopDevice};
 use tas_core::player::PlaybackState;
 use tas_core::{PlayerCommand, PlayerRegistry};
-use tas_proto::{Series, SpeakerState};
 use tas_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, ConnectionReason, HeaderLayout,
     PlayerStateReport, PlayerSupport, PlayerSyncState, StreamFormat, binary, roles,
 };
 use tas_sendspin::{Frame, SendspinServer, ServerConfig};
-use tas_telemetry::{Point, Telemetry};
 
 const WAIT: Duration = Duration::from_secs(10);
 const AP: &str = "apa1b2c3d4e5f6";

@@ -32,8 +32,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use blastcast::ServerClock;
-use tas_proto::Series;
-use tas_telemetry::Probe;
+use blastcast_telemetry::{Probe, Series};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;

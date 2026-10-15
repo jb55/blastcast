@@ -9,9 +9,8 @@ publish.workspace = true
 
 [dependencies]
 blastcast-mdns.workspace = true
-tas-proto.workspace = true
+blastcast-telemetry = { workspace = true, features = ["hub"] }
 tas-sendspin.workspace = true
-tas-telemetry.workspace = true
 
 blastcast.workspace = true
 bytes.workspace = true

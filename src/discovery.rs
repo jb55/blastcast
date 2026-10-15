@@ -15,9 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use blastcast_mdns::{BrowseEvent, Discovered, Mdns};
-use tas_proto::Speaker;
+use blastcast_telemetry::{Roster, Speaker};
 use tas_sendspin::SendspinServer;
-use tas_telemetry::Roster;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;

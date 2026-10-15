@@ -38,16 +38,15 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use blastcast_telemetry::{Probe, Roster, Series, Speaker, SpeakerSession, SpeakerState};
 use futures_channel::mpsc;
 use futures_util::StreamExt;
-use tas_proto::{Series, Speaker, SpeakerSession, SpeakerState};
 use tas_sendspin::protocol::{
     BinaryFrame, ClientHello, ClientMessage, ClientState, Codec, ConnectionReason, DeviceInfo,
     HeaderLayout, PlayerCommand, PlayerCommandKind, PlayerStateReport, PlayerSupport,
     PlayerSyncState, ServerMessage, StreamFormat, binary, roles,
 };
 use tas_sendspin::{Disconnect, Frame, SendspinServer};
-use tas_telemetry::{Probe, Roster};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
