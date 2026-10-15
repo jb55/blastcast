@@ -34,7 +34,8 @@ use tas_proto::{Column, Kind, Series, TelemetryFilter};
 use tokio::sync::{broadcast, watch};
 
 /// How far back a series' history goes: a minute, on the server clock.
-pub const WINDOW_US: i64 = 60_000_000;
+/// Clients keep as much ([`tas_proto::store::HISTORY_US`]).
+pub const WINDOW_US: i64 = tas_proto::store::HISTORY_US;
 /// The most points one series of one entity keeps, whatever its window:
 /// a minute of 20 ms chunks is 3000, and a source read ahead sends faster.
 pub const MAX_POINTS: usize = 4096;
