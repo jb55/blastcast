@@ -274,9 +274,47 @@ impl AirplayRouter {
         let Some(claim) = t.claim.take() else {
             return;
         };
+        if let Some(by) = self.taken_over(&targets, target_id, &claim.player_id) {
+            // Another receiver's session plays on the player now, as a
+            // member of a group player that sender picked: stopping it
+            // would stop that session's group. Only this one's stream and
+            // source session go.
+            tracing::info!(
+                target_id,
+                player_id = %claim.player_id,
+                by,
+                "AirPlay session ended; its player plays another session now"
+            );
+            self.audio.end_stream(target_id);
+            self.registry.set_source_session(&claim.player_id, None);
+            return;
+        }
         tracing::info!(target_id, player_id = %claim.player_id, "AirPlay session ended");
         self.release(target_id, &claim.player_id).await;
         self.stop(&claim.player_id).await;
+    }
+
+    /// The other receiver whose session plays on `player_id` now, itself
+    /// or through a group player it is a member of, if one does.
+    fn taken_over(
+        &self,
+        targets: &HashMap<String, Target>,
+        target_id: &str,
+        player_id: &str,
+    ) -> Option<String> {
+        targets
+            .iter()
+            .filter(|(id, _)| id.as_str() != target_id)
+            .find(|(_, t)| {
+                t.claim.as_ref().is_some_and(|c| {
+                    c.player_id == player_id
+                        || self
+                            .registry
+                            .get(&c.player_id)
+                            .is_some_and(|g| g.group_members.iter().any(|m| m == player_id))
+                })
+            })
+            .map(|(id, _)| id.clone())
     }
 
     /// Claims the source for `player_id` and plays it there.
@@ -711,6 +749,40 @@ mod tests {
 
     const KITCHEN: &str = "airplay_receiver://audio_source/kitchen";
     const BASE_URL: &str = "http://10.0.0.5:8095";
+
+    /// A sender moves from the kitchen's receiver to a group player's
+    /// with the kitchen in it. The kitchen's session ends 10 s later, and
+    /// must not stop the kitchen: that would stop the group playing.
+    #[tokio::test]
+    async fn an_ending_session_leaves_its_player_to_a_group_playing_another() {
+        let rig = Rig::new(true);
+        rig.marker(PLAY_BEGIN);
+        rig.wait(1).await;
+        let mut home = PlayerState::new("home", "fake", "Home".to_owned());
+        home.group_members = vec!["kitchen".into(), "den".into()];
+        let fake = Fake {
+            id: "home".into(),
+            log: Arc::clone(&rig.log),
+            source: Arc::default(),
+        };
+        rig.registry.add(home, Arc::new(fake)).unwrap();
+        rig.router.targets.lock().await.insert(
+            "home".into(),
+            Target {
+                claim: Some(Claim {
+                    player_id: "home".into(),
+                    session: 99,
+                }),
+                ..Default::default()
+            },
+        );
+        rig.marker(PLAY_END);
+        // Long enough for a stop, which takes the fake 30 ms.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let calls = rig.calls();
+        assert!(!calls.iter().any(|c| c.ends_with(" stop")), "{calls:?}");
+        assert_eq!(rig.get("kitchen").active_source, None);
+    }
 
     #[tokio::test]
     async fn a_session_plays_on_its_target_and_stops_at_the_end() {
