@@ -34,6 +34,10 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 x25519-dalek.workspace = true
 
+[features]
+# `testing`: an in-memory speaker for other crates' tests.
+testing = []
+
 [dev-dependencies]
 claxon.workspace = true
 futures-channel.workspace = true

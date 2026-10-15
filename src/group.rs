@@ -40,7 +40,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-use tas_audio::{AudioError, AudioFormat, LiveSource, ServerClock};
+use tas_audio::{AudioError, AudioFormat, IntoTimed, ServerClock, TimedSource};
 use tas_telemetry::Telemetry;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -73,10 +73,10 @@ pub struct GroupInfo {
 pub struct StreamInfo {
     /// New for every stream the groups start, across all groups.
     pub generation: u64,
-    /// The source's [`LiveSource::kind`].
+    /// The source's [`TimedSource::kind`].
     pub source: &'static str,
     pub live: bool,
-    /// The source's [`LiveSource::source_format`]: its format before it is
+    /// The source's [`TimedSource::source_format`]: its format before it is
     /// resampled to the session's.
     pub format: AudioFormat,
     /// Server-clock µs.
@@ -203,12 +203,12 @@ enum Op {
     },
     Play {
         group_id: String,
-        source: Box<dyn LiveSource>,
+        source: Box<dyn TimedSource>,
         reply: Reply<()>,
     },
     QueueNext {
         group_id: String,
-        source: Box<dyn LiveSource>,
+        source: Box<dyn TimedSource>,
         reply: Reply<()>,
     },
     Stop {
@@ -350,11 +350,8 @@ impl Groups {
 
     /// Plays `source` to the group. A group already playing jumps to it,
     /// as [`AudioStream::seek`] does.
-    pub async fn play(
-        &self,
-        group_id: &str,
-        source: Box<dyn LiveSource>,
-    ) -> Result<(), GroupError> {
+    pub async fn play(&self, group_id: &str, source: impl IntoTimed) -> Result<(), GroupError> {
+        let source = source.into_timed();
         self.call(|reply| Op::Play {
             group_id: group_id.into(),
             source,
@@ -367,8 +364,9 @@ impl Groups {
     pub async fn queue_next(
         &self,
         group_id: &str,
-        source: Box<dyn LiveSource>,
+        source: impl IntoTimed,
     ) -> Result<(), GroupError> {
+        let source = source.into_timed();
         self.call(|reply| Op::QueueNext {
             group_id: group_id.into(),
             source,
@@ -839,7 +837,7 @@ impl Actor {
         Ok(self.solo(conn))
     }
 
-    fn play(&mut self, group_id: &str, source: Box<dyn LiveSource>) -> Result<(), GroupError> {
+    fn play(&mut self, group_id: &str, source: Box<dyn TimedSource>) -> Result<(), GroupError> {
         let clock = self.clock;
         let generation = self.next_generation;
         self.next_generation += 1;

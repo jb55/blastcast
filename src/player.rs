@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tas_audio::LiveSource;
+use tas_audio::TimedSource;
 use tas_core::{CommandError, PlayerControl, SourceMetadata};
 
 use crate::connection::Connection;
@@ -135,7 +135,7 @@ impl PlayerControl for SendspinPlayer {
 
     /// Plays `source` to the group the player is in: for a follower, its
     /// leader's whole group.
-    async fn play_source(&self, source: Box<dyn LiveSource>) -> Result<(), CommandError> {
+    async fn play_source(&self, source: Box<dyn TimedSource>) -> Result<(), CommandError> {
         let group_id = self.group_id()?;
         self.groups.play(&group_id, source).await.map_err(failed)?;
         self.membership.sync();

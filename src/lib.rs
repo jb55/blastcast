@@ -14,6 +14,8 @@ pub mod server;
 pub mod stats;
 pub mod status;
 pub mod stream;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use connection::{Connection, Frame, SendError};
 pub use debug::DebugReport;
