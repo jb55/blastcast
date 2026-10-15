@@ -22,9 +22,9 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use blastcast::ServerClock;
+use blastcast_telemetry::Telemetry;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, future};
-use tas_telemetry::Telemetry;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 

@@ -40,8 +40,8 @@ use std::hash::{BuildHasher, RandomState};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use blastcast::{AudioError, AudioFormat, IntoTimed, ServerClock, TimedSource};
+use blastcast_telemetry::Telemetry;
 use bytes::Bytes;
-use tas_telemetry::Telemetry;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::connection::Connection;

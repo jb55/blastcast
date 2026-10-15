@@ -11,8 +11,7 @@ tas-core.workspace = true
 blastcast.workspace = true
 blastcast-audio.workspace = true
 blastcast-mdns.workspace = true
-tas-proto.workspace = true
-tas-telemetry.workspace = true
+blastcast-telemetry = { workspace = true, features = ["hub"] }
 aes-gcm.workspace = true
 async-trait.workspace = true
 axum.workspace = true

@@ -106,9 +106,8 @@ use blastcast::{AudioError, IntoTimed, SESSION_FORMAT, ServerClock, Span, TimedS
 #[cfg(doc)]
 use blastcast::{Item, LiveSource};
 use blastcast_audio::timed_to_session_format;
+use blastcast_telemetry::{Probe, Series};
 use bytes::Bytes;
-use tas_proto::Series;
-use tas_telemetry::Probe;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::Instrument;

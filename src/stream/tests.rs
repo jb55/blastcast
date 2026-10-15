@@ -14,7 +14,7 @@ use crate::protocol::{
     BinaryFrame, ClientHello, ClientState, Codec, ConnectionReason, HeaderLayout, PlayerSupport,
     RequestFormatPlayer, StreamFormat,
 };
-use tas_proto::Series;
+use blastcast_telemetry::Series;
 
 /// Bytes in a 20 ms chunk of 48 kHz stereo s16le.
 const CHUNK_BYTES: usize = 960 * 4;
@@ -713,11 +713,11 @@ async fn a_removed_player_gets_stream_end_even_while_paused() {
 
 /// `series` of `entity` as the hub holds it at `now_us`.
 fn track(
-    hub: &tas_telemetry::Telemetry,
+    hub: &blastcast_telemetry::Telemetry,
     now_us: i64,
     series: Series,
     entity: &str,
-) -> Vec<tas_telemetry::Point> {
+) -> Vec<blastcast_telemetry::Point> {
     hub.subscribe(now_us)
         .history
         .into_iter()
@@ -727,7 +727,7 @@ fn track(
 
 fn traced_player(
     clock: ServerClock,
-    hub: &tas_telemetry::Telemetry,
+    hub: &blastcast_telemetry::Telemetry,
     client_id: &str,
 ) -> (Arc<Connection>, Queues) {
     let (conn, q) = named_player(clock, client_id, vec![pcm(48_000, 16)], 0);
@@ -739,7 +739,7 @@ fn traced_player(
 #[tokio::test(start_paused = true)]
 async fn telemetry_matches_what_the_players_received() {
     let clock = ServerClock::new();
-    let hub = tas_telemetry::Telemetry::new();
+    let hub = blastcast_telemetry::Telemetry::new();
     let (kitchen, mut kq) = traced_player(clock, &hub, "kitchen");
     let (den, mut dq) = traced_player(clock, &hub, "den");
     let sine = SineSource::new(SESSION_FORMAT, 440.0).paced(clock);
@@ -791,7 +791,7 @@ async fn telemetry_matches_what_the_players_received() {
 #[tokio::test(start_paused = true)]
 async fn a_shift_and_a_seek_are_marked_on_the_stream() {
     let clock = ServerClock::new();
-    let hub = tas_telemetry::Telemetry::new();
+    let hub = blastcast_telemetry::Telemetry::new();
     let (conn, _q) = traced_player(clock, &hub, "kitchen");
     let source = Delayed::new(vec![20, 20, 20, 1000, 20, 20, 20, 20]);
     let stream = AudioStream::start_with(clock, source, hub.probe("s")).unwrap();
@@ -930,7 +930,7 @@ async fn a_timed_source_plays_at_its_stamps_at_any_chunk_size() {
 #[tokio::test(start_paused = true)]
 async fn too_little_lead_grows_the_added_latency_by_the_shortfall() {
     let clock = ServerClock::new();
-    let hub = tas_telemetry::Telemetry::new();
+    let hub = blastcast_telemetry::Telemetry::new();
     let (conn, mut q) = traced_player(clock, &hub, "kitchen");
     // 100 ms of lead against a 250 ms send-ahead, then 50 ms for a chunk,
     // then 100 ms again.
@@ -994,7 +994,7 @@ async fn a_flush_clears_the_players_and_resets_the_added_latency() {
 #[tokio::test(start_paused = true)]
 async fn a_jump_in_stamps_past_the_tolerance_moves_the_timeline() {
     let clock = ServerClock::new();
-    let hub = tas_telemetry::Telemetry::new();
+    let hub = blastcast_telemetry::Telemetry::new();
     let (conn, mut q) = traced_player(clock, &hub, "kitchen");
     // Chunk 5 comes 15 ms later than the frames before it put it, within
     // the tolerance; chunk 10 another 500 ms, past it.
@@ -1048,7 +1048,7 @@ async fn a_timed_source_with_the_lead_for_it_honours_the_required_lead() {
 #[tokio::test(start_paused = true)]
 async fn a_trimmable_source_starts_its_keep_past_the_floor() {
     let clock = ServerClock::new();
-    let hub = tas_telemetry::Telemetry::new();
+    let hub = blastcast_telemetry::Telemetry::new();
     let (conn, mut q) = traced_player(clock, &hub, "kitchen");
     // A second of lead, keeping 50 ms past the 250 ms send-ahead. From the
     // sixth chunk on each arrives 60 ms later, which the keep and the
@@ -1091,7 +1091,7 @@ async fn a_trimmable_source_starts_its_keep_past_the_floor() {
 #[tokio::test(start_paused = true)]
 async fn a_jump_in_a_trimmable_sources_stamps_trims_again() {
     let clock = ServerClock::new();
-    let hub = tas_telemetry::Telemetry::new();
+    let hub = blastcast_telemetry::Telemetry::new();
     let (conn, mut q) = traced_player(clock, &hub, "kitchen");
     // A second of lead, keeping 50 ms past the 250 ms send-ahead, as in
     // a_trimmable_source_starts_its_keep_past_the_floor. Then the stamps

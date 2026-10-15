@@ -22,9 +22,8 @@
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use blastcast_telemetry::{Probe, Series};
 use serde::Serialize;
-use tas_proto::Series;
-use tas_telemetry::Probe;
 
 use crate::protocol::{Codec, StreamFormat};
 
@@ -431,7 +430,7 @@ mod tests {
 
     #[test]
     fn each_time_request_and_pong_is_a_sample() {
-        let hub = tas_telemetry::Telemetry::new();
+        let hub = blastcast_telemetry::Telemetry::new();
         let s = LinkStats::with_probe(0, hub.probe("kitchen"));
         s.time_request(1_000, 6_000);
         s.pong(&LinkStats::ping_payload(10_000), 11_500);
