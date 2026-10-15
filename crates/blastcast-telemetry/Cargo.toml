@@ -1,0 +1,19 @@
+[package]
+name = "tas-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Tokio and tas-proto's series, nothing else: every protocol crate can emit
+# into the hub without depending on another's.
+[dependencies]
+tas-proto.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+allocation-counter = "0.8"
+
+[lints]
+workspace = true
