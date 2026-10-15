@@ -34,6 +34,15 @@
 //! does by default. A phone that left a dead connection behind can't lock
 //! the receiver.
 //!
+//! **What it reports.** The receiver is listed in
+//! [`NativeConfig::receivers`] while it runs, and each sender's stream in
+//! [`NativeConfig::sessions`], for `/v1/ws`. Its timings go to
+//! [`NativeConfig::telemetry`] under the receiver's source id: every
+//! timing reply and the clock map it leaves, each sync packet, each
+//! packet's lead and the buffer behind it, and marks for what the playout
+//! did (silence, a jump, running dry, a drift correction), resend
+//! requests, flushes, takeovers, and the session's begin and end.
+//!
 //! Like the rest of AirPlay input, audio only passes through: nothing is
 //! written anywhere.
 
@@ -58,6 +67,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tas_audio::{PcmChunk, ServerClock};
 use tas_mdns::service::{Service, TxtEntry};
+use tas_proto::Series;
+use tas_telemetry::{Probe, Roster, Telemetry};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
@@ -91,6 +102,13 @@ pub struct NativeConfig {
     /// Where a stream's three UDP ports come from, so a firewall can let
     /// the sender's audio in; any free port when `None`.
     pub udp_ports: Option<RangeInclusive<u16>>,
+    /// Where each receiver's timings go, on [`NativeConfig::clock`]; off
+    /// by default.
+    pub telemetry: Telemetry,
+    /// Every receiver running.
+    pub receivers: Roster<tas_proto::Receiver>,
+    /// Every sender's stream on one.
+    pub sessions: Roster<tas_proto::Session>,
 }
 
 /// The UDP ports streams use by default: three a stream, so ten at once.
@@ -110,6 +128,9 @@ impl NativeConfig {
             latency: Duration::from_millis(250),
             end_after: Duration::from_secs(10),
             udp_ports: Some(UDP_PORTS),
+            telemetry: Telemetry::default(),
+            receivers: Roster::default(),
+            sessions: Roster::default(),
         }
     }
 }
@@ -206,7 +227,23 @@ pub async fn serve(
         ),
         None => None,
     };
+    let id = crate::route::source_id(&info.target_id);
+    config.receivers.set(tas_proto::Receiver {
+        id: id.clone(),
+        target: info.target_id.clone(),
+        name: info.airplay_name.clone(),
+        port,
+        session: None,
+        playing: false,
+    });
+    let _listed = Listed {
+        receivers: config.receivers.clone(),
+        sessions: config.sessions.clone(),
+        id: id.clone(),
+    };
     let receiver = Arc::new(Receiver {
+        probe: config.telemetry.probe(&id),
+        id,
         config,
         info,
         handler,
@@ -251,8 +288,25 @@ pub async fn serve(
     Ok(())
 }
 
+/// Unlists a receiver and its sessions however its run ends.
+struct Listed {
+    receivers: Roster<tas_proto::Receiver>,
+    sessions: Roster<tas_proto::Session>,
+    id: String,
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        self.receivers.remove(&self.id);
+        self.sessions.retain(|s| s.receiver != self.id);
+    }
+}
+
 /// One target's receiver, shared by its connections.
 pub(crate) struct Receiver {
+    /// Its source id: what it is listed and measured under.
+    id: String,
+    probe: Probe,
     config: NativeConfig,
     info: ReceiverInfo,
     handler: Arc<dyn ReceiverHandler>,
@@ -288,9 +342,23 @@ impl Receiver {
         self.handler.audio(&self.info, chunk, play_at_us);
     }
 
-    /// `conn` announced a stream: it plays from now, and the connection
+    fn now_us(&self) -> i64 {
+        self.config.clock.now_us()
+    }
+
+    /// Marks `kind` on the receiver now.
+    fn mark(&self, kind: Series, detail: f64) {
+        self.probe.mark(kind, self.now_us(), detail);
+    }
+
+    /// The id `conn`'s stream is listed under.
+    fn session_id(&self, conn: u64) -> String {
+        format!("{}/{conn}", self.id)
+    }
+
+    /// `conn` announced `session`: it plays from now, and the connection
     /// that played before is dropped.
-    fn take_over(&self, conn: u64) {
+    fn take_over(&self, conn: u64, session: tas_proto::Session) {
         let mut state = self.lock();
         if let Some(previous) = state.current.replace(conn)
             && previous != conn
@@ -298,7 +366,14 @@ impl Receiver {
         {
             tracing::info!(previous, "a new AirPlay sender takes over");
             handle.abort();
+            self.mark(Series::Takeover, 0.0);
         }
+        drop(state);
+        let id = session.id.clone();
+        self.config.sessions.set(session);
+        self.config
+            .receivers
+            .modify(&self.id, |r| r.session = Some(id));
     }
 
     /// `conn` started recording: the session begins, unless it is on.
@@ -312,6 +387,8 @@ impl Receiver {
             state.playing = true;
             drop(state);
             tracing::info!(target_id = %self.info.target_id, "AirPlay session begins");
+            self.mark(Series::PlayBegin, 0.0);
+            self.config.receivers.modify(&self.id, |r| r.playing = true);
             self.event(MetadataEvent::PlayBegin);
         }
     }
@@ -327,9 +404,11 @@ impl Receiver {
     /// on it, the session ends unless a sender records again soon. The
     /// connection stays droppable, as a sender can stream on it again.
     fn release(self: &Arc<Self>, conn: u64) {
+        self.config.sessions.remove(&self.session_id(conn));
         let mut state = self.lock();
         if state.current == Some(conn) {
             state.current = None;
+            self.config.receivers.modify(&self.id, |r| r.session = None);
         }
         if state.owner != Some(conn) {
             return;
@@ -345,6 +424,8 @@ impl Receiver {
                 state.end_timer = None;
                 drop(state);
                 tracing::info!(target_id = %me.info.target_id, "AirPlay session ends");
+                me.mark(Series::PlayEnd, 0.0);
+                me.config.receivers.modify(&me.id, |r| r.playing = false);
                 me.event(MetadataEvent::PlayEnd);
             }
         }));

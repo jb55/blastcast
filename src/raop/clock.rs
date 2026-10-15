@@ -43,6 +43,14 @@ pub fn us_ntp(us: i64) -> u64 {
     (secs << 32) | ((micros << 32) / 1_000_000)
 }
 
+/// One timing reply, in µs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingSample {
+    pub round_trip_us: i64,
+    /// Sender NTP time less server-clock time.
+    pub offset_us: i64,
+}
+
 /// Estimates the sender's NTP clock against the server clock, as a
 /// [`ClockMap`].
 #[derive(Debug, Default)]
@@ -54,11 +62,11 @@ pub struct NtpEstimator {
 }
 
 impl NtpEstimator {
-    /// A timing reply read at server-clock `now_us`. Returns whether it
+    /// A timing reply read at server-clock `now_us`: its sample, if it
     /// was one.
-    pub fn reply(&mut self, packet: &[u8], now_us: i64) -> bool {
+    pub fn reply(&mut self, packet: &[u8], now_us: i64) -> Option<TimingSample> {
         if packet.len() < 32 || crate::raop::rtp::payload_type(packet) != Some(0x53) {
-            return false;
+            return None;
         }
         let read = |at: usize| u64::from_be_bytes(packet[at..at + 8].try_into().expect("8 bytes"));
         // Our send time, their receive and transmit, our receive.
@@ -67,14 +75,17 @@ impl NtpEstimator {
         let t4 = now_us;
         let round_trip = (t4 - t1) - (t3 - t2);
         if round_trip < 0 {
-            return false;
+            return None;
         }
         let offset = ((t2 - t1) + (t3 - t4)) / 2;
         if self.samples.len() == SAMPLES {
             self.samples.pop_front();
         }
         self.samples.push_back((round_trip, offset, (t1 + t4) / 2));
-        true
+        Some(TimingSample {
+            round_trip_us: round_trip,
+            offset_us: offset,
+        })
     }
 
     /// The sender's clock against ours, once a reply came: the offset of
@@ -186,7 +197,14 @@ mod tests {
         let request = crate::raop::rtp::timing_request(us_ntp(sent_us));
         let theirs = sent_us + delay + offset;
         let reply = sender::timing_reply(&request, us_ntp(theirs)).unwrap();
-        assert!(map.reply(&reply, sent_us + 2 * delay));
+        let got = map.reply(&reply, sent_us + 2 * delay).expect("a reply");
+        assert_eq!(
+            got,
+            TimingSample {
+                round_trip_us: 2 * delay,
+                offset_us: offset
+            }
+        );
     }
 
     #[test]
@@ -199,9 +217,9 @@ mod tests {
         // A slow reply skewed by queueing on the way back only.
         let request = crate::raop::rtp::timing_request(us_ntp(10_000));
         let reply = sender::timing_reply(&request, us_ntp(10_000 + 1_000 + offset)).unwrap();
-        assert!(map.reply(&reply, 10_000 + 1_000 + 40_000));
+        assert!(map.reply(&reply, 10_000 + 1_000 + 40_000).is_some());
         assert_eq!(map.offset_us(), Some(offset), "the quick one still wins");
-        assert!(!map.reply(&request, 0), "a request isn't a reply");
+        assert!(map.reply(&request, 0).is_none(), "a request isn't a reply");
     }
 
     #[test]

@@ -33,6 +33,10 @@
 //! corrected one frame a packet: one frame dropped when the sender runs
 //! fast, one repeated when it runs slow. That is at most one frame in
 //! 352, inaudible, and far more than any real drift.
+//!
+//! **Notes.** Each of those (a gap played as silence, a jump skipped, the
+//! buffer running dry, a frame dropped or repeated) is kept as a [`Note`]
+//! until [`Playout::take_notes`], so the connection can report it.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -66,6 +70,19 @@ pub enum Inserted {
     Overflow,
 }
 
+/// Something the playout did that the stream's telemetry marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Note {
+    /// A gap played as this many frames of silence.
+    Silence(i64),
+    /// The timestamps jumped by this many frames, skipped over.
+    Jump(i64),
+    /// Nothing to play for a latency: idle.
+    RanDry,
+    /// One frame dropped (1) or repeated (-1) for drift.
+    Corrected(i64),
+}
+
 /// Interleaved stereo s16 frames, ready to play.
 pub type Frames = Vec<i16>;
 
@@ -89,6 +106,7 @@ pub struct Playout {
     /// at or after it comes.
     flushed_before: Option<u32>,
     drift: Drift,
+    notes: Vec<Note>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,16 +160,21 @@ impl Drift {
         }
     }
 
-    /// Drops or repeats a frame of `frames`, if a correction is due.
-    fn correct(&mut self, frames: &mut Frames) {
+    /// Drops or repeats a frame of `frames`, if a correction is due, and
+    /// says which.
+    fn correct(&mut self, frames: &mut Frames) -> Option<Note> {
         let n = frames.len() / CHANNELS;
         if self.correction > 0 && n > 1 {
             frames.truncate((n - 1) * CHANNELS);
             self.correction -= 1;
+            Some(Note::Corrected(1))
         } else if self.correction < 0 && n > 0 {
             let last = frames[(n - 1) * CHANNELS..].to_vec();
             frames.extend_from_slice(&last);
             self.correction += 1;
+            Some(Note::Corrected(-1))
+        } else {
+            None
         }
     }
 }
@@ -168,7 +191,24 @@ impl Playout {
             playhead: None,
             flushed_before: None,
             drift: Drift::default(),
+            notes: Vec::new(),
         }
+    }
+
+    /// What it did since the last call, in order.
+    pub fn take_notes(&mut self) -> std::vec::Drain<'_, Note> {
+        self.notes.drain(..)
+    }
+
+    /// Frames queued and not yet played: from the playhead to the end of
+    /// the newest packet.
+    pub fn buffered_frames(&self) -> i64 {
+        let Some(head) = self.playhead else {
+            return 0;
+        };
+        self.packets.last_key_value().map_or(0, |(at, f)| {
+            (at + (f.len() / CHANNELS) as i64 - head.rtp).max(0)
+        })
     }
 
     pub fn is_idle(&self) -> bool {
@@ -252,6 +292,7 @@ impl Playout {
                 if now >= due + self.latency {
                     tracing::debug!("AirPlay audio ran dry; idle until the next packet");
                     self.flush(None);
+                    self.notes.push(Note::RanDry);
                 }
                 break;
             };
@@ -261,6 +302,7 @@ impl Playout {
                 if gap > MAX_GAP_FRAMES {
                     tracing::debug!(gap, "AirPlay timestamps jumped; skipping ahead");
                     head.rtp = at;
+                    self.notes.push(Note::Jump(gap));
                     continue;
                 }
                 let n = gap.min(SILENCE_FRAMES);
@@ -270,11 +312,14 @@ impl Playout {
                 });
                 head.rtp += n;
                 head.played += n as u64;
+                self.notes.push(Note::Silence(n));
                 continue;
             }
             let (_, mut frames) = self.packets.pop_first().expect("checked above");
             let n = (frames.len() / CHANNELS) as i64;
-            self.drift.correct(&mut frames);
+            if let Some(note) = self.drift.correct(&mut frames) {
+                self.notes.push(note);
+            }
             let rtp = head.rtp as u32;
             head.rtp += n;
             head.played += (frames.len() / CHANNELS) as u64;
@@ -347,8 +392,14 @@ mod tests {
         let mut p = Playout::new(LATENCY);
         p.insert(t0, 0, packet(PACKET, 1));
         p.insert(t0, 2 * PACKET, packet(PACKET, 3));
+        assert_eq!(p.buffered_frames(), 3 * i64::from(PACKET));
         let played = p.pop_due(t0 + ms(300));
         assert_eq!(summary(&played), [(1, 352), (0, 352), (3, 352)]);
+        assert_eq!(
+            p.take_notes().collect::<Vec<_>>(),
+            [Note::Silence(i64::from(PACKET))]
+        );
+        assert_eq!(p.buffered_frames(), 0);
         // Each keeps its place on the sender's timeline.
         let rtps: Vec<u32> = played.iter().map(|c| c.rtp).collect();
         assert_eq!(rtps, [0, PACKET, 2 * PACKET]);
@@ -378,6 +429,7 @@ mod tests {
         assert!(!p.is_idle());
         assert!(p.pop_due(due + LATENCY).is_empty());
         assert!(p.is_idle());
+        assert_eq!(p.take_notes().collect::<Vec<_>>(), [Note::RanDry]);
         assert_eq!(p.wake_at(), None);
 
         // Sent again ten seconds on: anchored to its own arrival.
@@ -424,12 +476,17 @@ mod tests {
         p.insert(t0, 0, packet(PACKET, 1));
         p.insert(t0, 5 * 44_100, packet(PACKET, 2));
         assert_eq!(summary(&p.pop_due(t0 + ms(300))), [(1, 352), (2, 352)]);
+        assert_eq!(
+            p.take_notes().collect::<Vec<_>>(),
+            [Note::Jump(5 * 44_100 - i64::from(PACKET))]
+        );
     }
 
     /// A sender `ppm` fast (positive) or slow, sending a packet every
     /// 352 of its frames for `secs`: how far what is buffered strays from
-    /// the drift target over the second half, below and above it.
-    fn drift(ppm: f64, secs: u64) -> (i64, i64) {
+    /// the drift target over the second half, below and above it, and
+    /// the frames dropped (positive) or repeated less those repeated.
+    fn drift(ppm: f64, secs: u64) -> (i64, i64, i64) {
         let t0 = Instant::now();
         let mut p = Playout::new(LATENCY);
         let period = Duration::from_secs_f64(f64::from(PACKET) / 44_100.0 / (1.0 + ppm / 1e6));
@@ -452,7 +509,14 @@ mod tests {
             p.pop_due(now);
             i += 1;
         }
-        (below, above)
+        let corrected = p
+            .take_notes()
+            .map(|n| match n {
+                Note::Corrected(f) => f,
+                other => panic!("{other:?}"),
+            })
+            .sum();
+        (below, above, corrected)
     }
 
     #[test]
@@ -462,14 +526,20 @@ mod tests {
         // a packet's 352 frames the playhead was.
         let slack = DRIFT_DEADBAND_FRAMES + 2 * i64::from(PACKET);
         for ppm in [-300.0, 300.0] {
-            let (below, above) = drift(ppm, 300);
+            let (below, above, corrected) = drift(ppm, 300);
             assert!(
                 below <= slack && above <= slack,
                 "{ppm} ppm: {below} below, {above} above"
             );
+            // Each correction is noted: most of the 3 969 frames, dropped
+            // for a fast sender and repeated for a slow one.
+            assert!(
+                corrected.signum() == ppm.signum() as i64 && corrected.abs() > 3_000,
+                "{ppm} ppm: {corrected} corrected"
+            );
         }
         // On time, it stays within a packet.
-        let (below, above) = drift(0.0, 60);
+        let (below, above, _) = drift(0.0, 60);
         assert!(
             below <= i64::from(PACKET) && above <= i64::from(PACKET),
             "{below} {above}"

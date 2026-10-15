@@ -11,6 +11,8 @@ use base64::Engine;
 use rsa::Pkcs1v15Sign;
 use tas_airplay_out::{NtpClock, RaopSession};
 use tas_audio::{PcmChunk, ServerClock};
+use tas_proto::Series;
+use tas_telemetry::{Point, Telemetry};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
@@ -58,6 +60,9 @@ impl Recorder {
 struct Rig {
     addr: SocketAddr,
     clock: ServerClock,
+    hub: Telemetry,
+    receivers: tas_telemetry::Roster<tas_proto::Receiver>,
+    sessions: tas_telemetry::Roster<tas_proto::Session>,
     recorder: Arc<Recorder>,
     stop: watch::Sender<bool>,
     task: JoinHandle<io::Result<()>>,
@@ -76,6 +81,12 @@ impl Rig {
         config.end_after = Duration::from_millis(300);
         // Tests run side by side; any port will do.
         config.udp_ports = None;
+        config.telemetry = Telemetry::new();
+        let (hub, receivers, sessions) = (
+            config.telemetry.clone(),
+            config.receivers.clone(),
+            config.sessions.clone(),
+        );
         let info = ReceiverInfo::native(DEVICE, "Kitchen".into(), addr.port(), None);
         let (stop, mut stopped) = watch::channel(false);
         let handler = recorder.clone();
@@ -85,6 +96,9 @@ impl Rig {
         Self {
             addr,
             clock,
+            hub,
+            receivers,
+            sessions,
             recorder,
             stop,
             task,
@@ -99,6 +113,33 @@ impl Rig {
         }
     }
 
+    /// Every point of `series` the receiver has emitted.
+    fn points(&self, series: Series) -> Vec<Point> {
+        let entity = crate::route::source_id(DEVICE);
+        self.hub
+            .subscribe(self.clock.now_us())
+            .history
+            .into_iter()
+            .filter(|t| t.series == series && *t.entity == *entity)
+            .flat_map(|t| t.points)
+            .collect()
+    }
+
+    async fn until_point(&self, series: Series) -> Vec<Point> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let points = self.points(series);
+            if !points.is_empty() {
+                return points;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {series:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     async fn shutdown(self) {
         self.stop.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(5), self.task)
@@ -106,6 +147,8 @@ impl Rig {
             .expect("serve stopped")
             .unwrap()
             .unwrap();
+        assert!(self.receivers.all().is_empty(), "unlisted once it stops");
+        assert!(self.sessions.all().is_empty());
     }
 }
 
@@ -196,7 +239,7 @@ struct Phone {
     key: [u8; 16],
     iv: [u8; 16],
     control: UdpSocket,
-    timing: UdpSocket,
+    timing: Arc<UdpSocket>,
     audio: UdpSocket,
     server: SocketAddr,
     seq: u16,
@@ -213,7 +256,7 @@ impl Phone {
             key: *b"an aes key, 16 b",
             iv: *b"and its iv, 16 b",
             control: udp().await.unwrap(),
-            timing: udp().await.unwrap(),
+            timing: Arc::new(udp().await.unwrap()),
             audio: udp().await.unwrap(),
             server: addr,
             seq: 65_530,
@@ -298,6 +341,21 @@ impl Phone {
         let record = self.request("RECORD", &[("RTP-Info", info)], None).await;
         assert_eq!(record.status, 200);
         ports
+    }
+
+    /// Answers the receiver's timing requests from a clock `offset_us`
+    /// ahead of `clock`, as long as the phone is around.
+    fn keep_time(&self, clock: ServerClock, offset_us: i64) -> JoinHandle<()> {
+        let timing = self.timing.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok((n, from)) = timing.recv_from(&mut buf).await {
+                let now = clock::us_ntp(clock.now_us() + offset_us);
+                if let Some(reply) = tas_airplay_out::rtp::timing_reply(&buf[..n], now) {
+                    let _ = timing.send_to(&reply, from).await;
+                }
+            }
+        })
     }
 
     /// The next packet of `samples`, encrypted and compressed.
@@ -449,6 +507,96 @@ async fn an_iphone_like_sender_with_a_lost_packet_and_metadata() {
         r.events().last() == Some(&MetadataEvent::PlayEnd)
     })
     .await;
+    rig.shutdown().await;
+}
+
+/// What the receiver measures of a phone whose clock reads [`OFFSET_US`]
+/// ahead of ours: the offset itself, each sync's mapped play time, each
+/// packet's lead, and marks for a lost packet played as silence, a flush
+/// and the session's ends. The receiver and the session are listed while
+/// they last.
+#[tokio::test]
+async fn a_phones_timeline_and_its_losses_are_telemetry() {
+    const OFFSET_US: i64 = 3_000_000_000;
+    const AHEAD_US: i64 = 2_000_000;
+    let rig = Rig::start().await;
+    let mut phone = Phone::connect(rig.addr).await;
+    let _time = phone.keep_time(rig.clock, OFFSET_US);
+    let [server_port, control_port, _] = phone.start().await;
+    let receiver_id = crate::route::source_id(DEVICE);
+    let sessions = rig.sessions.all();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let session = &sessions[0];
+    assert_eq!(
+        (
+            &*session.receiver,
+            &*session.sender,
+            &*session.codec,
+            session.encrypted
+        ),
+        (&*receiver_id, "127.0.0.1", "alac", true)
+    );
+    let receiver = rig.receivers.all();
+    assert_eq!(receiver[0].session.as_ref(), Some(&session.id));
+    assert!(receiver[0].playing);
+    assert_eq!(rig.points(Series::PlayBegin).len(), 1);
+
+    // The opening burst of timing requests, each answered.
+    for p in rig.until_point(Series::ClockMap).await {
+        assert!((p.value as i64 - OFFSET_US).abs() < 1_000, "{p:?}");
+    }
+    for p in rig.points(Series::ClockOffset) {
+        assert!((p.value as i64 - OFFSET_US).abs() < 1_000, "{p:?}");
+    }
+    assert!(
+        rig.points(Series::Rtt)
+            .iter()
+            .all(|p| (0.0..10_000.0).contains(&p.value))
+    );
+
+    // The next frame plays two seconds from now, on the phone's clock.
+    let at = rig.clock.now_us() + AHEAD_US;
+    let sync = tas_airplay_out::rtp::sync_packet(true, phone.rtp, clock::us_ntp(at + OFFSET_US), 0);
+    let control = SocketAddr::new(phone.server.ip(), control_port);
+    phone.control.send_to(&sync, control).await.unwrap();
+    let synced = rig.until_point(Series::Sync).await;
+    assert!(
+        (synced[0].value as i64 - at).abs() < 1_000,
+        "{synced:?} for {at}"
+    );
+
+    // Three packets, the second lost and never sent again.
+    let server = SocketAddr::new(phone.server.ip(), server_port);
+    for i in 0..3 {
+        let (_, packet) = phone.packet(&tone(352, i * 352));
+        if i != 1 {
+            phone.audio.send_to(&packet, server).await.unwrap();
+        }
+    }
+    let lead = rig.until_point(Series::Lead).await;
+    assert!((lead[0].value as i64 - AHEAD_US).abs() < 50_000, "{lead:?}");
+    assert!(!rig.until_point(Series::Buffered).await.is_empty());
+    let asked = rig.until_point(Series::ResendAsked).await;
+    assert_eq!(asked[0].value, 1.0);
+    let silence = rig.until_point(Series::Silence).await;
+    assert_eq!(silence[0].value.round(), 7982.0, "352 frames");
+
+    phone
+        .request(
+            "FLUSH",
+            &[(
+                "RTP-Info",
+                format!("seq={};rtptime={}", phone.seq, phone.rtp),
+            )],
+            None,
+        )
+        .await;
+    assert_eq!(rig.points(Series::Flush).len(), 1);
+
+    drop(phone);
+    rig.until_point(Series::PlayEnd).await;
+    assert!(rig.sessions.all().is_empty());
+    assert!(!rig.receivers.all()[0].playing);
     rig.shutdown().await;
 }
 

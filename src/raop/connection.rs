@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tas_audio::PcmChunk;
+use tas_proto::Series;
+use tas_telemetry::Probe;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Notify;
@@ -29,10 +31,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::Instrument;
 
-use super::announce::{Announce, Decoder};
+use super::announce::{Announce, Codec, Decoder, SAMPLE_RATE};
 use super::clock::{self, SyncPacket, Timeline};
 use super::crypto::{self, AudioCipher};
-use super::playout::{Inserted, Playout};
+use super::playout::{Inserted, Note, Playout};
 use super::rtsp::{self, Request, Response};
 use super::{AIRTUNES_VERSION, Receiver, bind_udp, params, rtp};
 use crate::audio::AIRPLAY_FORMAT;
@@ -168,7 +170,23 @@ impl Connection {
                     user_agent = req.header("User-Agent").unwrap_or_default(),
                     "AirPlay sender announced a stream"
                 );
-                self.receiver.take_over(self.id);
+                let session = tas_proto::Session {
+                    id: self.receiver.session_id(self.id),
+                    receiver: self.receiver.id.clone(),
+                    sender: self.peer.to_string(),
+                    sender_name: req
+                        .header("X-Apple-Client-Name")
+                        .or_else(|| req.header("User-Agent"))
+                        .map(str::to_owned),
+                    codec: match announce.codec {
+                        Codec::Alac(_) => "alac",
+                        Codec::L16 => "l16",
+                    }
+                    .into(),
+                    encrypted: announce.cipher.is_some(),
+                    since_us: self.receiver.now_us(),
+                };
+                self.receiver.take_over(self.id, session);
                 self.stream = None;
                 self.announce = Some(announce);
                 Response::ok()
@@ -334,6 +352,7 @@ struct Ingest {
     undecodable: u64,
     /// When the sender means each frame to play.
     timeline: Timeline,
+    probe: Probe,
 }
 
 impl Ingest {
@@ -378,12 +397,39 @@ impl Ingest {
         };
         let resumed = std::mem::take(&mut self.paused);
         match self.playout.insert(now, header.timestamp, frames) {
-            Inserted::Queued => {}
+            Inserted::Queued => {
+                let now_us = self.timeline.clock.now_us();
+                if let Some(at) = self.timeline.play_at_us(header.timestamp) {
+                    self.probe
+                        .sample(Series::Lead, now_us, (at - now_us) as f64);
+                }
+                let buffered = frames_us(self.playout.buffered_frames());
+                self.probe.sample(Series::Buffered, now_us, buffered);
+            }
             Inserted::Overflow => tracing::debug!("AirPlay buffer full; dropping a packet"),
             other => tracing::trace!(seq = header.seq, ?other, "AirPlay packet not queued"),
         }
         (missing, resumed)
     }
+
+    /// Marks what the playout did since the last call.
+    fn note(&mut self) {
+        let now_us = self.timeline.clock.now_us();
+        for note in self.playout.take_notes() {
+            let (kind, detail) = match note {
+                Note::Silence(frames) => (Series::Silence, frames_us(frames)),
+                Note::Jump(frames) => (Series::TimestampJump, frames_us(frames)),
+                Note::RanDry => (Series::RanDry, 0.0),
+                Note::Corrected(frames) => (Series::DriftCorrection, frames as f64),
+            };
+            self.probe.mark(kind, now_us, detail);
+        }
+    }
+}
+
+/// `frames` at the stream's rate, in µs.
+fn frames_us(frames: i64) -> f64 {
+    frames as f64 * 1e6 / f64::from(SAMPLE_RATE)
 }
 
 impl Stream {
@@ -405,6 +451,7 @@ impl Stream {
         ];
         let latency = receiver.config.latency;
         let clock = receiver.config.clock;
+        let probe = receiver.probe.clone();
         let shared = Arc::new(Shared {
             receiver,
             ingest: Mutex::new(Ingest {
@@ -416,6 +463,7 @@ impl Stream {
                 paused: false,
                 undecodable: 0,
                 timeline: Timeline::new(clock),
+                probe,
             }),
             queued: Notify::new(),
         });
@@ -446,6 +494,7 @@ impl Stream {
             std::mem::replace(&mut ingest.paused, true)
         };
         self.shared.queued.notify_one();
+        self.shared.receiver.mark(Series::Flush, 0.0);
         if !was_paused {
             self.shared.receiver.event(MetadataEvent::Paused);
         }
@@ -482,6 +531,7 @@ async fn queue(
     }
     if let (Some((first, count)), Some(to)) = (missing, control_to) {
         tracing::debug!(first, count, "asking for lost AirPlay packets");
+        shared.receiver.mark(Series::ResendAsked, f64::from(count));
         let _ = control
             .send_to(&rtp::resend_request(request_seq, first, count), to)
             .await;
@@ -540,6 +590,10 @@ async fn receive_control(shared: Arc<Shared>, socket: Arc<UdpSocket>, peer: IpAd
                         tracing::debug!(?sync, "the AirPlay sender's first sync");
                     }
                     ingest.timeline.sync(sync);
+                    if let Some(at) = ingest.timeline.play_at_us(sync.rtp) {
+                        let now_us = ingest.timeline.clock.now_us();
+                        ingest.probe.mark(Series::Sync, now_us, at as f64);
+                    }
                 }
             }
             other => tracing::trace!(?other, "unknown AirPlay control packet"),
@@ -574,7 +628,16 @@ async fn keep_time(
                 }
                 let packet = &buf[..n];
                 let now = clock.now_us();
-                if shared.lock().timeline.estimator.reply(packet, now) {
+                let reply = {
+                    let mut ingest = shared.lock();
+                    let estimator = &mut ingest.timeline.estimator;
+                    estimator.reply(packet, now).zip(estimator.map())
+                };
+                if let Some((sample, map)) = reply {
+                    let probe = &shared.receiver.probe;
+                    probe.sample(Series::ClockOffset, now, sample.offset_us as f64);
+                    probe.sample(Series::Rtt, now, sample.round_trip_us as f64);
+                    probe.sample(Series::ClockMap, now, map.offset_us as f64);
                     continue;
                 }
                 // It asks ours: the server clock, as NTP.
@@ -603,6 +666,7 @@ async fn play_out(shared: Arc<Shared>) {
         let due: Vec<_> = {
             let mut ingest = shared.lock();
             let due = ingest.playout.pop_due(Instant::now());
+            ingest.note();
             due.into_iter()
                 .map(|p| (ingest.timeline.play_at_us(p.rtp), p.frames))
                 .collect()
