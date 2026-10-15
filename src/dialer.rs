@@ -15,9 +15,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use blastcast_mdns::service::{SENDSPIN_CLIENT_TYPE, SENDSPIN_PATH};
+use blastcast_mdns::{BrowseEvent, Mdns, SendspinClient};
 use futures_util::{SinkExt, StreamExt, future};
-use tas_mdns::service::{SENDSPIN_CLIENT_TYPE, SENDSPIN_PATH};
-use tas_mdns::{BrowseEvent, Mdns, SendspinClient};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};

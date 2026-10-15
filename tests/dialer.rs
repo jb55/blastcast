@@ -5,9 +5,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use blastcast_mdns::SendspinClient;
 use futures_util::{SinkExt, StreamExt};
 use tas_core::PlayerRegistry;
-use tas_mdns::SendspinClient;
 use tas_sendspin::protocol::{
     ClientGoodbye, ClientHello, ClientMessage, ConnectionReason, GoodbyeReason, ServerMessage,
 };
