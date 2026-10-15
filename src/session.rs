@@ -441,13 +441,19 @@ impl RaopSession {
 
     pub async fn set_volume(&mut self, db: f32) -> Result<(), SessionError> {
         let body = format!("volume: {db:.6}\r\n");
+        self.set_parameter("text/parameters", body.as_bytes()).await
+    }
+
+    /// Tells the speaker something in a `SET_PARAMETER`: what is playing as
+    /// a DMAP listing (`application/x-dmap-tagged`), its cover art
+    /// (`image/jpeg`), or `text/parameters` such as the volume.
+    pub async fn set_parameter(
+        &mut self,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<(), SessionError> {
         self.rtsp
-            .request(
-                "SET_PARAMETER",
-                &self.uri,
-                &[],
-                Some(("text/parameters", body.as_bytes())),
-            )
+            .request("SET_PARAMETER", &self.uri, &[], Some((content_type, body)))
             .await?;
         Ok(())
     }
