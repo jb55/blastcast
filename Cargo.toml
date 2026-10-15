@@ -11,20 +11,26 @@ publish = false
 
 [workspace.dependencies]
 blastcast = { path = "crates/blastcast" }
+blastcast-airplay = { path = "crates/blastcast-airplay" }
 blastcast-airplay-out = { path = "crates/blastcast-airplay-out" }
 blastcast-audio = { path = "crates/blastcast-audio" }
 blastcast-mdns = { path = "crates/blastcast-mdns" }
 blastcast-sendspin = { path = "crates/blastcast-sendspin" }
 blastcast-telemetry = { path = "crates/blastcast-telemetry", default-features = false }
 
+aes = "0.8"
 aes-gcm = "0.10"
+alac = { version = "0.5", default-features = false }
+alac-encoder = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bytes = "1"
+cbc = "0.1"
 chacha20poly1305 = "0.10"
 claxon = "0.4"
 crypto-bigint = "0.5"
+ed25519-dalek = "2"
 flacenc = { version = "0.5", default-features = false }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
@@ -35,15 +41,21 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 mdns-sd = "0.21"
 opus = "0.4"
 opus-pure = "0.2"
+plist = { version = "1", default-features = false }
+rsa = "0.9"
 rubato = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
 sha2 = "0.10"
+symphonia-codec-aac = "0.6"
+symphonia-core = "0.6"
 tempfile = "3"
 thiserror = "2"
 tokio = "1"
 tokio-tungstenite = "0.29"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [workspace.lints.rust]

@@ -6,9 +6,7 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# A native AirPlay 1 and 2 receiver, into the blastcast timeline. It
-# depends on no tas-* crate (scripts/check.sh), so it moves to blastcast
-# as a directory.
+# A native AirPlay 1 and 2 receiver, into the blastcast timeline.
 [dependencies]
 aes.workspace = true
 alac.workspace = true
@@ -32,7 +30,7 @@ sha2.workspace = true
 symphonia-codec-aac.workspace = true
 symphonia-core.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 x25519-dalek.workspace = true
 

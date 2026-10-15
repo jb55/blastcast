@@ -13,14 +13,12 @@ It is a cargo workspace, one crate per directory under `crates/`:
 | crate | what it holds |
 |---|---|
 | `blastcast` | the timing core: the clock, clock maps, anchors, timed sources, the rate match and the timeline |
+| `blastcast-airplay` | AirPlay input: the native RAOP receiver (`raop`), AirPlay 2 with pairing, FairPlay setup and PTP (`ap2`), each receiver kept running (`receiver`), and the sender's audio as a timed source with its metadata. An app supplies the AirPlay 2 identity's storage; behind the `testing` feature, an AirPlay 2 sender for other crates' tests |
 | `blastcast-airplay-out` | AirPlay 1 output: a native RAOP sender (RTSP, ALAC, RTP, NTP timing, resends), discovery of `_raop._tcp` speakers, and the bridge that makes each speaker a Sendspin player (`AirplayOutputs`); a fake RAOP speaker in `testing` |
 | `blastcast-audio` | audio plumbing between protocols: PCM sample conversion (`pcm`), a streaming resampler over rubato (`StreamResampler`, `Resampled`, `TimedResampled`, `to_session_format`) and a test tone (`SineSource`) |
 | `blastcast-mdns` | one mDNS responder shared by every protocol: our adverts (any `Service`, with `_sendspin-server._tcp` and `_mass._tcp` built in) and browsing for players |
 | `blastcast-telemetry` | every timing a protocol measures: the `Series` (with its `Kind` and `Unit`), `Point` and the status types (`Stream`, `Receiver`, `Session`, `Speaker`), serde only; and behind the default `hub` feature, on tokio, the hub (`Telemetry`, `Probe`), a minute of history per series streamed live, and `Roster`, a watch of a protocol's entities |
 | `blastcast-sendspin` | the Sendspin server: handshakes, clock sync, groups, streams (Opus, FLAC, PCM) and pairing. An app hears about its players through the `Host` trait and keeps pairings with `Trust`; behind the `testing` feature, an in-memory speaker for other crates' tests |
-
-The AirPlay receiver (`blastcast-airplay`) is moving in beside them from
-tune-assistant-server.
 
 `blastcast-mdns`'s `advertise_browse` test advertises and browses over the
 host's real interfaces, so `./scripts/check.sh` needs multicast on the
@@ -60,5 +58,6 @@ stream is the sink. It depends on these crates by path, as a sibling checkout
 The history before this repo existed is that of each crate's directory in
 tune-assistant-server (`crates/blastcast`, `crates/tas-mdns`, `crates/tas-audio`,
 `crates/tas-telemetry`, `crates/tas-sendspin` until it became
-`crates/blastcast-sendspin`, and `crates/tas-airplay-out`), carried over
+`crates/blastcast-sendspin`, `crates/tas-airplay-out`, and `crates/tas-airplay`
+until it became `crates/blastcast-airplay`), carried over
 with `git subtree split`.
