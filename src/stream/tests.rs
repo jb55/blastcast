@@ -818,6 +818,8 @@ struct Scripted {
     clock: ServerClock,
     format: AudioFormat,
     items: VecDeque<(i64, tas_audio::Item)>,
+    /// Its [`TimedSource::trim_lead`].
+    trim_lead: Option<i64>,
 }
 
 impl Scripted {
@@ -826,7 +828,14 @@ impl Scripted {
             clock,
             format,
             items: VecDeque::new(),
+            trim_lead: None,
         }
+    }
+
+    /// Lets the stream trim its lead, keeping `keep_us`.
+    fn trimmed(mut self, keep_us: i64) -> Self {
+        self.trim_lead = Some(keep_us);
+        self
     }
 
     /// `n` chunks of `frames` frames, the first stamped to play at `t0` and
@@ -863,6 +872,10 @@ impl TimedSource for Scripted {
         self.format
     }
 
+    fn trim_lead(&self) -> Option<i64> {
+        self.trim_lead
+    }
+
     async fn next(&mut self) -> Result<Option<tas_audio::Item>, AudioError> {
         let Some((at, item)) = self.items.pop_front() else {
             return Ok(None);
@@ -875,6 +888,11 @@ impl TimedSource for Scripted {
 fn added_latency_ms(conn: &Connection, now: i64) -> f64 {
     let stats = conn.stats().snapshot(now, 0);
     stats.stream.expect("streamed to").added_latency_ms
+}
+
+fn trimmed_lead_ms(conn: &Connection, now: i64) -> f64 {
+    let stats = conn.stats().snapshot(now, 0);
+    stats.stream.expect("streamed to").trimmed_lead_ms
 }
 
 #[tokio::test(start_paused = true)]
@@ -903,6 +921,7 @@ async fn a_timed_source_plays_at_its_stamps_at_any_chunk_size() {
             .collect();
         assert_eq!(ts, exact, "{rate} Hz in chunks of {frames}");
         assert_eq!(added_latency_ms(&conn, clock.now_us()), 0.0);
+        assert_eq!(trimmed_lead_ms(&conn, clock.now_us()), 0.0);
         drop(stream);
     }
 }
@@ -1023,4 +1042,47 @@ async fn a_timed_source_with_the_lead_for_it_honours_the_required_lead() {
         assert_eq!(audio(&mut q)[0].0, lead_us + 100_000);
         drop(stream);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_trimmable_source_starts_its_keep_past_the_floor() {
+    let clock = ServerClock::new();
+    let hub = tas_telemetry::Telemetry::new();
+    let (conn, mut q) = traced_player(clock, &hub, "kitchen");
+    // A second of lead, keeping 50 ms past the 250 ms send-ahead. From the
+    // sixth chunk on each arrives 60 ms later, which the keep and the
+    // tolerance absorb. After a flush, two seconds of lead; after another,
+    // 280 ms, less than the floor and the keep.
+    let source = Scripted::new(clock, SESSION_FORMAT)
+        .trimmed(50_000)
+        .chunks(2_000_000, 5, 960, 1_000_000)
+        .chunks(2_100_000, 5, 960, 940_000)
+        .flush(1_400_000)
+        .chunks(4_000_000, 5, 960, 2_000_000)
+        .flush(2_500_000)
+        .chunks(3_280_000, 5, 960, 280_000);
+    let stream = AudioStream::start_with(clock, source.boxed(), hub.probe("s")).unwrap();
+    stream.add_player(conn.clone());
+    sleep_ms(2200).await;
+    assert_eq!(trimmed_lead_ms(&conn, clock.now_us()), 1700.0);
+    sleep_ms(1300).await;
+    let now = clock.now_us();
+
+    assert_eq!(control(&mut q), ["start", "clear", "clear", "end"]);
+    let ts: Vec<i64> = audio(&mut q).iter().map(|c| c.0).collect();
+    // The first chunk arrives at 1 s and plays at 1.3 s, not 2 s; the rest
+    // follow on. Each flush trims afresh, as far as the lead allows.
+    let mut expected: Vec<i64> = (0..10).map(|k| 1_300_000 + k * 20_000).collect();
+    expected.extend((0..5).map(|k| 2_300_000 + k * 20_000));
+    expected.extend((0..5).map(|k| 3_280_000 + k * 20_000));
+    assert_eq!(ts, expected);
+    assert_eq!(trimmed_lead_ms(&conn, now), 0.0, "nothing to trim");
+    assert_eq!(added_latency_ms(&conn, now), 0.0);
+
+    let trimmed = track(&hub, now, Series::LeadTrimmed, "s");
+    let trimmed: Vec<(i64, f64)> = trimmed.iter().map(|p| (p.t_us, p.value)).collect();
+    assert_eq!(trimmed, [(1_000_000, 700_000.0), (2_000_000, 1_700_000.0)]);
+    assert!(track(&hub, now, Series::LatencyAdded, "s").is_empty());
+    assert!(track(&hub, now, Series::TimelineRebase, "s").is_empty());
+    drop(stream);
 }

@@ -27,11 +27,13 @@ const READ_AHEAD: usize = 2;
 pub(crate) enum FeedItem {
     /// Interleaved session-format samples: [`CHUNK_FRAMES`] frames, or fewer
     /// for the last chunk before the end. `play_at_us` is when its first
-    /// frame plays, if its source said.
+    /// frame plays, if its source said; `trim_lead` is its source's
+    /// [`TimedSource::trim_lead`].
     Chunk {
         samples: Vec<f32>,
         live: bool,
         play_at_us: Option<i64>,
+        trim_lead: Option<i64>,
     },
     /// The source dropped what it had sent that hasn't played. What the
     /// feed held back of it is gone too.
@@ -125,16 +127,17 @@ async fn read(
     // Frames read so far, and where the first of `pending` is among them.
     let mut frames: u64 = 0;
     let mut anchor: Option<Anchor> = None;
-    let send = |samples: Vec<f32>, live, anchor: Option<Anchor>, first: u64| {
+    let send = |samples: Vec<f32>, live, trim_lead, anchor: Option<Anchor>, first: u64| {
         let play_at_us = anchor.map(|a| a.at(first));
         tx.send(FeedItem::Chunk {
             samples,
             live,
             play_at_us,
+            trim_lead,
         })
     };
     loop {
-        let live = source.is_live();
+        let (live, trim_lead) = (source.is_live(), source.trim_lead());
         match source.next().await {
             Ok(Some(Item::Chunk { pcm, play_at_us })) => {
                 anchor = match (play_at_us, anchor) {
@@ -148,7 +151,7 @@ async fn read(
                     let rest = pending.split_off(chunk_samples);
                     let samples = std::mem::replace(&mut pending, rest);
                     let first = frames - ((samples.len() + pending.len()) / channels) as u64;
-                    if send(samples, live, anchor, first).await.is_err() {
+                    if send(samples, live, trim_lead, anchor, first).await.is_err() {
                         return;
                     }
                 }
@@ -172,7 +175,7 @@ async fn read(
         if !pending.is_empty() {
             let samples = std::mem::take(&mut pending);
             let first = frames - (samples.len() / channels) as u64;
-            if send(samples, live, anchor, first).await.is_err() {
+            if send(samples, live, trim_lead, anchor, first).await.is_err() {
                 return;
             }
         }

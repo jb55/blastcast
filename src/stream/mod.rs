@@ -55,7 +55,7 @@
 //!
 //! **Timed sources.** A [`TimedSource`] may stamp its chunks with when they
 //! play (an AirPlay sender's times, on the server clock), and the stream
-//! places them there, plus an `offset_us` it adds to every stamp. The
+//! places them there, plus an offset it adds to every stamp. The
 //! contiguous timeline still wins within [`SHIFT_TOLERANCE_US`]: a chunk
 //! further than that from the cursor is a discontinuity (the sender
 //! skipped, or resumed after a gap without a flush), and the timeline moves
@@ -63,19 +63,30 @@
 //! send-ahead floor grows the offset by the shortfall instead of being
 //! dropped, and says so in the log and in `/debug` (`added_latency_ms`):
 //! a phone with less lead than the players need plays a little late
-//! rather than not at all. The offset never shrinks while the stream runs;
-//! [`Item::Flush`] (`stream/clear`, as a seek) resets it, and the next
-//! chunk places the timeline afresh. A timed source whose lead already
+//! rather than not at all. What is added never shrinks while the stream
+//! runs; [`Item::Flush`] (`stream/clear`, as a seek) resets it, and the
+//! next chunk places the timeline afresh. A timed source whose lead already
 //! covers a player's `required_lead_time_ms` is sent with it, which the
 //! spec allows only when it adds no latency. An unstamped chunk, and every
 //! [`LiveSource`]'s, is placed as described above.
+//!
+//! **Trimmed lead.** A source whose lead is a sender's buffer, not a time
+//! anything else plays to, says so with [`TimedSource::trim_lead`]: an
+//! AirPlay 1 phone stamps its audio two seconds ahead and plays none of
+//! it itself. Its first stamped chunk after a start or a flush takes that
+//! surplus off the offset, so the chunk plays the send-ahead floor, plus
+//! what the source asks to keep for its own lateness (a resend), after it
+//! arrives, and the rest keep the stamps' spacing and rate. `/debug` shows
+//! it as `trimmed_lead_ms`, apart from `added_latency_ms`, which still
+//! grows on top. A source that doesn't say so plays at its stamps.
 //!
 //! **Telemetry.** A stream started with a [`Probe`] emits, as its own
 //! entity, the timeline cursor and the send-ahead floor per chunk, and
 //! marks for its start, each `stream/clear`, each shift (by how much) and
 //! its end. A timed source's chunks add their lead as stamped against
-//! their arrival and the offset, with marks for each time the offset grows
-//! and each discontinuity the timeline moves for (by how much). Each player emits its own per chunk (see
+//! their arrival and the latency added, with marks for each time that
+//! grows, the lead trimmed as each timeline starts, and each discontinuity
+//! the timeline moves for (by how much). Each player emits its own per chunk (see
 //! [`LinkStats`](crate::stats::LinkStats)), and marks its `stream/start`
 //! and `stream/end`.
 
@@ -186,7 +197,9 @@ impl AudioStream {
             clock,
             live: source.is_live(),
             honour_lead: !source.is_live(),
-            offset_us: 0,
+            added_us: 0,
+            trimmed_us: None,
+            trim_lead: None,
             feed: Some(Feed::spawn(source)),
             queued: VecDeque::new(),
             timeline: None,
@@ -301,8 +314,9 @@ impl Output {
 
     /// `without_lead` is whether the stream leaves out the players'
     /// required lead, which the send-ahead `/debug` shows for it depends
-    /// on; `added_latency_us` is the stream's offset, shown beside it.
-    fn start(&mut self, encoding: &Encoding, without_lead: bool, added_latency_us: i64) {
+    /// on; `offset` is what the stream added to a timed source's play
+    /// times and what it trimmed from them, in µs, shown beside it.
+    fn start(&mut self, encoding: &Encoding, without_lead: bool, offset: (i64, i64)) {
         let encoder = &encoding.encoder;
         self.send_control(ServerMessage::StreamStart(StreamStart {
             server_transmitted: None,
@@ -319,7 +333,8 @@ impl Output {
         let send_ahead = send_ahead_us(&timing, without_lead);
         let stats = self.conn.stats();
         stats.stream_started(encoder.format(), send_ahead);
-        stats.added_latency(added_latency_us);
+        stats.added_latency(offset.0);
+        stats.trimmed_lead(offset.1);
         stats.probe().mark(
             Series::StreamStart,
             self.conn.clock().now_us(),
@@ -482,7 +497,14 @@ struct Streamer {
     honour_lead: bool,
     /// Added to a timed source's play times: what it took to send its
     /// chunks a send-ahead before they play. Only grows until a flush.
-    offset_us: i64,
+    added_us: i64,
+    /// Taken off a timed source's play times: the surplus lead a source
+    /// that allows it ([`TimedSource::trim_lead`]) came with as its
+    /// timeline started. `None` until the first stamped chunk since the
+    /// start or the last flush sets it.
+    trimmed_us: Option<i64>,
+    /// The latest chunk's source's [`TimedSource::trim_lead`].
+    trim_lead: Option<i64>,
     /// `None` once every source has run out.
     feed: Option<Feed>,
     /// Sources queued too late for the feed, which had already finished.
@@ -525,8 +547,10 @@ impl Streamer {
                     samples,
                     live,
                     play_at_us,
+                    trim_lead,
                 }) => {
                     self.live = live;
+                    self.trim_lead = trim_lead;
                     if let Some(at) = play_at_us {
                         let now = self.clock.now_us();
                         self.probe
@@ -598,7 +622,7 @@ impl Streamer {
 
     /// Drops everything sent that hasn't played: `stream/clear` to every
     /// started player, and the timeline is placed afresh by the next chunk,
-    /// with nothing added to its play time.
+    /// with nothing added to its play time or trimmed from it yet.
     fn clear(&mut self) {
         self.pending = None;
         self.pending_at = None;
@@ -607,7 +631,8 @@ impl Streamer {
         self.history.clear();
         self.probe
             .mark(Series::StreamClear, self.clock.now_us(), 0.0);
-        self.set_offset(0);
+        self.set_added(0);
+        self.set_trimmed(None);
         for out in self.outputs.iter_mut().filter(|o| o.started) {
             out.send_control(ServerMessage::StreamClear(StreamClear {
                 server_transmitted: None,
@@ -621,14 +646,30 @@ impl Streamer {
         }
     }
 
-    fn set_offset(&mut self, offset_us: i64) {
-        if offset_us == self.offset_us {
+    fn set_added(&mut self, added_us: i64) {
+        if added_us == self.added_us {
             return;
         }
-        self.offset_us = offset_us;
+        self.added_us = added_us;
         for out in &self.outputs {
-            out.conn.stats().added_latency(offset_us);
+            out.conn.stats().added_latency(added_us);
         }
+    }
+
+    fn set_trimmed(&mut self, trimmed_us: Option<i64>) {
+        if trimmed_us == self.trimmed_us {
+            return;
+        }
+        self.trimmed_us = trimmed_us;
+        for out in &self.outputs {
+            out.conn.stats().trimmed_lead(trimmed_us.unwrap_or(0));
+        }
+    }
+
+    /// What the stream adds to a timed source's play times: what it added
+    /// less what it trimmed.
+    fn offset_us(&self) -> i64 {
+        self.added_us - self.trimmed_us.unwrap_or(0)
     }
 
     /// Reads the sources queued after the feed finished, if any; with none,
@@ -792,11 +833,15 @@ impl Streamer {
     /// and no earlier than the tolerance short of the send-ahead floor,
     /// the offset growing by whatever that takes. The floor leaves out the
     /// required lead, which is honoured only once the chunk's lead covers
-    /// it.
+    /// it. The first stamped chunk since the start or a flush sets what is
+    /// trimmed (see [`Self::trim`]).
     fn place_timed(&mut self, at: i64, now: i64) {
         let send_ahead = self.send_ahead_with(true);
         let floor = now + send_ahead;
-        let target = at + self.offset_us;
+        if self.trimmed_us.is_none() {
+            self.trim(at, floor, now);
+        }
+        let target = at + self.offset_us();
         let mut start = match &self.timeline {
             None => {
                 self.probe
@@ -826,7 +871,7 @@ impl Streamer {
                 (at - now) / 1000,
             );
             self.probe.mark(Series::LatencyAdded, now, shortfall as f64);
-            self.set_offset(self.offset_us + shortfall);
+            self.set_added(self.added_us + shortfall);
             start = floor;
         }
         if self.timeline.as_ref().map(Timeline::cursor_us) != Some(start) {
@@ -834,7 +879,32 @@ impl Streamer {
         }
         self.honour_lead = start - now >= self.send_ahead_with(false);
         self.probe
-            .sample(Series::AddedLatency, now, self.offset_us as f64);
+            .sample(Series::AddedLatency, now, self.added_us as f64);
+    }
+
+    /// Sets what is taken off the play times of a source whose lead may be
+    /// trimmed, from its first chunk, stamped `at`: whatever lead it has
+    /// past the `floor` plus what the source asks to keep, so that chunk
+    /// plays that keep past the floor and the rest keep the stamps'
+    /// spacing. A timeline unstamped chunks already placed further ahead
+    /// carries on from its cursor instead. Nothing is trimmed from a source
+    /// that doesn't allow it, or that has no surplus.
+    fn trim(&mut self, at: i64, floor: i64, now: i64) {
+        let trimmed = self.trim_lead.map_or(0, |keep| {
+            let cursor = self.timeline.as_ref().map(Timeline::cursor_us);
+            let start = cursor.unwrap_or(i64::MIN).max(floor + keep);
+            (at - start).max(0)
+        });
+        if trimmed > 0 {
+            tracing::info!(
+                "playing the sender's audio {} ms sooner than it said: send-ahead {} ms, lead {} ms",
+                trimmed / 1000,
+                (floor - now) / 1000,
+                (at - now) / 1000,
+            );
+            self.probe.mark(Series::LeadTrimmed, now, trimmed as f64);
+        }
+        self.set_trimmed(Some(trimmed));
     }
 
     /// Puts the shared timeline's cursor at `at`, and every running
@@ -923,10 +993,12 @@ impl Streamer {
             history,
             live,
             honour_lead,
-            offset_us,
+            added_us,
+            trimmed_us,
             ..
         } = self;
-        let (live, without_lead, offset_us) = (*live, !*honour_lead, *offset_us);
+        let (live, without_lead) = (*live, !*honour_lead);
+        let offset = (*added_us, trimmed_us.unwrap_or(0));
         let out = &mut outputs[i];
         let encoding = encodings
             .iter_mut()
@@ -936,7 +1008,7 @@ impl Streamer {
         let target = now + lead.max(LATE_JOIN_MIN_LEAD_US);
 
         if encoding.running {
-            out.start(encoding, without_lead, offset_us);
+            out.start(encoding, without_lead, offset);
             let first = encoding.sent.partition_point(|(s, _)| s.start_us < target);
             let chunks = encoding.sent.range(first..);
             let n = fitting_tail(
@@ -963,7 +1035,7 @@ impl Streamer {
             .get(history.len() - n)
             .map_or(cursor, |(s, _)| s.start_us);
         encoding.run(at);
-        out.start(encoding, without_lead, offset_us);
+        out.start(encoding, without_lead, offset);
         for (span, samples) in replay {
             // A shift left a gap in the kept audio; the format's timeline
             // takes the same gap.

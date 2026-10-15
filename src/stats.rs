@@ -77,6 +77,8 @@ struct StreamStats {
     lead_us: Option<i64>,
     /// The latency the stream added to its timed source's play times.
     added_latency_us: i64,
+    /// The surplus lead the stream cut from them as its timeline started.
+    trimmed_lead_us: i64,
 }
 
 /// Something that went wrong on a connection, kept after it closes.
@@ -166,6 +168,7 @@ impl LinkStats {
             end_us: None,
             lead_us: None,
             added_latency_us: 0,
+            trimmed_lead_us: 0,
         });
     }
 
@@ -173,6 +176,13 @@ impl LinkStats {
     pub fn added_latency(&self, us: i64) {
         if let Some(s) = &mut self.lock().stream {
             s.added_latency_us = us;
+        }
+    }
+
+    /// The stream now plays its timed source `us` sooner than stamped.
+    pub fn trimmed_lead(&self, us: i64) {
+        if let Some(s) = &mut self.lock().stream {
+            s.trimmed_lead_us = us;
         }
     }
 
@@ -248,6 +258,7 @@ impl LinkStats {
             playing: s.playing,
             send_ahead_ms: ms(s.send_ahead_us),
             added_latency_ms: ms(s.added_latency_us),
+            trimmed_lead_ms: ms(s.trimmed_lead_us),
             lead_ms: s.lead_us.map(ms),
             buffered_ms: match s.end_us {
                 Some(end) if s.playing => ms((end - now_us).max(0)),
@@ -317,6 +328,11 @@ pub struct StreamSnapshot {
     /// sender's chunks with less lead than the send-ahead still play: 0 for
     /// a source that isn't timed. It only grows while the stream runs.
     pub added_latency_ms: f64,
+    /// How much sooner than stamped the stream plays a timed source whose
+    /// lead may be trimmed (an AirPlay sender's), so its audio plays a
+    /// send-ahead after it arrives, not two seconds: set as each timeline
+    /// starts, 0 for any other source. `added_latency_ms` grows on top.
+    pub trimmed_lead_ms: f64,
     /// How far ahead of its play time the last chunk was sent.
     pub lead_ms: Option<f64>,
     /// Audio sent that hasn't played yet, as far as the server knows.
