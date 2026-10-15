@@ -19,7 +19,7 @@ pub mod timeline;
 pub use clock::ServerClock;
 pub use format::{AudioFormat, PcmChunk, SESSION_FORMAT};
 pub use map::{Anchor, ClockMap};
-pub use source::LiveSource;
+pub use source::{IntoTimed, Item, LiveSource, TimedSource, Untimed};
 pub use timeline::{Span, Timeline};
 
 /// What can go wrong reading, converting or resampling audio.
