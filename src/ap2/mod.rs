@@ -14,25 +14,32 @@
 //! - [`fairplay`]: `/fp-setup`, answered with fixed bytes.
 //! - [`ptp`]: the process' one PTP follower, which puts each phone's
 //!   timeline on the server clock as a blastcast clock map.
+//! - [`setup`]: SETUP's two phases, timing then streams, and the session
+//!   they leave: the PTP peers followed, the [`events`] channel, and the
+//!   [`buffered`] audio's data channel, decrypted and decoded.
 //!
 //! A sender's AirPlay 2 requests arrive on the AirPlay 1 receiver's
 //! connection: [`handles`] tells them apart and a [`Connection`] answers
-//! them, so the AirPlay 1 path is left as it is. SETUP and buffered audio
-//! come in later steps; until they do, a target only advertises AirPlay 2
-//! when [`NativeConfig::airplay2`](crate::raop::NativeConfig::airplay2)
-//! says so, since a phone that sees AirPlay 2 uses it and can't fall back.
+//! them, so the AirPlay 1 path is left as it is. Playing the decoded audio
+//! on its timeline comes in a later step; until it does, a target only
+//! advertises AirPlay 2 when
+//! [`NativeConfig::airplay2`](crate::raop::NativeConfig::airplay2) says
+//! so, since a phone that sees AirPlay 2 uses it and can't fall back.
 //!
 //! Ported from `openairplay2` 0.5 (MIT, Copyright (c) 2026 Stefan Arentz):
 //! its info.rs (the TXT record and the /info plist) and receiver.rs (the
 //! features mask), with the bits checked against shairplay 0.10's
 //! features.rs. Each module names what else it is ported from.
 
+pub mod buffered;
 pub mod channel;
+pub mod events;
 pub mod fairplay;
 pub mod identity;
 pub mod info;
 pub mod pairing;
 pub mod ptp;
+pub mod setup;
 pub mod srp;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -123,14 +130,15 @@ pub fn handles(req: &Request) -> bool {
             .is_some_and(|t| t.eq_ignore_ascii_case(BPLIST))
 }
 
-/// One sender's connection, as far as AirPlay 2 goes: its pairing and,
-/// once paired, its keys.
+/// One sender's connection, as far as AirPlay 2 goes: its pairing, once
+/// paired its keys, and what SETUP set up.
 #[derive(Debug, Default)]
 pub struct Connection {
     pairing: pairing::Pairing,
     keys: Option<Keys>,
     /// Paired by the last answer, so encrypted once it is sent.
     paired: Option<Keys>,
+    session: setup::Session,
 }
 
 impl Connection {
@@ -152,7 +160,28 @@ impl Connection {
         Some(keys)
     }
 
-    /// Answers an AirPlay 2 request to `device`.
+    /// What SETUP set up.
+    pub fn session(&self) -> &setup::Session {
+        &self.session
+    }
+
+    /// Answers a SETUP with a plist body: refused until paired, since the
+    /// event channel is encrypted with the pairing's keys.
+    pub async fn setup(&mut self, ctx: setup::Context<'_>, req: &Request) -> Response {
+        let Some(keys) = &self.keys else {
+            tracing::debug!("an AirPlay 2 SETUP before pairing");
+            return Response::new(455);
+        };
+        self.session.setup(ctx, keys, req).await
+    }
+
+    /// A TEARDOWN: of the stream, when `body` names `streams`, else of
+    /// everything SETUP set up.
+    pub fn teardown(&mut self, body: &[u8]) {
+        self.session.teardown(body);
+    }
+
+    /// Answers an AirPlay 2 request to `device`, SETUP aside.
     pub fn answer(&mut self, device: &Device, req: &Request) -> Response {
         match (req.method.as_str(), req.uri.as_str()) {
             ("GET", "/info") => Response::ok().body(BPLIST, info::info_plist(device)),
@@ -175,6 +204,11 @@ impl Connection {
                     Response::new(400)
                 }
             },
+            ("SETPEERS" | "SETPEERSX", _) => self.session.set_peers(&req.body),
+            ("TEARDOWN", _) => {
+                self.session.teardown(&req.body);
+                Response::ok()
+            }
             (method, uri) => {
                 tracing::debug!(method, uri, "AirPlay 2 request not handled yet");
                 Response::new(501)

@@ -9,8 +9,10 @@
 //! The keys are HKDF-SHA512 of the pairing's shared secret: SRP's `K`
 //! after transient pair-setup, X25519's after pair-verify. The sender
 //! writes with `Control-Write-Encryption-Key` and reads with
-//! `Control-Read-Encryption-Key`, both salted `Control-Salt`; the event
-//! channel's keys are the same with `Events`.
+//! `Control-Read-Encryption-Key`, both salted `Control-Salt`. The event
+//! channel's are labelled `Events` and go the other way round: there the
+//! accessory writes with `Events-Write-Encryption-Key`, as shairplay
+//! 0.10's server side does (owntone's sender, as pair_ap's channel 3).
 //!
 //! [`SecureRead`] decrypts under the RTSP reader
 //! ([`Request::read`](crate::raop::rtsp::Request::read)), so a request is
@@ -80,12 +82,16 @@ impl Keys {
         self.pair(role, "Control")
     }
 
-    /// The event channel's two halves, for `role`'s end, on the same
-    /// convention as [`control`](Self::control): the controller writes with
-    /// the `Write` key. Nothing has checked that against a real sender
-    /// yet; headway:tune-assistant/language-guilt-wheat will.
+    /// The event channel's two halves, for `role`'s end: the other way
+    /// round from [`control`](Self::control), so the accessory writes with
+    /// the `Write` key. Checked against shairplay 0.10 and owntone, not
+    /// yet against a real sender (headway:tune-assistant/actress-melt-notable).
     pub fn events(&self, role: Role) -> (Sealer, Opener) {
-        self.pair(role, "Events")
+        let other = match role {
+            Role::Accessory => Role::Controller,
+            Role::Controller => Role::Accessory,
+        };
+        self.pair(other, "Events")
     }
 
     fn pair(&self, role: Role, channel: &str) -> (Sealer, Opener) {
@@ -372,10 +378,24 @@ mod tests {
             phone_open.open(&mut wire).unwrap().unwrap(),
             b"RTSP/1.0 200 OK\r\n\r\n"
         );
-        // The event channel's keys are its own.
+        // The event channel's keys are its own, and the accessory writes
+        // with its Write key.
         let (mut events, _) = keys.events(Role::Controller);
         let mut wire = events.seal(b"x");
         assert!(our_open.open(&mut wire).is_err());
+        let (mut ours, _) = keys.events(Role::Accessory);
+        let wire = ours.seal(b"POST /command RTSP/1.0\r\n\r\n");
+        let write = hkdf_sha512(&[0x11; 64], b"Events-Salt", b"Events-Write-Encryption-Key");
+        let plain = ChaCha20Poly1305::new(&write.into())
+            .decrypt(
+                &nonce(0),
+                Payload {
+                    msg: &wire[2..],
+                    aad: &wire[..2],
+                },
+            )
+            .unwrap();
+        assert_eq!(plain, b"POST /command RTSP/1.0\r\n\r\n");
     }
 
     #[test]

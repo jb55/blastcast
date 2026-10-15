@@ -81,6 +81,15 @@ impl Rig {
     /// A receiver whose audio and events go to `handlers` as well as the
     /// recorder.
     async fn start_with(handlers: Vec<Arc<dyn ReceiverHandler>>) -> Self {
+        Self::start_configured(handlers, |_| {}).await
+    }
+
+    /// As [`start_with`](Self::start_with), with `configure` having the
+    /// last word on the config.
+    async fn start_configured(
+        handlers: Vec<Arc<dyn ReceiverHandler>>,
+        configure: impl FnOnce(&mut NativeConfig),
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let recorder = Arc::new(Recorder::default());
@@ -90,7 +99,9 @@ impl Rig {
         config.end_after = Duration::from_millis(300);
         // Tests run side by side; any port will do.
         config.udp_ports = None;
+        config.tcp_ports = None;
         config.telemetry = Telemetry::new();
+        configure(&mut config);
         let (hub, receivers, sessions) = (
             config.telemetry.clone(),
             config.receivers.clone(),
@@ -935,5 +946,328 @@ async fn an_airplay_2_sender_pairs_and_talks_encrypted() {
     ));
 
     drop((phone, wrong, verified, other));
+    rig.shutdown().await;
+}
+
+/// A receiver that can play AirPlay 2 audio: a PTP follower on loopback,
+/// and the decoded audio on a channel.
+async fn ap2_rig() -> (
+    Rig,
+    tokio::sync::mpsc::Receiver<crate::ap2::buffered::Decoded>,
+) {
+    let any = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+    let ptp =
+        crate::ap2::ptp::Ptp::bind_to(ServerClock::new(), Telemetry::default(), any, any).await;
+    let (audio, decoded) = tokio::sync::mpsc::channel(64);
+    let rig = Rig::start_configured(Vec::new(), move |config| {
+        config.ptp = ptp;
+        config.ap2_audio = Some(audio);
+    })
+    .await;
+    (rig, decoded)
+}
+
+async fn paired(rig: &Rig) -> crate::ap2::testing::Controller {
+    let mut phone = crate::ap2::testing::Controller::connect(rig.addr)
+        .await
+        .unwrap();
+    phone.pair_setup("3939").await.unwrap();
+    phone
+}
+
+async fn decoded(
+    audio: &mut tokio::sync::mpsc::Receiver<crate::ap2::buffered::Decoded>,
+) -> crate::ap2::buffered::Decoded {
+    tokio::time::timeout(Duration::from_secs(5), audio.recv())
+        .await
+        .expect("decoded audio in time")
+        .expect("the channel is open")
+}
+
+/// The first stream's `key` in a phase 2 reply.
+fn stream_port(response: &Response, key: &str) -> u16 {
+    let reply = crate::ap2::testing::reply_plist(response).unwrap();
+    let stream = reply["streams"].as_array().unwrap()[0]
+        .as_dictionary()
+        .unwrap();
+    stream[key].as_unsigned_integer().unwrap() as u16
+}
+
+/// The raw AAC frames of an ADTS stream.
+fn adts_frames(mut adts: &[u8]) -> Vec<&[u8]> {
+    let mut frames = Vec::new();
+    while adts.len() > 7 {
+        assert_eq!((adts[0], adts[1] & 0xf6), (0xff, 0xf0), "an ADTS sync word");
+        let header = if adts[1] & 1 == 1 { 7 } else { 9 };
+        let len = (usize::from(adts[3] & 3) << 11)
+            | (usize::from(adts[4]) << 3)
+            | (usize::from(adts[5]) >> 5);
+        frames.push(&adts[header..len]);
+        adts = &adts[len..];
+    }
+    frames
+}
+
+/// How closely `got` follows `want` at the lag and gain that fit best, as
+/// a signal-to-noise ratio in dB.
+fn best_snr(got: &[f64], want: impl Fn(usize) -> f64) -> f64 {
+    // Past the encoder's delay (ffmpeg's is 1024 frames), and short of the
+    // source's end.
+    let window = 4096..12_000;
+    let fit = |lag: usize| {
+        let (mut gw, mut ww) = (0.0, 0.0);
+        for n in window.clone() {
+            gw += got[n] * want(n - lag);
+            ww += want(n - lag) * want(n - lag);
+        }
+        (gw, ww)
+    };
+    let lag = (0..=2048)
+        .max_by(|&a, &b| {
+            let ((ga, wa), (gb, wb)) = (fit(a), fit(b));
+            (ga / wa.sqrt()).total_cmp(&(gb / wb.sqrt()))
+        })
+        .unwrap();
+    let (gw, ww) = fit(lag);
+    let gain = gw / ww;
+    let (mut signal, mut noise) = (0.0, 0.0);
+    for n in window {
+        let fit = gain * want(n - lag);
+        signal += fit * fit;
+        noise += (got[n] - fit) * (got[n] - fit);
+    }
+    10.0 * (signal / noise).log10()
+}
+
+/// SETUP in both phases, the event channel, and buffered audio in each
+/// codec: decrypted, decoded and handed on in order with its RTP time.
+#[tokio::test]
+async fn an_airplay_2_sender_streams_alac_and_aac() {
+    use crate::ap2::buffered::TYPE_BUFFERED;
+    use crate::ap2::setup::AUDIO_BUFFER_SIZE;
+    use crate::ap2::testing::{DataSender, reply_plist};
+
+    let (rig, mut audio) = ap2_rig().await;
+    let mut phone = paired(&rig).await;
+    let local: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+
+    let timing = phone.setup_timing(&[local]).await.unwrap();
+    assert_eq!(timing.status, 200);
+    let reply = reply_plist(&timing).unwrap();
+    let event_port = reply["eventPort"].as_unsigned_integer().unwrap() as u16;
+    assert_ne!(event_port, 0);
+    let ours = reply["timingPeerInfo"].as_dictionary().unwrap();
+    assert_eq!(
+        ours["Addresses"].as_array().unwrap()[0].as_string(),
+        Some("127.0.0.1")
+    );
+    // The event channel: encrypted with the Events keys, both ways.
+    let mut events = phone.open_events(rig.addr, event_port).await.unwrap();
+    let command = events.request("POST", "/command", &[], None).await.unwrap();
+    assert_eq!(command.status, 200);
+
+    // ALAC is lossless: what comes out is what went in.
+    let shk = [0x5a; 32];
+    let alac = phone
+        .setup_stream(TYPE_BUFFERED, 2, &shk, 352)
+        .await
+        .unwrap();
+    assert_eq!(alac.status, 200);
+    assert_eq!(stream_port(&alac, "type"), TYPE_BUFFERED as u16);
+    assert_ne!(stream_port(&alac, "controlPort"), 0);
+    let reply = reply_plist(&alac).unwrap();
+    let stream = reply["streams"].as_array().unwrap()[0]
+        .as_dictionary()
+        .unwrap();
+    assert_eq!(
+        stream["audioBufferSize"].as_unsigned_integer(),
+        Some(AUDIO_BUFFER_SIZE)
+    );
+    let port = stream_port(&alac, "dataPort");
+    let mut data = DataSender::connect(rig.addr, port, &shk, 1000)
+        .await
+        .unwrap();
+    let sent: Vec<Vec<i16>> = (0..20).map(|i| tone(352, i * 352)).collect();
+    for samples in &sent {
+        data.send(&alac_packet(samples), 352).await.unwrap();
+    }
+    for (i, samples) in sent.iter().enumerate() {
+        let got = decoded(&mut audio).await;
+        assert_eq!((got.seq, got.rtp), (i as u32, 1000 + 352 * i as u32));
+        assert_eq!(&got.frames, samples, "packet {i}");
+    }
+    // RECORD is answered, as a phone sends it.
+    let record = phone
+        .request("RECORD", "rtsp://127.0.0.1/1", &[], None)
+        .await
+        .unwrap();
+    assert_eq!(record.status, 200);
+
+    // The stream torn down, and one of AAC-LC set up on the same session.
+    let mut only_streams = plist::Dictionary::new();
+    only_streams.insert("streams".into(), plist::Value::Array(Vec::new()));
+    let teardown = phone
+        .plist_request(
+            "TEARDOWN",
+            "rtsp://127.0.0.1/1",
+            &plist::Value::Dictionary(only_streams),
+        )
+        .await
+        .unwrap();
+    assert_eq!(teardown.status, 200);
+    drop(data);
+    let aac = phone
+        .setup_stream(TYPE_BUFFERED, 4, &shk, 1024)
+        .await
+        .unwrap();
+    assert_eq!(aac.status, 200);
+    let port = stream_port(&aac, "dataPort");
+    let mut data = DataSender::connect(rig.addr, port, &shk, 50_000)
+        .await
+        .unwrap();
+    // ffmpeg's 0.5 s of a 440 Hz sine on the left and 660 Hz on the
+    // right, at 1/8 of full scale.
+    let frames = adts_frames(include_bytes!("../../testdata/sine-440-660.aac"));
+    assert!(frames.len() > 20);
+    for frame in &frames {
+        data.send(frame, 1024).await.unwrap();
+    }
+    let mut pcm = Vec::new();
+    for i in 0..frames.len() {
+        let got = decoded(&mut audio).await;
+        assert_eq!(got.rtp, 50_000 + 1024 * i as u32);
+        assert_eq!(got.frames.len(), 2 * 1024);
+        pcm.extend(got.frames);
+    }
+    // AAC is lossy: the source, within its tolerance.
+    for (channel, hz) in [(0, 440.0), (1, 660.0)] {
+        let got: Vec<f64> = pcm
+            .iter()
+            .skip(channel)
+            .step_by(2)
+            .map(|&s| f64::from(s) / 32_768.0)
+            .collect();
+        let want = |n: usize| 0.125 * (2.0 * std::f64::consts::PI * hz * n as f64 / 44_100.0).sin();
+        let snr = best_snr(&got, want);
+        assert!(snr > 25.0, "{hz} Hz decoded at {snr:.1} dB");
+    }
+
+    drop((data, events, phone));
+    rig.shutdown().await;
+}
+
+/// What a test's log says, by every task on its thread.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Logs {
+    /// Captures the log of the current thread (a `#[tokio::test]`'s
+    /// runtime) while the guard lives.
+    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        let logs = Self::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn contains(&self, what: &str) -> bool {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).contains(what)
+    }
+}
+
+/// What SETUP can't play is refused with a reason in the log, and the
+/// connection carries on.
+#[tokio::test]
+async fn airplay_2_setup_refuses_what_it_cant_play() {
+    use crate::ap2::buffered::{TYPE_BUFFERED, TYPE_REALTIME};
+    use crate::ap2::testing::{Controller, DataSender};
+
+    let (logs, _guard) = Logs::capture();
+    let (rig, mut audio) = ap2_rig().await;
+    let local: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+    let shk = [0x5a; 32];
+
+    // Not before pairing, and no stream before its timing.
+    let mut stranger = Controller::connect(rig.addr).await.unwrap();
+    assert_eq!(stranger.setup_timing(&[local]).await.unwrap().status, 455);
+    let mut phone = paired(&rig).await;
+    let early = phone
+        .setup_stream(TYPE_BUFFERED, 2, &shk, 352)
+        .await
+        .unwrap();
+    assert_eq!(early.status, 455);
+    assert_eq!(phone.setup_timing(&[local]).await.unwrap().status, 200);
+
+    // Realtime audio, naming it.
+    let realtime = phone
+        .setup_stream(TYPE_REALTIME, 2, &shk, 352)
+        .await
+        .unwrap();
+    assert_eq!(realtime.status, 501);
+    assert!(logs.contains("realtime audio stream (type 96)"));
+    // A key that isn't one, and AAC-ELD, which symphonia doesn't decode.
+    let short = phone
+        .setup_stream(TYPE_BUFFERED, 2, &[1; 16], 352)
+        .await
+        .unwrap();
+    assert_eq!(short.status, 400);
+    let eld = phone
+        .setup_stream(TYPE_BUFFERED, 8, &shk, 480)
+        .await
+        .unwrap();
+    assert_eq!(eld.status, 415);
+    assert!(logs.contains("AAC-ELD"));
+
+    // A sender sealing with some other key: nothing decodes, and the data
+    // channel is closed on it.
+    let ok = phone
+        .setup_stream(TYPE_BUFFERED, 2, &shk, 352)
+        .await
+        .unwrap();
+    assert_eq!(ok.status, 200);
+    let port = stream_port(&ok, "dataPort");
+    let mut data = DataSender::connect(rig.addr, port, &[0x77; 32], 0)
+        .await
+        .unwrap();
+    for i in 0..8 {
+        data.send(&alac_packet(&tone(352, i * 352)), 352)
+            .await
+            .unwrap();
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(5), data.closed())
+        .await
+        .expect("the data channel closed");
+    assert!(audio.try_recv().is_err());
+    assert!(logs.contains("wrong shk"));
+    let options = phone.request("OPTIONS", "*", &[], None).await.unwrap();
+    assert_eq!(options.status, 200);
+    drop((stranger, phone));
+    rig.shutdown().await;
+
+    // Without PTP, the timing phase is answered and its audio refused.
+    let rig = Rig::start().await;
+    let mut phone = paired(&rig).await;
+    assert_eq!(phone.setup_timing(&[local]).await.unwrap().status, 200);
+    let refused = phone
+        .setup_stream(TYPE_BUFFERED, 2, &shk, 352)
+        .await
+        .unwrap();
+    assert_eq!(refused.status, 503);
+    assert!(logs.contains("no PTP timing"));
+    drop(phone);
     rig.shutdown().await;
 }

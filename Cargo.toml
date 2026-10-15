@@ -29,6 +29,8 @@ rsa.workspace = true
 rustix = { workspace = true }
 sha1.workspace = true
 sha2.workspace = true
+symphonia-codec-aac.workspace = true
+symphonia-core.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -44,6 +46,7 @@ alac-encoder.workspace = true
 tas-airplay-out.workspace = true
 tas-sendspin = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

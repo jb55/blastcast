@@ -162,6 +162,7 @@ impl Connection {
             AIRTUNES_VERSION
         };
         let response = match req.method.as_str() {
+            "SETUP" if ap2::handles(req) => self.ap2_setup(req).await,
             _ if ap2::handles(req) => self.ap2.answer(&self.receiver.ap2, req),
             "OPTIONS" => Response::ok().header("Public", PUBLIC),
             "ANNOUNCE" => self.announce(req),
@@ -268,7 +269,25 @@ impl Connection {
             .header("Session", "1")
     }
 
+    async fn ap2_setup(&mut self, req: &Request) -> Response {
+        let config = &self.receiver.config;
+        let ctx = ap2::setup::Context {
+            peer: self.peer,
+            local: self.local,
+            tcp_ports: config.tcp_ports.as_ref(),
+            udp_ports: config.udp_ports.as_ref(),
+            ptp: &config.ptp,
+            audio: config.ap2_audio.clone(),
+        };
+        self.ap2.setup(ctx, req).await
+    }
+
     fn record(&mut self) -> Response {
+        if self.ap2.session().stream().is_some() {
+            // AirPlay 2's RECORD starts nothing: its audio is already
+            // flowing, and SETRATEANCHORTIME says when it plays.
+            return Response::ok();
+        }
         let Some(stream) = &self.stream else {
             return Response::new(455);
         };
@@ -293,6 +312,7 @@ impl Connection {
     }
 
     fn teardown(&mut self) -> Response {
+        self.ap2.teardown(&[]);
         self.stream = None;
         self.announce = None;
         self.receiver.release(self.id);

@@ -1,19 +1,21 @@
 //! A sender for tests, standing in for a phone's AirPlay 2 controller: it
 //! connects, reads `/info`, pairs (transient pair-setup or pair-verify),
-//! runs `/fp-setup`, and sends any request to any URI, encrypted once
-//! paired. Built with the `testing` feature for other crates' tests, such
-//! as an interop harness.
+//! runs `/fp-setup`, sends any request to any URI, encrypted once paired,
+//! runs SETUP's two phases, opens the event channel, and streams buffered
+//! audio on the data channel. Built with the `testing` feature for other
+//! crates' tests, such as an interop harness.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use chacha20poly1305::aead::Aead;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use tokio::io::BufReader;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use super::buffered::{AudioKey, Packet};
 use super::channel::{Keys, Role, SecureRead, SecureWrite, encrypt_reader};
 use super::pairing::{FLAG_TRANSIENT, nonce, verify_cipher};
 use super::tlv::{Tlv, ty};
@@ -246,6 +248,143 @@ impl Controller {
         body.to_writer_binary(&mut bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         self.request(method, uri, &[], Some((BPLIST, &bytes))).await
+    }
+}
+
+impl Controller {
+    /// SETUP's first phase, as a phone sends it: PTP timing, with `peers`
+    /// as the `timingPeerInfo` to follow.
+    pub async fn setup_timing(&mut self, peers: &[IpAddr]) -> io::Result<Response> {
+        let addresses: Vec<plist::Value> = peers
+            .iter()
+            .map(|p| plist::Value::String(p.to_string()))
+            .collect();
+        let mut info = plist::Dictionary::new();
+        info.insert("Addresses".into(), plist::Value::Array(addresses));
+        info.insert(
+            "ID".into(),
+            plist::Value::String(peers.first().map(ToString::to_string).unwrap_or_default()),
+        );
+        let mut body = plist::Dictionary::new();
+        body.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
+        body.insert("timingPeerInfo".into(), plist::Value::Dictionary(info));
+        body.insert(
+            "sessionUUID".into(),
+            plist::Value::String("5A3D4E3B-0000-4000-8000-746173746573".into()),
+        );
+        body.insert("isMultiSelectAirPlay".into(), plist::Value::Boolean(true));
+        self.plist_request(
+            "SETUP",
+            "rtsp://127.0.0.1/1",
+            &plist::Value::Dictionary(body),
+        )
+        .await
+    }
+
+    /// SETUP's second phase: one stream of `kind` (103 is buffered), codec
+    /// `ct`, key `shk` and `spf` frames a packet.
+    pub async fn setup_stream(
+        &mut self,
+        kind: u64,
+        ct: u64,
+        shk: &[u8],
+        spf: u64,
+    ) -> io::Result<Response> {
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::from(kind));
+        stream.insert("ct".into(), plist::Value::from(ct));
+        stream.insert("shk".into(), plist::Value::Data(shk.to_vec()));
+        stream.insert("spf".into(), plist::Value::from(spf));
+        stream.insert("sr".into(), plist::Value::from(44_100u64));
+        stream.insert("controlPort".into(), plist::Value::from(0u64));
+        stream.insert("latencyMin".into(), plist::Value::from(11_025u64));
+        let mut body = plist::Dictionary::new();
+        body.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        self.plist_request(
+            "SETUP",
+            "rtsp://127.0.0.1/1",
+            &plist::Value::Dictionary(body),
+        )
+        .await
+    }
+
+    /// Opens the event channel SETUP's first phase answered with, on
+    /// `receiver`'s address.
+    pub async fn open_events(&self, receiver: SocketAddr, port: u16) -> io::Result<Self> {
+        let keys = self
+            .keys
+            .clone()
+            .ok_or_else(|| io::Error::other("not paired"))?;
+        let mut events = Self::connect(SocketAddr::new(receiver.ip(), port)).await?;
+        let (sealer, opener) = keys.events(Role::Controller);
+        encrypt_reader(&mut events.read, opener);
+        events.write.encrypt(sealer);
+        events.keys = Some(keys);
+        Ok(events)
+    }
+}
+
+/// A plist reply's dictionary.
+pub fn reply_plist(response: &Response) -> io::Result<plist::Dictionary> {
+    plist::Value::from_reader(io::Cursor::new(&response.body))
+        .ok()
+        .and_then(plist::Value::into_dictionary)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a plist"))
+}
+
+/// A phone's end of a buffered stream's data channel.
+pub struct DataSender {
+    tcp: TcpStream,
+    key: AudioKey,
+    seq: u32,
+    /// The RTP time of the next packet.
+    pub rtp: u32,
+}
+
+impl DataSender {
+    /// Connects to `port` on `receiver`, to send audio sealed with `shk`
+    /// from RTP time `rtp`.
+    pub async fn connect(
+        receiver: SocketAddr,
+        port: u16,
+        shk: &[u8],
+        rtp: u32,
+    ) -> io::Result<Self> {
+        let key = AudioKey::new(shk).ok_or_else(|| io::Error::other("shk isn't 32 bytes"))?;
+        let tcp = TcpStream::connect(SocketAddr::new(receiver.ip(), port)).await?;
+        tcp.set_nodelay(true)?;
+        Ok(Self {
+            tcp,
+            key,
+            seq: 0,
+            rtp,
+        })
+    }
+
+    /// Sends one packet of `frames` frames: one ALAC packet or AAC frame.
+    pub async fn send(&mut self, payload: &[u8], frames: u32) -> io::Result<()> {
+        let packet = Packet {
+            seq: self.seq,
+            rtp: self.rtp,
+            // shairplay's AudioSsrc for 44.1 kHz.
+            ssrc: 0x0000_face,
+            payload: payload.to_vec(),
+        };
+        let wire = self.key.seal(&packet, u64::from(self.seq).to_le_bytes());
+        self.seq = (self.seq + 1) & 0xff_ffff;
+        self.rtp = self.rtp.wrapping_add(frames);
+        self.tcp.write_all(&wire).await
+    }
+
+    /// Waits for the receiver to close the channel.
+    pub async fn closed(mut self) -> io::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 64];
+        while self.tcp.read(&mut buf).await? > 0 {}
+        Ok(())
     }
 }
 

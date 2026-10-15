@@ -107,6 +107,9 @@ pub struct NativeConfig {
     /// Where a stream's three UDP ports come from, so a firewall can let
     /// the sender's audio in; any free port when `None`.
     pub udp_ports: Option<RangeInclusive<u16>>,
+    /// Where an AirPlay 2 session's TCP event and data ports come from,
+    /// for the same reason; any free port when `None`.
+    pub tcp_ports: Option<RangeInclusive<u16>>,
     /// Where each receiver's timings go, on [`NativeConfig::clock`]; off
     /// by default.
     pub telemetry: Telemetry,
@@ -126,11 +129,20 @@ pub struct NativeConfig {
     /// timing with ([`crate::ap2::ptp::Ptp::bind`]). Off by default, as in
     /// tests, so buffered audio is refused.
     pub ptp: crate::ap2::ptp::Ptp,
+    /// Where AirPlay 2's decoded audio goes, each packet's with its RTP
+    /// time, until headway:tune-assistant/express-bone-jungle makes it a
+    /// timed source: a test's sink. Dropped when `None`.
+    pub ap2_audio: Option<tokio::sync::mpsc::Sender<crate::ap2::buffered::Decoded>>,
 }
 
 /// The UDP ports streams use by default: three a stream, so ten at once.
 /// shairport-sync's start at 6001 too.
 pub const UDP_PORTS: RangeInclusive<u16> = 6001..=6030;
+
+/// The TCP ports AirPlay 2 sessions use by default: an event and a data
+/// port each, so fifteen at once. The same numbers as [`UDP_PORTS`], so
+/// one firewall rule for both protocols lets every stream in.
+pub const TCP_PORTS: RangeInclusive<u16> = 6001..=6030;
 
 impl NativeConfig {
     pub fn new(
@@ -145,12 +157,14 @@ impl NativeConfig {
             latency: Duration::from_millis(250),
             end_after: Duration::from_secs(10),
             udp_ports: Some(UDP_PORTS),
+            tcp_ports: Some(TCP_PORTS),
             telemetry: Telemetry::default(),
             receivers: Roster::default(),
             sessions: Roster::default(),
             identity: crate::ap2::Identity::generate(),
             airplay2: false,
             ptp: crate::ap2::ptp::Ptp::off(),
+            ap2_audio: None,
         }
     }
 }
@@ -163,6 +177,7 @@ impl std::fmt::Debug for NativeConfig {
             .field("latency", &self.latency)
             .field("end_after", &self.end_after)
             .field("udp_ports", &self.udp_ports)
+            .field("tcp_ports", &self.tcp_ports)
             .field("airplay2", &self.airplay2)
             .finish()
     }
@@ -480,16 +495,42 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|s| *s).await.is_ok();
 }
 
+/// A TCP listener for `peer` to connect to: on the first free port of
+/// `ports`, or, with none free or no range, any port.
+pub(crate) async fn bind_tcp(
+    peer: IpAddr,
+    ports: Option<&RangeInclusive<u16>>,
+) -> io::Result<TcpListener> {
+    let any = unspecified(peer);
+    if let Some(ports) = ports {
+        for port in ports.clone() {
+            if let Ok(listener) = TcpListener::bind((any, port)).await {
+                return Ok(listener);
+            }
+        }
+        tracing::warn!(
+            ?ports,
+            "no free AirPlay TCP port in range; using any (a firewall may refuse the sender)"
+        );
+    }
+    TcpListener::bind((any, 0)).await
+}
+
+/// Every address of `peer`'s family.
+fn unspecified(peer: IpAddr) -> IpAddr {
+    match peer {
+        IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+    }
+}
+
 /// A UDP socket for talking to `peer`: on the first free port of `ports`,
 /// or, with none free or no range, any port.
-async fn bind_udp(
+pub(crate) async fn bind_udp(
     peer: IpAddr,
     ports: Option<&RangeInclusive<u16>>,
 ) -> io::Result<tokio::net::UdpSocket> {
-    let any: IpAddr = match peer {
-        IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
-        IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
-    };
+    let any = unspecified(peer);
     if let Some(ports) = ports {
         for port in ports.clone() {
             if let Ok(socket) = tokio::net::UdpSocket::bind((any, port)).await {
