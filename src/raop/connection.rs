@@ -19,10 +19,12 @@
 //!   gap over as silence and what follows it, and when the sender has
 //!   gone quiet.
 //!
-//! A gap waits for its resend until the missing frame plays less
+//! A gap waits for its resend for [`RESEND_WINDOW`] at most, and never
+//! past when the missing frame plays less
 //! [`NativeConfig::latency`](super::NativeConfig::latency), the lead kept
-//! for downstream: so a phone's two seconds leave most of two seconds for
-//! a resend.
+//! for downstream. Not the most of a phone's two seconds: downstream plays
+//! its audio a send-ahead and that window after it arrives
+//! ([`crate::audio`]), so what a longer wait held back would come late.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -41,7 +43,7 @@ use tracing::Instrument;
 use super::announce::{Announce, Codec, Decoder, SAMPLE_RATE};
 use super::clock::{self, SyncPacket, Timeline};
 use super::crypto::{self, AudioCipher};
-use super::playout::{Inserted, Note, Played, Playout};
+use super::playout::{Inserted, Note, Played, Playout, RESEND_WINDOW};
 use super::rtsp::{self, Request, Response};
 use super::{AIRTUNES_VERSION, Receiver, bind_udp, params, rtp};
 use crate::audio::AIRPLAY_FORMAT;
@@ -360,7 +362,7 @@ struct Ingest {
     /// When the sender means each frame to play.
     timeline: Timeline,
     /// The lead a chunk is handed over with at the least: a gap waits for
-    /// its resend until this long before it plays.
+    /// its resend no later than this long before it plays.
     lead: Duration,
     /// When the sender's lead was last logged.
     lead_logged: Option<Instant>,
@@ -519,7 +521,7 @@ impl Stream {
             ingest: Mutex::new(Ingest {
                 cipher,
                 decoder,
-                playout: Playout::new(latency),
+                playout: Playout::new(RESEND_WINDOW),
                 highest: None,
                 resend_seq: 0,
                 paused: false,

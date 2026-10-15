@@ -24,7 +24,7 @@ use super::crypto::tests::{encrypt_payload, public_key};
 use super::params::tests::listing;
 use super::rtsp::{self, Response};
 use super::*;
-use crate::audio::AirplayAudio;
+use crate::audio::{AirplayAudio, KEEP_LEAD};
 use crate::metadata::{SenderVolume, TrackInfo};
 use tas_sendspin::testing::FakeSpeaker;
 
@@ -247,11 +247,13 @@ async fn chunks_carry_the_senders_play_time() {
     rig.shutdown().await;
 }
 
-/// The phone's timeline reaches a Sendspin player: our sender anchors frame
-/// r0 at server-clock time t, and the player gets r0's audio stamped t plus
-/// the latency the stream added, then the rest contiguous. A FLUSH reaches
-/// it as `stream/clear` at once, with none of the flushed audio after it,
-/// and the next anchor places the timeline afresh.
+/// The phone's timeline reaches a Sendspin player, less its surplus lead:
+/// our sender anchors frame r0 at server-clock time t, 2.5 s ahead, and the
+/// player gets r0's audio stamped t less the lead the stream trimmed,
+/// which leaves it the send-ahead and [`KEEP_LEAD`] after it arrived, then
+/// the rest contiguous. A FLUSH reaches it as `stream/clear` at once, with
+/// none of the flushed audio after it, and the next anchor is trimmed
+/// afresh.
 #[tokio::test]
 async fn a_senders_timeline_and_flush_reach_a_sendspin_player() {
     let audio = AirplayAudio::new();
@@ -269,10 +271,10 @@ async fn a_senders_timeline_and_flush_reach_a_sendspin_player() {
     sender.push(&tone(44_100, 0)).await.unwrap();
     sender.finish().await.unwrap();
 
-    let first = chunks(&mut speaker, 10).await;
-    let added_us = added_latency_us(&speaker, rig.clock.now_us());
-    assert_eq!(added_us, 0, "two seconds of lead need no more");
-    assert_placed(&first, t + added_us);
+    let (first, seen) = chunks(&mut speaker, 10).await;
+    let (added_us, trimmed_us) = offset_us(&speaker, rig.clock.now_us());
+    assert_trimmed(first[0].0 - seen, trimmed_us);
+    assert_placed(&first, t - trimmed_us, added_us);
     assert_eq!(speaker.control(), ["start"]);
 
     // Most of the second is still to play: the flush drops it.
@@ -296,49 +298,82 @@ async fn a_senders_timeline_and_flush_reach_a_sendspin_player() {
     sender.anchor(t2).await.unwrap();
     sender.push(&tone(44_100 / 2, 0)).await.unwrap();
     sender.finish().await.unwrap();
-    let second = chunks(&mut speaker, 10).await;
-    assert_placed(&second, t2 + added_latency_us(&speaker, rig.clock.now_us()));
+    let (second, seen) = chunks(&mut speaker, 10).await;
+    let (added_us, trimmed_us) = offset_us(&speaker, rig.clock.now_us());
+    assert_trimmed(second[0].0 - seen, trimmed_us);
+    assert_placed(&second, t2 - trimmed_us, added_us);
 
     sender.teardown().await;
     stream.stop().await;
     rig.shutdown().await;
 }
 
-/// The first `n` audio chunks the speaker gets, within 5 s.
-async fn chunks(speaker: &mut FakeSpeaker, n: usize) -> Vec<(i64, usize)> {
+/// The first `n` audio chunks the speaker gets, within 5 s, and when the
+/// first was seen on the server clock, within the 5 ms it is polled at.
+async fn chunks(speaker: &mut FakeSpeaker, n: usize) -> (Vec<(i64, usize)>, i64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut got = Vec::new();
+    let mut seen = None;
     while got.len() < n {
         assert!(Instant::now() < deadline, "{} chunks of {n}", got.len());
         tokio::time::sleep(Duration::from_millis(5)).await;
         got.extend(speaker.audio());
+        if !got.is_empty() {
+            seen.get_or_insert(speaker.conn().clock().now_us());
+        }
     }
-    got
+    (got, seen.expect("seen"))
 }
 
-fn added_latency_us(speaker: &FakeSpeaker, now: i64) -> i64 {
+/// What the stream added to the sender's play times, and what it trimmed
+/// from them, in µs.
+fn offset_us(speaker: &FakeSpeaker, now: i64) -> (i64, i64) {
     let stats = speaker.conn().stats().snapshot(now, 0);
-    (stats.stream.expect("streamed to").added_latency_ms * 1000.0) as i64
+    let stream = stats.stream.expect("streamed to");
+    let us = |ms: f64| (ms * 1000.0).round() as i64;
+    (us(stream.added_latency_ms), us(stream.trimmed_lead_ms))
+}
+
+/// The first chunk of a timeline went out the players' send-ahead and
+/// [`KEEP_LEAD`] before it plays, which, seen a poll or a busy scheduler
+/// late, is `lead`, and most of a sender's two seconds were trimmed for
+/// it.
+fn assert_trimmed(lead: i64, trimmed_us: i64) {
+    let want = tas_sendspin::stream::DEFAULT_SEND_AHEAD_US + KEEP_LEAD.as_micros() as i64;
+    assert!(
+        (want - 100_000..=want).contains(&lead),
+        "first chunk seen {lead} µs ahead, sent {want} ahead"
+    );
+    assert!(trimmed_us > 1_500_000, "trimmed {trimmed_us} µs");
 }
 
 /// The first chunk plays at `at` and every one after it where the frames
-/// before it end.
-fn assert_placed(chunks: &[(i64, usize)], at: i64) {
+/// before it end, or later by no more than the `added_us` the stream added
+/// for chunks handed over late: with no lead kept past the send-ahead, a
+/// busy test machine can make some.
+fn assert_placed(chunks: &[(i64, usize)], at: i64, added_us: i64) {
     // The clock map's error on localhost, as above.
     let (first, _) = chunks[0];
     assert!(
         (first - at).abs() < 500,
         "first chunk at {first}, sent for {at}"
     );
-    let mut frames = 0;
+    let mut gaps = 0;
+    let mut end = first;
     for &(ts, n) in chunks {
-        let want = first + frames * 1_000_000 / 48_000;
         assert!(
-            (ts - want).abs() <= 1,
-            "{ts} after {frames} frames, not {want}"
+            ts >= end - 1,
+            "{ts} overlaps the chunk before, ending {end}"
         );
-        frames += n as i64;
+        if ts > end + 1 {
+            gaps += ts - end;
+        }
+        end = ts + n as i64 * 1_000_000 / 48_000;
     }
+    assert!(
+        gaps <= added_us + chunks.len() as i64,
+        "{gaps} µs of gaps, {added_us} added"
+    );
 }
 
 /// A sender that does what an iPhone does, one request at a time.

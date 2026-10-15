@@ -97,9 +97,9 @@ pub struct NativeConfig {
     /// Where `_raop._tcp` is advertised; nowhere when `None`, as in tests.
     pub mdns: Option<tas_mdns::Mdns>,
     /// The least lead a chunk is handed over with: a lost packet is waited
-    /// for until this long before it plays, or, before the sender's
-    /// timeline is known, this long after it was missed. It is also the
-    /// `Audio-Latency` answered to `RECORD`.
+    /// for [`playout::RESEND_WINDOW`] after it was missed, but no later
+    /// than this long before it plays. It is also the `Audio-Latency`
+    /// answered to `RECORD`.
     pub latency: Duration,
     /// How long after the last sender leaves the session ends, as
     /// shairport's `active_state_timeout`.

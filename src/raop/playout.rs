@@ -12,11 +12,13 @@
 //! [`Playout::pop_ready`] hands over from there for as long as packets
 //! follow on. At a gap (a later packet is here but not the next one):
 //!
-//! - it waits for the resend until the **deadline**, which the caller
-//!   gives: when the missing frame plays less the lead downstream needs.
-//!   So the window a lost packet has to come again is whatever lead the
-//!   sender left, not a fixed one. Before the sender's timeline is known,
-//!   the window is [`Playout::new`]'s, from when the gap was found;
+//! - it waits for the resend for [`Playout::new`]'s window from when the
+//!   gap was found ([`RESEND_WINDOW`] for a stream), or until the
+//!   **deadline** the caller gives, if that is sooner: when the missing
+//!   frame plays less the lead downstream needs. Downstream plays a
+//!   phone's audio well before its stamps ([`crate::audio`]), keeping only
+//!   so much lead past its send-ahead, and whatever follows a gap is held
+//!   back with it: a longer wait would leave that late;
 //! - once the deadline passes, the gap is handed over as silence, up to a
 //!   packet's worth at a time;
 //! - a gap over [`MAX_GAP_FRAMES`] is the sender jumping its timestamps,
@@ -46,6 +48,12 @@ pub const MAX_GAP_FRAMES: i64 = SAMPLE_RATE as i64;
 /// Nothing arriving for this long is the sender pausing or gone, not a
 /// loss: one second, as a gap that long would be skipped anyway.
 pub const IDLE_AFTER: Duration = Duration::from_secs(1);
+/// How long a gap waits for its resend, from when it was found: the
+/// Sendspin stream's tolerance for a late chunk, since downstream keeps
+/// none of the sender's lead for it ([`crate::audio`]), so a longer wait
+/// adds latency. A quiet Wi-Fi LAN's round trip is a few ms (Music on a
+/// Mac: 3 ms median), so most resends still make it.
+pub const RESEND_WINDOW: Duration = Duration::from_millis(20);
 /// The most silence played for a gap at once: one packet's worth.
 const SILENCE_FRAMES: i64 = 352;
 /// The most buffered: ten seconds of 352-frame packets. A sender sends in
@@ -185,12 +193,12 @@ impl Playout {
         self.flushed_before = before;
     }
 
-    /// When the gap at the head stops waiting for its resend: `deadline`
-    /// for the missing frame, if it says, or the window from when the gap
-    /// was found.
+    /// When the gap at the head stops waiting for its resend: the window
+    /// from when the gap was found, or `deadline` for the missing frame if
+    /// that says sooner.
     fn gap_deadline(&self, head: i64, deadline: &impl Fn(u32) -> Option<Instant>) -> Instant {
-        deadline(head as u32)
-            .unwrap_or_else(|| self.gap_since.expect("set when the gap was found") + self.window)
+        let window = self.gap_since.expect("set when the gap was found") + self.window;
+        deadline(head as u32).map_or(window, |d| d.min(window))
     }
 
     /// When [`Self::pop_ready`] next has something to do, if nothing
@@ -349,33 +357,49 @@ mod tests {
         );
     }
 
-    /// With the sender's timeline, a gap waits until its deadline: as
-    /// long as the lead the sender left allows, not a fixed window.
+    /// With the sender's timeline, a gap still waits only the window: a
+    /// phone's two seconds of lead are trimmed downstream, and what
+    /// follows the gap waits with it. A deadline sooner than the window
+    /// cuts the wait short.
     #[test]
-    fn a_gap_waits_as_long_as_the_senders_lead_allows() {
+    fn a_gap_waits_the_window_or_its_deadline_if_sooner() {
         let t0 = Instant::now();
         let mut p = Playout::new(WINDOW);
         // Frame r must be handed over by 1.9 s plus its own time.
-        let deadline = |rtp: u32| {
+        let far = |rtp: u32| {
             Some(t0 + ms(1_900) + Duration::from_micros(u64::from(rtp) * 1_000_000 / 44_100))
         };
         p.insert(t0, 0, packet(PACKET, 1));
         p.insert(t0, 2 * PACKET, packet(PACKET, 3));
-        assert_eq!(summary(&p.pop_ready(t0, deadline)), [(1, 352)]);
-        let due = deadline(PACKET).unwrap();
-        assert_eq!(p.wake_at(deadline), Some(due));
-        // Well past the window, still waiting; the resend comes in time.
-        assert!(p.pop_ready(t0 + ms(1_000), deadline).is_empty());
-        p.insert(t0 + ms(1_000), PACKET, packet(PACKET, 2));
+        assert_eq!(summary(&p.pop_ready(t0, far)), [(1, 352)]);
+        assert_eq!(p.wake_at(far), Some(t0 + WINDOW));
+        // The resend comes within the window.
+        assert!(p.pop_ready(t0 + ms(100), far).is_empty());
+        p.insert(t0 + ms(100), PACKET, packet(PACKET, 2));
         assert_eq!(
-            summary(&p.pop_ready(t0 + ms(1_000), deadline)),
+            summary(&p.pop_ready(t0 + ms(100), far)),
             [(2, 352), (3, 352)]
         );
-        // Another gap whose deadline has passed goes at once.
-        p.insert(t0 + ms(3_000), 4 * PACKET, packet(PACKET, 5));
+        // Another gap, whose resend never comes: silence once the window
+        // is out, nowhere near its deadline.
+        let t1 = t0 + ms(200);
+        p.insert(t1, 4 * PACKET, packet(PACKET, 5));
+        assert!(p.pop_ready(t1, far).is_empty());
+        assert_eq!(p.wake_at(far), Some(t1 + WINDOW));
+        assert!(p.pop_ready(t1 + WINDOW - ms(1), far).is_empty());
         assert_eq!(
-            summary(&p.pop_ready(t0 + ms(3_000), deadline)),
+            summary(&p.pop_ready(t1 + WINDOW, far)),
             [(0, 352), (5, 352)]
+        );
+        // A gap whose frame is due sooner waits only until then.
+        let t2 = t0 + ms(400);
+        let near = |_: u32| Some(t2 + ms(30));
+        p.insert(t2, 6 * PACKET, packet(PACKET, 7));
+        assert!(p.pop_ready(t2, near).is_empty());
+        assert_eq!(p.wake_at(near), Some(t2 + ms(30)));
+        assert_eq!(
+            summary(&p.pop_ready(t2 + ms(30), near)),
+            [(0, 352), (7, 352)]
         );
     }
 

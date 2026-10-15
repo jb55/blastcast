@@ -10,6 +10,14 @@
 //! is dropped at once rather than played out. shairport-sync's audio has
 //! no play time: its chunks are unstamped, placed as they arrive.
 //!
+//! **Less the lead nothing plays to.** A phone stamps its audio about two
+//! seconds ahead, a buffer for a receiver that waits to play it, and plays
+//! none of it itself. So the stream may trim it ([`TimedSource::trim_lead`]):
+//! each timeline (a start, or after a flush) starts the players'
+//! send-ahead (plus [`KEEP_LEAD`]) after its first chunk arrives, and the
+//! rest keep the stamps' spacing. Play and pause on the phone take about a
+//! quarter second to be heard, not two seconds.
+//!
 //! **The sender's clock is matched to ours** by blastcast's [`RateMatch`]:
 //! a phone's stamps follow its own clock, tens of ppm off ours, and the
 //! stage drops or repeats a frame now and then to keep the audio on them.
@@ -46,6 +54,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use blastcast::{RateMatch, RateStats};
@@ -73,6 +82,14 @@ const FRAME_BYTES: usize = 4;
 /// Bytes per read. shairport writes 352 frames (1408 bytes) at a time, so a
 /// read normally returns one write; this only bounds a backlog.
 const READ_BYTES: usize = 16 * 1024;
+
+/// What a stream keeps of the sender's lead past the players' send-ahead:
+/// none, since the send-ahead is already the players' buffer. The rest of
+/// a phone's two seconds is trimmed: nothing plays to it. A chunk handed
+/// over later than the first by more than the stream's tolerance (Wi-Fi,
+/// or a resend waited for, [`crate::raop::playout::RESEND_WINDOW`]) adds that much latency until
+/// the next pause; keeping more would trade latency for fewer of those.
+pub(crate) const KEEP_LEAD: Duration = Duration::ZERO;
 
 /// Items queued for a stream that isn't keeping up: about 1 s of
 /// shairport's 352-frame writes. Past it, chunks are dropped rather than
@@ -332,6 +349,10 @@ impl TimedSource for Received {
         "airplay"
     }
 
+    fn trim_lead(&self) -> Option<i64> {
+        Some(KEEP_LEAD.as_micros() as i64)
+    }
+
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
         Ok(self.items.recv().await)
     }
@@ -355,6 +376,10 @@ impl TimedSource for Matched {
 
     fn kind(&self) -> &'static str {
         self.source.kind()
+    }
+
+    fn trim_lead(&self) -> Option<i64> {
+        self.source.trim_lead()
     }
 
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
