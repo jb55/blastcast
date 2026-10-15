@@ -563,7 +563,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use tas_audio::{Item, TimedSource};
+    use blastcast::{Item, TimedSource};
     use tas_core::player::PlayerState;
     use tas_core::{ImageSource, PlayerControl, PlayerFeature};
 
@@ -796,7 +796,7 @@ mod tests {
         // The receiver's audio is what the player was handed, in the
         // session format.
         let mut source = rig.source("kitchen").unwrap();
-        let chunk = tas_audio::PcmChunk::new(crate::audio::AIRPLAY_FORMAT, vec![0.5; 2816]);
+        let chunk = blastcast::PcmChunk::new(crate::audio::AIRPLAY_FORMAT, vec![0.5; 2816]);
         rig.handlers.audio(&rig.info, &chunk, None);
         let next = tokio::time::timeout(Duration::from_secs(5), source.next())
             .await
@@ -806,7 +806,7 @@ mod tests {
         let Item::Chunk { pcm, play_at_us } = next else {
             panic!("expected audio, got {next:?}");
         };
-        assert_eq!(pcm.format, tas_audio::SESSION_FORMAT);
+        assert_eq!(pcm.format, blastcast::SESSION_FORMAT);
         assert_eq!(play_at_us, None);
 
         // The first volume is the receiver's own starting level: skipped.

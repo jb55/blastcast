@@ -37,7 +37,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use blastcast::ClockMap;
-use tas_audio::ServerClock;
+use blastcast::ServerClock;
 use tas_proto::Series;
 use tas_telemetry::{Probe, Telemetry};
 use tokio::net::UdpSocket;

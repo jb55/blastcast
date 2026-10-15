@@ -75,9 +75,9 @@ use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use blastcast::{PcmChunk, ServerClock};
 use blastcast_mdns::service::{Service, TxtEntry};
 use sha2::{Digest, Sha256};
-use tas_audio::{PcmChunk, ServerClock};
 use tas_proto::Series;
 use tas_telemetry::{Probe, Roster, Telemetry};
 use tokio::net::TcpListener;

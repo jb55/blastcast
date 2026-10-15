@@ -65,8 +65,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blastcast::{Anchor, ClockMap};
+use blastcast::{PcmChunk, ServerClock};
 use plist::{Dictionary, Value};
-use tas_audio::{PcmChunk, ServerClock};
 use tas_proto::Series;
 use tas_telemetry::Probe;
 use tokio::sync::mpsc;

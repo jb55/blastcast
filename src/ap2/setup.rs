@@ -36,8 +36,8 @@ use std::net::IpAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
+use blastcast::ServerClock;
 use plist::{Dictionary, Value};
-use tas_audio::ServerClock;
 use tas_telemetry::Probe;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;

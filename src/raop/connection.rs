@@ -35,7 +35,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use tas_audio::PcmChunk;
+use blastcast::PcmChunk;
 use tas_proto::Series;
 use tas_telemetry::Probe;
 use tokio::io::BufReader;

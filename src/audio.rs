@@ -46,10 +46,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use blastcast::{AudioError, AudioFormat, Item, PcmChunk, ServerClock, TimedSource};
 use blastcast::{RateMatch, RateStats};
-use tas_audio::{
-    AudioError, AudioFormat, Item, PcmChunk, ServerClock, TimedSource, timed_to_session_format,
-};
+use blastcast_audio::timed_to_session_format;
 use tas_proto::Series;
 use tas_telemetry::{Probe, Telemetry};
 use tokio::sync::mpsc;
@@ -344,7 +343,7 @@ impl TimedSource for Matched {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use tas_audio::SESSION_FORMAT;
+    use blastcast::SESSION_FORMAT;
 
     use super::*;
 

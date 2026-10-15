@@ -39,7 +39,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use tas_audio::PcmChunk;
+use blastcast::PcmChunk;
 
 use crate::config::{self, NameTemplate, ReceiverInfo};
 use crate::metadata::MetadataEvent;
@@ -488,7 +488,7 @@ mod tests {
             let recorder = Arc::new(Recorder::default());
             let mut config = SupervisorConfig::new(NativeConfig::new(
                 state.server_id(),
-                tas_audio::ServerClock::new(),
+                blastcast::ServerClock::new(),
                 None,
             ));
             config.restart_delay = Duration::from_millis(10);
