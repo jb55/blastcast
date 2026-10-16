@@ -189,6 +189,16 @@ async fn a_peer_relaying_another_grandmaster_maps_that_timeline() {
     ptp.receive(&follow_up, tv, server + 6);
     assert_eq!(ptp.map(TV).unwrap().offset_us, tv_offset - 5);
 
+    // The TV goes quiet while the phone carries on relaying its time: the
+    // relay's live map, not the TV's frozen one.
+    for _ in 0..48 {
+        server += 125_000;
+        let (sync, follow_up) = gm.sync(i128::from(server + tv_offset) * 1000);
+        ptp.receive(&sync, phone, server + 40);
+        ptp.receive(&follow_up, phone, server + 90);
+    }
+    assert_eq!(ptp.map(TV).unwrap().offset_us, tv_offset - 40);
+
     // The phone takes the timeline back, and its Syncs are its own again.
     gm.announce = Grandmaster::new(PHONE).announce;
     ptp.receive(&gm.announce(), phone, server + 10);

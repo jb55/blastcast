@@ -425,21 +425,24 @@ impl Drop for Follow {
 }
 
 impl State {
-    /// `timeline`'s map: its own clock's, or else the relay's that has
-    /// carried it longest of those heard lately, so the map doesn't flip
-    /// between two relays' estimates of it.
+    /// `timeline`'s map, from the clocks carrying it heard lately (within
+    /// [`ANNOUNCE_FRESH_US`] of the freshest): its own clock's, or else
+    /// the relay's that has carried it longest, so the map doesn't flip
+    /// between two relays' estimates of it. A grandmaster that stopped
+    /// sending Syncs (a soundbar demoted) leaves its relays' map, not its
+    /// own frozen one.
     fn map(&self, timeline: u64) -> Option<ClockMap> {
         let carrying = || {
             self.clocks
                 .iter()
                 .filter(move |(_, c)| c.timeline == timeline && c.estimator.map().is_some())
         };
-        if let Some((_, c)) = carrying().find(|(id, _)| **id == timeline) {
+        let latest = carrying().map(|(_, c)| c.heard_us).max()?;
+        let fresh = || carrying().filter(move |(_, c)| latest - c.heard_us <= ANNOUNCE_FRESH_US);
+        if let Some((_, c)) = fresh().find(|(id, _)| **id == timeline) {
             return c.estimator.map();
         }
-        let latest = carrying().map(|(_, c)| c.heard_us).max()?;
-        carrying()
-            .filter(|(_, c)| latest - c.heard_us <= ANNOUNCE_FRESH_US)
+        fresh()
             .min_by_key(|(id, c)| (c.since_us, **id))?
             .1
             .estimator
