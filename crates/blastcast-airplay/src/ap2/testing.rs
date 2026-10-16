@@ -328,8 +328,8 @@ impl Controller {
         if let Some((timeline, rtp, ns)) = anchor {
             let (secs, frac) = super::hold::network_time(ns);
             body.insert("networkTimeSecs".into(), plist::Value::from(secs));
-            body.insert("networkTimeFrac".into(), plist::Value::from(frac));
-            body.insert("networkTimeTimelineID".into(), plist::Value::from(timeline));
+            body.insert("networkTimeFrac".into(), ios_u64(frac));
+            body.insert("networkTimeTimelineID".into(), ios_u64(timeline));
             body.insert("networkTimeFlags".into(), plist::Value::from(0u64));
             body.insert("rtpTime".into(), plist::Value::from(u64::from(rtp)));
         }
@@ -384,6 +384,12 @@ impl Controller {
         events.keys = Some(keys);
         Ok(events)
     }
+}
+
+/// `v` as iOS writes a u64: an 8-byte signed integer, negative when its
+/// top bit is set (the plist crate writes 16 bytes for those).
+pub fn ios_u64(v: u64) -> plist::Value {
+    plist::Value::from(v as i64)
 }
 
 /// A plist reply's dictionary.

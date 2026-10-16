@@ -1,4 +1,5 @@
 use super::*;
+use crate::ap2::testing::ios_u64;
 
 const PACKET: i64 = 352;
 /// A phone 7 s ahead of us.
@@ -347,6 +348,27 @@ fn requests_read_as_commands() {
             }),
         })
     );
+    // As iOS writes them: 8-byte signed integers, so a fraction past half
+    // a second and a clock id with its top bit set read as negative.
+    let soundbar = 0x984e_8aff_fe92_2389;
+    let mut d = plist::Dictionary::new();
+    d.insert("rate".into(), Value::from(1i64));
+    d.insert("rtpTime".into(), Value::from(1_067_985_882i64));
+    d.insert("networkTimeSecs".into(), Value::from(85_141i64));
+    d.insert("networkTimeFrac".into(), ios_u64(3 << 62));
+    d.insert("networkTimeTimelineID".into(), ios_u64(soundbar));
+    assert_eq!(
+        Command::rate(&write(d)),
+        Some(Command::Rate {
+            playing: Some(true),
+            anchor: Some(RateAnchor {
+                timeline: soundbar,
+                rtp: 1_067_985_882,
+                remote_us: 85_141_750_000,
+            }),
+        })
+    );
+
     let mut d = plist::Dictionary::new();
     d.insert("rate".into(), Value::Real(0.0));
     assert_eq!(

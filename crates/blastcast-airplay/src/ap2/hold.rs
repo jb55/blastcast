@@ -155,8 +155,7 @@ impl Command {
         let dict = dictionary(body)?;
         let number = |key: &str| {
             let v = dict.get(key)?;
-            v.as_unsigned_integer()
-                .or_else(|| v.as_real().map(|r| r as u64))
+            uint(v).or_else(|| v.as_real().map(|r| r as u64))
         };
         let anchor = match (
             number("networkTimeSecs"),
@@ -178,12 +177,21 @@ impl Command {
     /// A FLUSHBUFFERED body, or `None` if it has no `flushUntilTS`.
     pub fn flush(body: &[u8]) -> Option<Self> {
         let dict = dictionary(body)?;
-        let ts = |key: &str| dict.get(key)?.as_unsigned_integer().map(|t| t as u32);
+        let ts = |key: &str| dict.get(key).and_then(uint).map(|t| t as u32);
         Some(Self::Flush {
             from: ts("flushFromTS"),
             until: ts("flushUntilTS")?,
         })
     }
+}
+
+/// An integer's 64 bits. iOS writes a u64 as an 8-byte binary plist
+/// integer, which is signed: a `networkTimeFrac` of half a second or more,
+/// or a grandmaster's clock id with its top bit set, reads as negative.
+/// shairport-sync's `plist_get_uint_val` keeps the bits, and so does this.
+fn uint(v: &Value) -> Option<u64> {
+    v.as_unsigned_integer()
+        .or_else(|| v.as_signed_integer().map(|i| i as u64))
 }
 
 fn dictionary(body: &[u8]) -> Option<Dictionary> {
