@@ -75,7 +75,11 @@
 //! a phone with less lead than the players need plays a little late
 //! rather than not at all. What is added never shrinks while the stream
 //! runs; [`Item::Flush`] (`stream/clear`, as a seek) resets it, and the
-//! next chunk places the timeline afresh. A timed source whose lead already
+//! next chunk places the timeline afresh. An on-time source's chunk
+//! ([`TimedSource::on_time`], an AirPlay 2 phone's, whose other speakers
+//! play to the same stamps) is never played late: what can't reach the
+//! players in time is cut off its front, or the whole chunk dropped, so
+//! the speakers stay in step with the rest of the sender's group. A timed source whose lead already
 //! covers a player's `required_lead_time_ms` is sent with it, which the
 //! spec allows only when it adds no latency. An unstamped chunk, and every
 //! [`LiveSource`]'s, is placed as described above.
@@ -216,6 +220,8 @@ impl AudioStream {
             added_us: 0,
             trimmed_us: None,
             trim_lead: None,
+            on_time: false,
+            cut_us: 0,
             feed: Some(Feed::spawn(source)),
             queued: VecDeque::new(),
             timeline: None,
@@ -557,6 +563,10 @@ struct Streamer {
     trimmed_us: Option<i64>,
     /// The latest chunk's source's [`TimedSource::trim_lead`].
     trim_lead: Option<i64>,
+    /// The latest chunk's source's [`TimedSource::on_time`].
+    on_time: bool,
+    /// An on-time source's audio cut since it was last logged, in µs.
+    cut_us: i64,
     /// `None` once every source has run out.
     feed: Option<Feed>,
     /// Sources queued too late for the feed, which had already finished.
@@ -605,9 +615,11 @@ impl Streamer {
                     live,
                     play_at_us,
                     trim_lead,
+                    on_time,
                 }) => {
                     self.live = live;
                     self.trim_lead = trim_lead;
+                    self.on_time = on_time;
                     if let Some(at) = play_at_us {
                         let now = self.clock.now_us();
                         self.probe
@@ -817,13 +829,9 @@ impl Streamer {
 
     /// Sends the pending chunk, or sets `wake_us` for when to try again.
     fn pump(&mut self) {
-        let Some(frames) = self
-            .pending
-            .as_ref()
-            .map(|s| s.len() / usize::from(SESSION_FORMAT.channels))
-        else {
+        if self.pending.is_none() {
             return;
-        };
+        }
         let now = self.clock.now_us();
         match self.pending_at {
             Some(at) => self.place_timed(at, now),
@@ -832,6 +840,14 @@ impl Streamer {
                 self.place_timeline(now + self.send_ahead_us(), now);
             }
         }
+        // An on-time source's chunk may have been cut, or dropped whole.
+        let Some(frames) = self
+            .pending
+            .as_ref()
+            .map(|s| s.len() / usize::from(SESSION_FORMAT.channels))
+        else {
+            return;
+        };
         let send_ahead = self.send_ahead_us();
         let floor = now + send_ahead;
         self.sync_outputs(now);
@@ -942,7 +958,17 @@ impl Streamer {
                 }
             }
         };
-        if start < floor - SHIFT_TOLERANCE_US {
+        if start < floor - SHIFT_TOLERANCE_US && self.on_time {
+            match self.cut(floor - start) {
+                Some(cut_us) => start += cut_us,
+                None => return,
+            }
+            tracing::info!(
+                "cut {} ms of the sender's audio, too late for the players: send-ahead {} ms",
+                std::mem::take(&mut self.cut_us) / 1000,
+                send_ahead / 1000,
+            );
+        } else if start < floor - SHIFT_TOLERANCE_US {
             let shortfall = floor - start;
             tracing::info!(
                 "added {} ms to the sender's latency: send-ahead {} ms, lead {} ms",
@@ -960,6 +986,29 @@ impl Streamer {
         self.honour_lead = start - now >= self.send_ahead_with(false);
         self.probe
             .sample(Series::AddedLatency, now, self.added_us as f64);
+    }
+
+    /// Cuts `late_us` (rounded up to a frame) off the front of the pending
+    /// chunk, for an on-time source whose chunk can't reach the players
+    /// in time. Returns how far its first frame moved, or `None` when
+    /// none of it is left: then nothing is placed, and the timeline waits
+    /// for a chunk that makes it.
+    fn cut(&mut self, late_us: i64) -> Option<i64> {
+        let rate = i64::from(SESSION_FORMAT.sample_rate);
+        let channels = usize::from(SESSION_FORMAT.channels);
+        let samples = self.pending.as_mut()?;
+        let frames = (late_us * rate + 999_999) / 1_000_000;
+        let cut_us = frames * 1_000_000 / rate;
+        if frames as usize >= samples.len() / channels {
+            self.cut_us += (samples.len() / channels) as i64 * 1_000_000 / rate;
+            self.pending = None;
+            self.pending_at = None;
+            return None;
+        }
+        samples.drain(..frames as usize * channels);
+        self.cut_us += cut_us;
+        self.pending_at = self.pending_at.map(|at| at + cut_us);
+        Some(cut_us)
     }
 
     /// Sets what is taken off the play times of a source whose lead may be

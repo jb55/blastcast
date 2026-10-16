@@ -115,6 +115,16 @@ pub trait TimedSource: Send {
         None
     }
 
+    /// Whether the stamps are when other devices play the same audio: an
+    /// AirPlay 2 phone's, which its own speakers play to. A sink then
+    /// never plays a chunk later than stamped. What can't reach its
+    /// players in time is cut, so it stays in step with the others.
+    /// `false`, the default: a sink may play a chunk late rather than
+    /// drop it.
+    fn on_time(&self) -> bool {
+        false
+    }
+
     /// The next item. `Ok(None)` ends the stream as [`Item::End`] does.
     /// Chunks may be any size, but never empty.
     async fn next(&mut self) -> Result<Option<Item>, AudioError>;
@@ -140,6 +150,10 @@ impl<S: TimedSource + ?Sized> TimedSource for Box<S> {
 
     fn trim_lead(&self) -> Option<i64> {
         (**self).trim_lead()
+    }
+
+    fn on_time(&self) -> bool {
+        (**self).on_time()
     }
 
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {

@@ -821,6 +821,8 @@ struct Scripted {
     items: VecDeque<(i64, blastcast::Item)>,
     /// Its [`TimedSource::trim_lead`].
     trim_lead: Option<i64>,
+    /// Its [`TimedSource::on_time`].
+    on_time: bool,
 }
 
 impl Scripted {
@@ -830,7 +832,14 @@ impl Scripted {
             format,
             items: VecDeque::new(),
             trim_lead: None,
+            on_time: false,
         }
+    }
+
+    /// Its stamps are when other speakers play the same audio.
+    fn on_time(mut self) -> Self {
+        self.on_time = true;
+        self
     }
 
     /// Lets the stream trim its lead, keeping `keep_us`.
@@ -875,6 +884,10 @@ impl TimedSource for Scripted {
 
     fn trim_lead(&self) -> Option<i64> {
         self.trim_lead
+    }
+
+    fn on_time(&self) -> bool {
+        self.on_time
     }
 
     async fn next(&mut self) -> Result<Option<blastcast::Item>, AudioError> {
@@ -964,6 +977,32 @@ async fn too_little_lead_grows_the_added_latency_by_the_shortfall() {
     assert_eq!(lead[0].value, 100_000.0, "as the sender stamped it");
     assert_eq!(lead[10].value, 50_000.0);
     assert!(track(&hub, now, Series::TimelineRebase, "s").is_empty());
+    drop(stream);
+}
+
+/// An AirPlay 2 phone's start: the hold hands over what is due at once as
+/// one chunk, its first frame 100 ms ahead against a 250 ms send-ahead.
+/// What can't make it is cut, not played late, and the rest plays at its
+/// stamps, in step with the phone's other speakers.
+#[tokio::test(start_paused = true)]
+async fn an_on_time_source_is_cut_not_played_late() {
+    let clock = ServerClock::new();
+    let (conn, mut q) = player(clock, vec![pcm(48_000, 16)], 0);
+    available(&conn, true);
+    let source = Scripted::new(clock, SESSION_FORMAT)
+        .on_time()
+        .chunks(1_100_000, 1, 19_200, 100_000)
+        .chunks(1_500_000, 10, 960, 1_000_000);
+    let stream = AudioStream::start(clock, source.boxed()).unwrap();
+    stream.add_player(conn.clone());
+    sleep_ms(1500).await;
+
+    let ts: Vec<i64> = audio(&mut q).iter().map(|c| c.0).collect();
+    // The floor is 1.25 s. The 20 ms chunks from 1.1 s to 1.22 s start
+    // more than the tolerance short of it and go; 1.24 s is within it.
+    let expected: Vec<i64> = (0..23).map(|k| 1_240_000 + k * 20_000).collect();
+    assert_eq!(ts, expected);
+    assert_eq!(added_latency_ms(&conn, clock.now_us()), 0.0);
     drop(stream);
 }
 

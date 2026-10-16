@@ -27,13 +27,14 @@ const READ_AHEAD: usize = 2;
 pub(crate) enum FeedItem {
     /// Interleaved session-format samples: [`CHUNK_FRAMES`] frames, or fewer
     /// for the last chunk before the end. `play_at_us` is when its first
-    /// frame plays, if its source said; `trim_lead` is its source's
-    /// [`TimedSource::trim_lead`].
+    /// frame plays, if its source said; `trim_lead` and `on_time` are its
+    /// source's [`TimedSource::trim_lead`] and [`TimedSource::on_time`].
     Chunk {
         samples: Vec<f32>,
         live: bool,
         play_at_us: Option<i64>,
         trim_lead: Option<i64>,
+        on_time: bool,
     },
     /// The source dropped what it had sent that hasn't played. What the
     /// feed held back of it is gone too.
@@ -127,21 +128,23 @@ async fn read(
     // Frames read so far, and where the first of `pending` is among them.
     let mut frames: u64 = 0;
     let mut anchor: Option<Anchor> = None;
-    let send = |samples: Vec<f32>, live, trim_lead, anchor: Option<Anchor>, first: u64| {
-        let play_at_us = anchor.map(|a| a.at(first));
-        tx.send(FeedItem::Chunk {
-            samples,
-            live,
-            play_at_us,
-            trim_lead,
-        })
-    };
+    let send =
+        |samples: Vec<f32>, (live, trim_lead, on_time), anchor: Option<Anchor>, first: u64| {
+            let play_at_us = anchor.map(|a| a.at(first));
+            tx.send(FeedItem::Chunk {
+                samples,
+                live,
+                play_at_us,
+                trim_lead,
+                on_time,
+            })
+        };
     loop {
         let item = source.next().await;
         // Read as of the item it came with: a source's audio can change
         // hands, as a target's does from an AirPlay 1 phone to an AirPlay 2
         // one, while the feed waits for it.
-        let (live, trim_lead) = (source.is_live(), source.trim_lead());
+        let kind = (source.is_live(), source.trim_lead(), source.on_time());
         match item {
             Ok(Some(Item::Chunk { pcm, play_at_us })) => {
                 anchor = match (play_at_us, anchor) {
@@ -155,7 +158,7 @@ async fn read(
                     let rest = pending.split_off(chunk_samples);
                     let samples = std::mem::replace(&mut pending, rest);
                     let first = frames - ((samples.len() + pending.len()) / channels) as u64;
-                    if send(samples, live, trim_lead, anchor, first).await.is_err() {
+                    if send(samples, kind, anchor, first).await.is_err() {
                         return;
                     }
                 }
@@ -179,7 +182,7 @@ async fn read(
         if !pending.is_empty() {
             let samples = std::mem::take(&mut pending);
             let first = frames - (samples.len() / channels) as u64;
-            if send(samples, live, trim_lead, anchor, first).await.is_err() {
+            if send(samples, kind, anchor, first).await.is_err() {
                 return;
             }
         }

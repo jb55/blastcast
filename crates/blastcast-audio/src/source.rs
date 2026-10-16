@@ -267,6 +267,10 @@ impl<S: TimedSource> TimedSource for TimedResampled<S> {
         self.inner.trim_lead()
     }
 
+    fn on_time(&self) -> bool {
+        self.inner.on_time()
+    }
+
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
         if let Some(item) = self.after.take() {
             return Ok(Some(item));

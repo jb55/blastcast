@@ -18,7 +18,9 @@
 //! jump to the lead. Play and pause on the phone take about a quarter
 //! second to be heard, not two seconds. That is AirPlay 1's: an AirPlay 2
 //! phone's stamps are when it plays its own picture and its other
-//! speakers, so its audio ([`ReceiverHandler::audio_on_time`]) keeps them.
+//! speakers, so its audio ([`ReceiverHandler::audio_on_time`]) keeps them
+//! ([`TimedSource::on_time`]): what comes too late for the players is cut,
+//! never played late.
 //!
 //! **The sender's clock is matched to ours** by blastcast's [`RateMatch`]:
 //! a phone's stamps follow its own clock, tens of ppm off ours, and the
@@ -260,7 +262,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// One stream of a receiver's audio, as it was handed over.
 struct Received {
     items: mpsc::Receiver<Item>,
-    /// Its slot's `on_time`: whether the lead may be trimmed. Not the
+    /// Its slot's `on_time`: whether the stamps are kept, or the lead may
+    /// be trimmed. Not the
     /// slot itself, whose sender would keep this open.
     on_time: Arc<AtomicBool>,
 }
@@ -276,8 +279,11 @@ impl TimedSource for Received {
     }
 
     fn trim_lead(&self) -> Option<i64> {
-        let on_time = self.on_time.load(Ordering::Relaxed);
-        (!on_time).then_some(KEEP_LEAD.as_micros() as i64)
+        (!self.on_time()).then_some(KEEP_LEAD.as_micros() as i64)
+    }
+
+    fn on_time(&self) -> bool {
+        self.on_time.load(Ordering::Relaxed)
     }
 
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
@@ -307,6 +313,10 @@ impl TimedSource for Matched {
 
     fn trim_lead(&self) -> Option<i64> {
         self.source.trim_lead()
+    }
+
+    fn on_time(&self) -> bool {
+        self.source.on_time()
     }
 
     async fn next(&mut self) -> Result<Option<Item>, AudioError> {
