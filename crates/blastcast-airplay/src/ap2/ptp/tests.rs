@@ -5,6 +5,7 @@ use crate::ap2::testing::Grandmaster;
 
 const PHONE: u64 = 0x0011_22ff_fe33_4455;
 const HOMEPOD: u64 = 0x66aa_bbff_fecc_ddee;
+const TV: u64 = 0x74d0_82ff_fe72_6d91;
 
 fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
@@ -134,6 +135,67 @@ async fn a_better_grandmaster_takes_the_session_over() {
     assert_eq!(report_gm(&ptp), Some(PHONE));
     drop(follow);
     assert!(ptp.report().follows.is_empty());
+}
+
+/// A TV's clock wins, and its Syncs don't reach us: the phone follows it
+/// and sends the TV's time in its own Syncs, under its own clock id, with
+/// Announces naming the TV. The anchors name the TV, so that is the map.
+#[tokio::test]
+async fn a_peer_relaying_another_grandmaster_maps_that_timeline() {
+    let ptp = follower(Telemetry::default()).await;
+    let (phone, tv) = (ip("192.168.1.84"), ip("192.168.1.103"));
+    let follow = ptp.follow([phone, tv]).unwrap();
+    let mut gm = Grandmaster::new(PHONE);
+    ptp.receive(&gm.announce(), phone, 0);
+    let (sync, follow_up) = gm.sync(5_000_000_000);
+    ptp.receive(&sync, phone, 10);
+    ptp.receive(&follow_up, phone, 20);
+    assert_eq!(ptp.map(PHONE).unwrap().offset_us, 5_000_000 - 10);
+
+    // The TV wins: the phone announces it, steps removed, and its Syncs
+    // carry the TV's time from now on.
+    gm.announce.priority1 = 128;
+    gm.announce.grandmaster = TV;
+    gm.announce.steps_removed = 1;
+    ptp.receive(&gm.announce(), phone, 100_000);
+    assert_eq!(follow.grandmaster(), Some(TV));
+    assert_eq!(follow.map(), None, "no Sync on the TV's time yet");
+    let tv_offset = 84_161_000_000;
+    let mut server = 125_000;
+    for _ in 0..8 {
+        let (sync, follow_up) = gm.sync(i128::from(server + tv_offset) * 1000);
+        ptp.receive(&sync, phone, server + 40);
+        ptp.receive(&follow_up, phone, server + 90);
+        server += 125_000;
+    }
+    let (id, map) = follow
+        .map()
+        .expect("the TV's timeline, from the phone's Syncs");
+    assert_eq!(id, TV);
+    assert_eq!(map.offset_us, tv_offset - 40);
+    assert_eq!(ptp.map(TV), Some(map));
+    // Its Syncs aren't on the phone's own timeline now.
+    assert_eq!(ptp.map(PHONE), None);
+    let report = ptp.report();
+    let clock = report.clocks.iter().find(|c| c.id == PHONE).unwrap();
+    assert_eq!((clock.timeline, clock.steps), (TV, 0), "a restart, no step");
+
+    // Should the TV's own Syncs reach us, they are the better map.
+    let mut own = Grandmaster::new(TV);
+    own.announce.priority1 = 128;
+    ptp.receive(&own.announce(), tv, server);
+    let (sync, follow_up) = own.sync(i128::from(server + tv_offset) * 1000);
+    ptp.receive(&sync, tv, server + 5);
+    ptp.receive(&follow_up, tv, server + 6);
+    assert_eq!(ptp.map(TV).unwrap().offset_us, tv_offset - 5);
+
+    // The phone takes the timeline back, and its Syncs are its own again.
+    gm.announce = Grandmaster::new(PHONE).announce;
+    ptp.receive(&gm.announce(), phone, server + 10);
+    let (sync, follow_up) = gm.sync(7_000_000_000);
+    ptp.receive(&sync, phone, server + 20);
+    ptp.receive(&follow_up, phone, server + 30);
+    assert_eq!(ptp.map(PHONE).unwrap().offset_us, 7_000_000 - server - 20);
 }
 
 fn report_gm(ptp: &Ptp) -> Option<u64> {

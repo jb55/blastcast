@@ -9,6 +9,14 @@
 //! [`Ptp::map`] puts any timeline id on the server clock. It sends
 //! nothing, as shairport-sync's nqptp doesn't.
 //!
+//! **Relays.** A clock's Syncs carry the time of the grandmaster its
+//! latest Announce names, not always its own: when a TV's clock wins, the
+//! phone follows it and sends the TV's time under its own clock id, and
+//! the anchors name the TV. So each clock's estimator is on the timeline
+//! its sender announces (its own id until it announces), and starts again
+//! when that changes, as nqptp's does; [`Ptp::map`] finds a timeline by
+//! the clocks carrying it, preferring its own clock's Syncs.
+//!
 //! **Ports.** PTP is UDP 319 (event: Sync) and 320 (general: Follow_Up,
 //! Announce), and only one socket on a host can own them, so a [`Ptp`] is
 //! bound once, at start, and shared by every AirPlay 2 target. Both are
@@ -137,6 +145,9 @@ struct State {
     clocks: HashMap<u64, Clock>,
     /// Each peer's latest Announce, and when it came.
     announces: HashMap<IpAddr, (Announce, i64)>,
+    /// The grandmaster each clock's latest Announce names, by clock id:
+    /// the timeline its Syncs carry.
+    timelines: HashMap<u64, u64>,
     follows: HashMap<u64, Following>,
     next_follow: u64,
     /// Messages from no peer anybody follows.
@@ -146,6 +157,10 @@ struct State {
 
 struct Clock {
     peer: IpAddr,
+    /// The grandmaster whose time its Syncs carry, and since when (server
+    /// time): the estimator is on that timeline.
+    timeline: u64,
+    since_us: i64,
     estimator: Estimator,
     pending: Pending,
     probe: Probe,
@@ -193,6 +208,9 @@ pub struct Report {
 #[derive(Debug, Clone)]
 pub struct ClockReport {
     pub id: u64,
+    /// The grandmaster whose time its Syncs carry: `id`, unless it relays
+    /// another's.
+    pub timeline: u64,
     pub peer: IpAddr,
     pub samples: u64,
     /// How often its clock stepped and the map started again.
@@ -312,9 +330,9 @@ impl Ptp {
 
     /// The server clock against timeline `timeline_id`: a grandmaster's
     /// clock id, SETRATEANCHORTIME's `networkTimeTimelineID`. `None` until
-    /// one of its Syncs came.
+    /// a Sync carrying its time came, from it or a peer relaying it.
     pub fn map(&self, timeline_id: u64) -> Option<ClockMap> {
-        self.0.lock().clocks.get(&timeline_id)?.estimator.map()
+        self.0.lock().map(timeline_id)
     }
 
     /// What `/debug` shows.
@@ -325,6 +343,7 @@ impl Ptp {
             .iter()
             .map(|(&id, c)| ClockReport {
                 id,
+                timeline: c.timeline,
                 peer: c.peer,
                 samples: c.samples,
                 steps: c.steps,
@@ -405,6 +424,29 @@ impl Drop for Follow {
     }
 }
 
+impl State {
+    /// `timeline`'s map: its own clock's, or else the relay's that has
+    /// carried it longest of those heard lately, so the map doesn't flip
+    /// between two relays' estimates of it.
+    fn map(&self, timeline: u64) -> Option<ClockMap> {
+        let carrying = || {
+            self.clocks
+                .iter()
+                .filter(move |(_, c)| c.timeline == timeline && c.estimator.map().is_some())
+        };
+        if let Some((_, c)) = carrying().find(|(id, _)| **id == timeline) {
+            return c.estimator.map();
+        }
+        let latest = carrying().map(|(_, c)| c.heard_us).max()?;
+        carrying()
+            .filter(|(_, c)| latest - c.heard_us <= ANNOUNCE_FRESH_US)
+            .min_by_key(|(id, c)| (c.since_us, **id))?
+            .1
+            .estimator
+            .map()
+    }
+}
+
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -422,6 +464,7 @@ impl Inner {
         match m.body {
             Body::Announce(a) => {
                 state.announces.insert(from, (a, now_us));
+                state.timelines.insert(m.source.clock, a.grandmaster);
             }
             Body::Sync(t) if !m.two_step => {
                 self.sample(
@@ -496,6 +539,8 @@ impl Inner {
                 id,
                 Clock {
                     peer,
+                    timeline: state.timelines.get(&id).copied().unwrap_or(id),
+                    since_us: now_us,
                     estimator: Estimator::default(),
                     pending: Pending::default(),
                     probe: self.telemetry.probe(&timeline_entity(id)),
@@ -511,10 +556,23 @@ impl Inner {
         clock
     }
 
-    /// A Sync of `id`'s that left at `sent_ns` on its clock and was read
-    /// at server time `read_us`.
+    /// A Sync of `id`'s that left at `sent_ns` on the clock it carries and
+    /// was read at server time `read_us`.
     fn sample(&self, state: &mut State, id: u64, peer: IpAddr, sent_ns: i128, read_us: i64) {
+        let timeline = state.timelines.get(&id).copied().unwrap_or(id);
         let clock = self.clock_for(state, id, peer, read_us);
+        if clock.timeline != timeline {
+            // It follows another grandmaster now, and sends its time.
+            tracing::info!(
+                clock = %format!("{id:016x}"),
+                from = %format!("{:016x}", clock.timeline),
+                to = %format!("{timeline:016x}"),
+                "PTP: a clock's Syncs carry another grandmaster's time now"
+            );
+            clock.timeline = timeline;
+            clock.since_us = read_us;
+            clock.estimator = Estimator::default();
+        }
         let remote_us = (sent_ns.div_euclid(1000)) as i64;
         let s = clock.estimator.sample(remote_us, read_us);
         clock.samples += 1;
@@ -554,11 +612,12 @@ impl Inner {
         let now = best.or_else(|| {
             let syncing = state
                 .clocks
-                .iter()
-                .filter(|(_, c)| f.peers.contains(&c.peer) && c.samples > 0)
-                .filter(|(_, c)| now_us - c.heard_us <= ANNOUNCE_FRESH_US);
+                .values()
+                .filter(|c| f.peers.contains(&c.peer) && c.samples > 0)
+                .filter(|c| now_us - c.heard_us <= ANNOUNCE_FRESH_US);
             let mut newest: Option<(u64, i64)> = None;
-            for (&id, c) in syncing {
+            for c in syncing {
+                let id = c.timeline;
                 if Some(id) == was {
                     return Some(id);
                 }
