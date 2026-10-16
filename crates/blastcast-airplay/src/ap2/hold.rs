@@ -102,6 +102,10 @@ const AGREE_US: i64 = 1_000;
 /// for one.
 const MAP_POLL: Duration = Duration::from_millis(20);
 
+/// How long a playing stream waits for its timeline's clock map before
+/// that is logged: by then the phone's Syncs should have come.
+const MAP_WAIT_WARNING: Duration = Duration::from_secs(3);
+
 /// Ranged flushes remembered, for packets in them still to come.
 const RANGES: usize = 8;
 
@@ -536,16 +540,33 @@ pub async fn run(
 ) {
     let mut hold = Hold::default();
     let mut reading = true;
+    // Since when it has played without a map, and whether that was said.
+    let mut unmapped: Option<(Instant, bool)> = None;
     loop {
         let now = out.clock.now_us();
         let map = hold.timeline().and_then(|t| out.ptp.map(t));
         let wake = match &map {
             Some(map) => {
+                if let Some((_, true)) = unmapped {
+                    tracing::info!("AirPlay 2 audio has the phone's PTP clock now");
+                }
+                unmapped = None;
                 hand_over(&mut hold, &out, now, map);
                 hold.next_due(map, HAND_OVER_LEAD_US)
                     .map(|us| out.clock.instant_at(us))
             }
-            None if hold.is_playing() => Some(Instant::now() + MAP_POLL),
+            None if hold.is_playing() => {
+                let (since, said) = unmapped.get_or_insert((Instant::now(), false));
+                if !*said && since.elapsed() >= MAP_WAIT_WARNING {
+                    *said = true;
+                    tracing::warn!(
+                        timeline = hold.timeline().map(|t| format!("{t:016x}")),
+                        waited_s = MAP_WAIT_WARNING.as_secs(),
+                        "AirPlay 2 audio is held: no PTP clock for the phone's timeline, so nothing plays. Its Syncs aren't reaching us from a followed peer (SETPEERS)"
+                    );
+                }
+                Some(Instant::now() + MAP_POLL)
+            }
             None => None,
         };
         let far = Instant::now() + Duration::from_secs(3600);

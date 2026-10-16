@@ -19,6 +19,15 @@
 //! The TCP ports come from [`NativeConfig::tcp_ports`] and the UDP one
 //! from [`NativeConfig::udp_ports`], so a firewall can let them in.
 //!
+//! RECORD starts the session and nothing else, so it is answered 200
+//! whenever it comes: an iPhone sends it between the phases, a Mac after
+//! phase 2, and the session begins at whichever of it and phase 2 comes
+//! second ([`Session::record`], [`Session::recorded`]).
+//!
+//! An iPhone's phase 1 names no `Addresses` in its `timingPeerInfo` (its
+//! `ID`, `ClockID` and `DeviceType` only, with `asyncPTPClockConfig`), so
+//! no peers are followed until its SETPEERS.
+//!
 //! SETPEERS and SETPEERSX change the peers followed; TEARDOWN with
 //! `streams` ends the stream and without them the session.
 //! SETRATEANCHORTIME and FLUSHBUFFERED go to the stream's [`hold`], which
@@ -118,12 +127,24 @@ pub struct Session {
     sender_name: Option<String>,
     events: Option<Task>,
     stream: Option<Stream>,
+    /// RECORD has come.
+    recorded: bool,
 }
 
 impl Session {
     /// The stream phase 2 set up, while it lasts.
     pub fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
+    }
+
+    /// RECORD: the sender means to play, with or without a stream yet.
+    pub fn record(&mut self) {
+        self.recorded = true;
+    }
+
+    /// Whether RECORD has come since the session was set up.
+    pub fn recorded(&self) -> bool {
+        self.recorded
     }
 
     /// What the sender called itself in phase 1, if it did.
@@ -140,15 +161,18 @@ impl Session {
             );
             return Response::new(400);
         };
+        let shown = super::show(&Value::Dictionary(dict.clone()));
+        tracing::debug!(request = shown, "AirPlay 2 SETUP");
         let reply = match dict.get("streams").and_then(Value::as_array) {
             Some(streams) => self.streams(ctx, streams).await,
             None => self.timing(ctx, keys, &dict).await,
         };
         match reply {
             Ok(dict) => {
+                let dict = Value::Dictionary(dict);
+                tracing::debug!(reply = super::show(&dict), "AirPlay 2 SETUP answered");
                 let mut body = Vec::new();
-                Value::Dictionary(dict)
-                    .to_writer_binary(&mut body)
+                dict.to_writer_binary(&mut body)
                     .expect("a plist of ours encodes");
                 Response::ok().body(BPLIST, body)
             }

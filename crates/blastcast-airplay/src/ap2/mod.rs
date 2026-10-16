@@ -119,11 +119,18 @@ const fn features(bits: &[(u32, &str)]) -> u64 {
 pub const TLV8: &str = "application/octet-stream";
 
 /// Whether `req` is an AirPlay 2 request: `GET /info`, pairing,
-/// `/fp-setup`, or one with a binary plist body. An AirPlay 1 sender sends
-/// none of them, since its advert offers neither FairPlay (`et=3`) nor a
-/// pairing key.
+/// `/fp-setup`, a method only AirPlay 2 has, or one with a binary plist
+/// body. An AirPlay 1 sender sends none of them, since its advert offers
+/// neither FairPlay (`et=3`) nor a pairing key.
+///
+/// The methods go by name, as their content type can't be relied on: an
+/// iPhone's SETPEERS says `Content-Type: /peer-list-changed`.
 pub fn handles(req: &Request) -> bool {
     (req.method == "GET" && req.uri == "/info")
+        || matches!(
+            req.method.as_str(),
+            "SETPEERS" | "SETPEERSX" | "SETRATEANCHORTIME" | "FLUSHBUFFERED"
+        )
         || (req.method == "POST"
             && matches!(
                 req.uri.as_str(),
@@ -132,6 +139,28 @@ pub fn handles(req: &Request) -> bool {
         || req
             .header("Content-Type")
             .is_some_and(|t| t.eq_ignore_ascii_case(BPLIST))
+}
+
+/// A plist for the log, on one line: each data value as its length only,
+/// since some are keys (a stream's `shk`).
+pub fn show(value: &plist::Value) -> String {
+    use plist::Value;
+    match value {
+        Value::Dictionary(d) => {
+            let items: Vec<String> = d.iter().map(|(k, v)| format!("{k}: {}", show(v))).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        Value::Array(a) => {
+            let items: Vec<String> = a.iter().map(show).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Value::Data(d) => format!("<{} bytes>", d.len()),
+        Value::String(s) => format!("{s:?}"),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(r) => r.to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// One sender's connection, as far as AirPlay 2 goes: its pairing, once
@@ -169,6 +198,11 @@ impl Connection {
         &self.session
     }
 
+    /// RECORD, on a paired connection.
+    pub fn record(&mut self) {
+        self.session.record();
+    }
+
     /// Answers a SETUP with a plist body: refused until paired, since the
     /// event channel is encrypted with the pairing's keys.
     pub async fn setup(&mut self, ctx: setup::Context<'_>, req: &Request) -> Response {
@@ -188,7 +222,12 @@ impl Connection {
     /// Answers an AirPlay 2 request to `device`, SETUP and TEARDOWN aside.
     pub fn answer(&mut self, device: &Device, req: &Request) -> Response {
         match (req.method.as_str(), req.uri.as_str()) {
-            ("GET", "/info") => Response::ok().body(BPLIST, info::info_plist(device)),
+            ("GET", "/info") => {
+                if let Ok(asked) = plist::Value::from_reader(std::io::Cursor::new(&req.body)) {
+                    tracing::debug!(request = show(&asked), "AirPlay 2 GET /info");
+                }
+                Response::ok().body(BPLIST, info::info_plist(device))
+            }
             ("POST", "/pair-setup" | "/pair-verify") if self.is_paired() => {
                 tracing::debug!(uri = %req.uri, "pairing again on a paired AirPlay 2 connection");
                 Response::new(455)
@@ -209,6 +248,14 @@ impl Connection {
                 }
             },
             ("SETPEERS" | "SETPEERSX", _) => self.session.set_peers(&req.body),
+            // A remote command's answer, and the audio mode; nothing to do
+            // with either, and shairport-sync answers both 200.
+            ("POST", "/command" | "/audioMode") => {
+                if let Ok(body) = plist::Value::from_reader(std::io::Cursor::new(&req.body)) {
+                    tracing::debug!(uri = %req.uri, body = show(&body), "AirPlay 2 POST");
+                }
+                Response::ok()
+            }
             ("SETRATEANCHORTIME", _) => self.session.command(&req.body, hold::Command::rate),
             ("FLUSHBUFFERED", _) => self.session.command(&req.body, hold::Command::flush),
             (method, uri) => {
@@ -260,6 +307,12 @@ mod tests {
         assert!(handles(&request("POST", "/pair-verify", None)));
         assert!(handles(&request("POST", "/fp-setup", Some(TLV8))));
         assert!(handles(&request("SETUP", "rtsp://x/1", Some(BPLIST))));
+        // An iPhone's, as it labels it.
+        assert!(handles(&request(
+            "SETPEERS",
+            "rtsp://x/1",
+            Some("/peer-list-changed")
+        )));
         assert!(!handles(&request("OPTIONS", "*", None)));
         assert!(!handles(&request(
             "SET_PARAMETER",

@@ -1654,6 +1654,125 @@ async fn an_airplay_2_senders_session_metadata_and_volume() {
     ap2.shutdown().await;
 }
 
+/// An iPhone (iOS 27) plays in its own order: its phase 1 names no
+/// timing addresses, and between the phases it reads /info, asks the
+/// volume and sends RECORD, which must be answered 200 or the phone gives
+/// up and shows "Unable to connect"; then SETPEERS, under a content type
+/// that isn't a plist's, which must reach the follower or no audio plays
+/// (headway:tune-assistant/flavor-figure-enemy). The session begins once
+/// its stream is set up.
+#[tokio::test]
+async fn an_iphone_records_before_its_stream() {
+    use crate::ap2::buffered::TYPE_BUFFERED;
+    use plist::{Dictionary, Value};
+
+    let ap2 = Ap2::start(Vec::new()).await;
+    let rig = &ap2.rig;
+    let mut phone = paired(rig).await;
+
+    // Its phase 1, as one sent it.
+    let mut peer = Dictionary::new();
+    peer.insert("ID".into(), "3DDA21F0-2651-4C8F-9640-4EC0BE3B0397".into());
+    peer.insert("ClockID".into(), Value::from(8_364_539_730_743_787_528u64));
+    peer.insert("DeviceType".into(), Value::from(0u64));
+    peer.insert("SupportsClockPortMatchingOverride".into(), true.into());
+    let mut setup = Dictionary::new();
+    for (k, v) in [
+        ("osVersion", "27.0"),
+        ("name", "Test iPhone"),
+        (
+            "sessionCorrelationUUID",
+            "3DDA21F0-2651-4C8F-9640-4EC0BE3B0397",
+        ),
+        ("groupUUID", "E7679068-025F-41E9-AB65-C087D18B5C85"),
+        ("deviceID", "D2:7D:CE:A2:A1:EE"),
+        ("timingProtocol", "PTP"),
+        ("sourceVersion", "980.77.1"),
+        ("model", "iPhone18,2"),
+        ("macAddress", "42:69:44:CA:81:0D"),
+        ("sessionUUID", "606FEF6D-B5F9-48D6-9C55-4E8EFFF0FCFF"),
+        ("osBuildVersion", "24A435"),
+        ("osName", "iPhone OS"),
+    ] {
+        setup.insert(k.into(), v.into());
+    }
+    for (k, v) in [
+        ("isMultiSelectAirPlay", true),
+        ("combinedGetInfoWithControlSetup", true),
+        ("senderSupportsRelay", true),
+        ("groupContainsGroupLeader", false),
+        ("statsCollectionEnabled", false),
+        ("supportsGroupCohesion", true),
+        ("updateSessionRequest", false),
+        ("asyncPTPClockConfig", true),
+    ] {
+        setup.insert(k.into(), v.into());
+    }
+    setup.insert(
+        "timingPeerList".into(),
+        Value::Array(vec![Value::Dictionary(peer.clone())]),
+    );
+    setup.insert("timingPeerInfo".into(), Value::Dictionary(peer));
+    let uri = "rtsp://127.0.0.1/6949036004539451606";
+    let timing = phone
+        .plist_request("SETUP", uri, &Value::Dictionary(setup))
+        .await
+        .unwrap();
+    assert_eq!(timing.status, 200);
+    let reply = crate::ap2::testing::reply_plist(&timing).unwrap();
+    let event_port = reply["eventPort"].as_unsigned_integer().unwrap() as u16;
+    let events = phone.open_events(rig.addr, event_port).await.unwrap();
+
+    // Between the phases.
+    let info = phone.info().await.unwrap();
+    assert_eq!(info["name"].as_string(), Some("Kitchen"));
+    let volume = phone
+        .request(
+            "GET_PARAMETER",
+            uri,
+            &[],
+            Some(("text/parameters", b"volume\r\n")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(volume.status, 200);
+    let record = phone.request("RECORD", uri, &[], None).await.unwrap();
+    assert_eq!(record.status, 200);
+    assert!(rig.sessions.all().is_empty(), "no stream yet");
+    assert!(!rig.receivers.all()[0].playing);
+
+    // Its clock's Syncs are dropped until its SETPEERS names it, which it
+    // labels as no plist.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(ap2.ptp.map(PHONE_CLOCK).is_none(), "followed no peer yet");
+    let peers = Value::Array(vec!["127.0.0.1".into(), "fe80::1c2b:3cff:fe4d:5e6f".into()]);
+    let mut body = Vec::new();
+    peers.to_writer_binary(&mut body).unwrap();
+    let set_peers = phone
+        .request("SETPEERS", uri, &[], Some(("/peer-list-changed", &body)))
+        .await
+        .unwrap();
+    assert_eq!(set_peers.status, 200);
+    ap2.mapped().await;
+
+    let stream = phone
+        .setup_stream(TYPE_BUFFERED, 2, &[0x5a; 32], 352)
+        .await
+        .unwrap();
+    assert_eq!(stream.status, 200);
+    let sessions = rig.sessions.all();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_eq!(sessions[0].sender_name.as_deref(), Some("Test iPhone"));
+    assert!(rig.receivers.all()[0].playing);
+    rig.until("the begin", |r| {
+        r.events().first() == Some(&MetadataEvent::PlayBegin)
+    })
+    .await;
+
+    drop((phone, events));
+    ap2.shutdown().await;
+}
+
 /// AirPlay 1 and AirPlay 2 senders to one target take it over from each
 /// other, as two of either protocol do: an old Mac on AirPlay 1 cuts off a
 /// phone on AirPlay 2, and the next AirPlay 2 phone cuts off the Mac. The

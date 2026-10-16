@@ -108,8 +108,20 @@ pub(crate) async fn run(receiver: Arc<Receiver>, id: u64, tcp: TcpStream, peer: 
                 break;
             }
         };
-        tracing::trace!(method = %request.method, uri = %request.uri, "AirPlay request");
         let response = conn.answer(&request).await;
+        if request.uri == "/feedback" {
+            // iOS's keep-alive, every two seconds.
+            tracing::trace!(status = response.status, "AirPlay feedback");
+        } else {
+            tracing::debug!(
+                method = %request.method,
+                uri = %request.uri,
+                content_type = request.header("Content-Type").unwrap_or_default(),
+                len = request.body.len(),
+                status = response.status,
+                "AirPlay request"
+            );
+        }
         if let Err(e) = write.send(&response.to_bytes()).await {
             tracing::debug!(error = %e, "AirPlay connection ended");
             break;
@@ -295,6 +307,10 @@ impl Connection {
                 encrypted: true,
             };
             self.receiver.take_over(self.id, sender);
+            // An iPhone's RECORD came before its stream.
+            if self.ap2.session().recorded() {
+                self.receiver.begin(self.id);
+            }
         }
         response
     }
@@ -309,12 +325,16 @@ impl Connection {
     }
 
     fn record(&mut self) -> Response {
-        if self.ap2.session().stream().is_some() {
+        if self.stream.is_none() && self.ap2.is_paired() {
             // AirPlay 2's RECORD starts the session and nothing else: its
-            // audio is already flowing, and SETRATEANCHORTIME says when it
-            // plays.
-            self.receiver.begin(self.id);
-            return Response::ok();
+            // audio flows on the data channel, and SETRATEANCHORTIME says
+            // when it plays. An iPhone sends it before its streams SETUP,
+            // which begins the session then; a Mac sends it after.
+            self.ap2.record();
+            if self.ap2.session().stream().is_some() {
+                self.receiver.begin(self.id);
+            }
+            return Response::ok().header("Audio-Latency", "0");
         }
         let Some(stream) = &self.stream else {
             return Response::new(455);
