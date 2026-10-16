@@ -93,7 +93,7 @@ enum Timing {
     Unset,
     /// Phase 1 asked for this protocol, not PTP.
     Other(Option<String>),
-    Following(Follow),
+    Following(Arc<Follow>),
     /// PTP, but the follower can't: why.
     Refused(String),
 }
@@ -198,7 +198,7 @@ impl Session {
             match ctx.ptp.follow(peers.iter().copied()) {
                 Ok(follow) => {
                     tracing::debug!(?peers, "AirPlay 2 SETUP: following PTP");
-                    Timing::Following(follow)
+                    Timing::Following(Arc::new(follow))
                 }
                 Err(why) => {
                     tracing::warn!(
@@ -253,8 +253,8 @@ impl Session {
                 return Err(501);
             }
         }
-        match &self.timing {
-            Timing::Following(_) => {}
+        let follow = match &self.timing {
+            Timing::Following(follow) => follow.clone(),
             Timing::Refused(why) => {
                 tracing::warn!(reason = %why, "refusing AirPlay 2 buffered audio: no PTP timing");
                 return Err(503);
@@ -270,7 +270,7 @@ impl Session {
                 tracing::warn!("refusing AirPlay 2 buffered audio: no timing SETUP before it");
                 return Err(455);
             }
-        }
+        };
         let codec =
             Codec::from_setup(number("ct"), number("spf"), number("sr")).map_err(|why| {
                 tracing::warn!(codec = %why, "refusing an AirPlay 2 stream we can't decode");
@@ -291,7 +291,7 @@ impl Session {
 
         // The old stream's ports are free again first.
         self.stream = None;
-        let stream = Stream::start(&ctx, codec, key, decoder)
+        let stream = Stream::start(&ctx, follow, codec, key, decoder)
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "can't open the AirPlay 2 stream's ports");
@@ -384,6 +384,7 @@ fn port(listener: &TcpListener) -> Result<u16, u16> {
 impl Stream {
     async fn start(
         ctx: &Context<'_>,
+        follow: Arc<Follow>,
         codec: Codec,
         key: AudioKey,
         decoder: Decoder,
@@ -397,6 +398,7 @@ impl Stream {
         let out = hold::Out {
             sink: ctx.sink.clone(),
             ptp: ctx.ptp.clone(),
+            follow,
             clock: ctx.clock,
             probe: ctx.probe.clone(),
         };

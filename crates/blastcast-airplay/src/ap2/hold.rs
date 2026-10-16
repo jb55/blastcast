@@ -44,6 +44,18 @@
 //!   still to come. Without `flushFromTS` it drops everything before
 //!   `flushUntilTS`. The sink is flushed when any of it was handed over.
 //!
+//! **Following the grandmaster.** An anchor is on the timeline of the
+//! group's PTP grandmaster when it was sent. When the grandmaster changes
+//! (a TV leaves the group, and the soundbar takes over) the phone sends no
+//! new anchor, and the old timeline's map goes with the clock that carried
+//! it. So the hold keeps the last map it had for its anchor's timeline.
+//! Once the session's new grandmaster's timeline maps, the anchor moves
+//! onto it, at the same server times ([`Timeline::map`]), and until then
+//! it plays on the last map. Nothing is flushed, and the frames handed
+//! over keep their stamps. shairport-sync does the same: its
+//! `get_ptp_anchor_local_time_info` shifts the anchor by nqptp's
+//! `clock_change_offset`.
+//!
 //! TEARDOWN drops the stream, and the receiver ends the session the way it
 //! ends AirPlay 1's ([`crate::raop`]): [`Item::End`](blastcast::Item::End)
 //! after its end delay unless a sender plays again.
@@ -74,7 +86,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::buffered::Decoded;
-use super::ptp::Ptp;
+use super::ptp::{Follow, Ptp};
 use super::setup::AUDIO_BUFFER_SIZE;
 use crate::audio::AIRPLAY_FORMAT;
 use crate::metadata::MetadataEvent;
@@ -300,6 +312,15 @@ impl Hold {
     /// Frames dropped as late since the last call.
     pub fn take_late(&mut self) -> u64 {
         std::mem::take(&mut self.late)
+    }
+
+    /// Moves the anchor onto timeline `timeline`, `remote_us` saying where
+    /// on it a time on the old one falls.
+    pub fn rebase(&mut self, timeline: u64, remote_us: impl FnOnce(i64) -> i64) {
+        if let Some((t, anchor)) = &mut self.anchor {
+            *t = timeline;
+            anchor.remote_us = remote_us(anchor.remote_us);
+        }
     }
 
     /// When the frame at RTP time `rtp` plays, through `map`, by the
@@ -532,11 +553,63 @@ fn agrees(old: &(u64, Anchor), new: &(u64, Anchor)) -> bool {
     old.0 == new.0 && (remote - new.1.remote_us).abs() <= AGREE_US
 }
 
+/// The map a stream's hold last handed over by, and the timeline it was
+/// for: what carries its anchor across a change of grandmaster. See the
+/// [module docs](self).
+#[derive(Debug, Default)]
+pub struct Timeline {
+    last: Option<(u64, ClockMap)>,
+}
+
+impl Timeline {
+    /// The map to hand `hold` over by. `ptp` maps a timeline, and
+    /// `grandmaster` is the session's grandmaster now. The anchor's own
+    /// timeline's map comes first. Without one, once the timeline has
+    /// mapped, the anchor moves onto `grandmaster`'s timeline when that
+    /// maps; until then it is the last map. `None` while the anchor's
+    /// timeline has never mapped.
+    pub fn map(
+        &mut self,
+        hold: &mut Hold,
+        ptp: impl Fn(u64) -> Option<ClockMap>,
+        grandmaster: Option<u64>,
+    ) -> Option<ClockMap> {
+        let timeline = hold.timeline()?;
+        if let Some(map) = ptp(timeline) {
+            self.last = Some((timeline, map));
+            return Some(map);
+        }
+        let (_, old) = self.last.filter(|(t, _)| *t == timeline)?;
+        let Some((to, new)) = grandmaster
+            .filter(|&g| g != timeline)
+            .and_then(|g| Some((g, ptp(g)?)))
+        else {
+            return Some(old);
+        };
+        let mut moved_us = 0;
+        hold.rebase(to, |remote_us| {
+            let rebased = new.to_remote_us(old.to_server_us(remote_us));
+            moved_us = rebased - remote_us;
+            rebased
+        });
+        tracing::info!(
+            from = format!("{timeline:016x}"),
+            to = format!("{to:016x}"),
+            moved_us,
+            "AirPlay 2 audio follows the new PTP grandmaster: its anchor is on that timeline now"
+        );
+        self.last = Some((to, new));
+        Some(new)
+    }
+}
+
 /// What a stream's hold hands to, and what it reads the time and its
 /// timeline with.
 pub struct Out {
     pub sink: Arc<dyn Sink>,
     pub ptp: Ptp,
+    /// The session's grandmaster, for an anchor whose timeline is gone.
+    pub follow: Arc<Follow>,
     pub clock: ServerClock,
     pub probe: Probe,
 }
@@ -549,12 +622,13 @@ pub async fn run(
     out: Out,
 ) {
     let mut hold = Hold::default();
+    let mut timeline = Timeline::default();
     let mut reading = true;
     // Since when it has played without a map, and whether that was said.
     let mut unmapped: Option<(Instant, bool)> = None;
     loop {
         let now = out.clock.now_us();
-        let map = hold.timeline().and_then(|t| out.ptp.map(t));
+        let map = timeline.map(&mut hold, |t| out.ptp.map(t), out.follow.grandmaster());
         let wake = match &map {
             Some(map) => {
                 if let Some((_, true)) = unmapped {

@@ -420,3 +420,61 @@ fn paused_and_resumed_follow_the_rate_after_it_first_plays() {
     hold.set_rate(Some(true), anchor(1352, 50_000));
     assert!(!hold.is_paused());
 }
+
+/// The grandmaster changes and no new anchor comes: the anchor's timeline
+/// loses its map. The hold plays on the last map, then moves the anchor
+/// onto the new grandmaster's timeline once that maps, at the same server
+/// times.
+#[test]
+fn an_anchor_follows_the_grandmaster_onto_its_timeline() {
+    const SOUNDBAR: u64 = 0x984e_8aff_fe92_2389;
+    let mut hold = held(1000, 10);
+    hold.set_rate(Some(true), anchor(1000, 50_000));
+    let mut timeline = Timeline::default();
+    let tv = map();
+    // The soundbar's clock runs 3 s and 20 ppm away from the TV's.
+    let soundbar = ClockMap {
+        offset_us: OFFSET + 3_000_000,
+        drift_ppm: 20.0,
+        at_us: 40_000,
+        ..ClockMap::identity()
+    };
+    let before = hold.play_at_us(1000 + 5 * PACKET as u32, &tv).unwrap();
+
+    // Never mapped: nothing.
+    let mut fresh = held(1000, 1);
+    fresh.set_rate(Some(true), anchor(1000, 50_000));
+    assert_eq!(Timeline::default().map(&mut fresh, |_| None, None), None);
+
+    let maps = |t: u64| (t == TIMELINE).then_some(tv);
+    assert_eq!(timeline.map(&mut hold, maps, Some(TIMELINE)), Some(tv));
+    // The TV's map is gone and the soundbar's hasn't come: the last map.
+    assert_eq!(timeline.map(&mut hold, |_| None, Some(SOUNDBAR)), Some(tv));
+    assert_eq!(hold.timeline(), Some(TIMELINE));
+    // The soundbar's maps: the anchor moves onto it.
+    let maps = |t: u64| (t == SOUNDBAR).then_some(soundbar);
+    assert_eq!(
+        timeline.map(&mut hold, maps, Some(SOUNDBAR)),
+        Some(soundbar)
+    );
+    assert_eq!(hold.timeline(), Some(SOUNDBAR));
+    let after = hold
+        .play_at_us(1000 + 5 * PACKET as u32, &soundbar)
+        .unwrap();
+    assert!((after - before).abs() <= 1, "{before} → {after}");
+    // And stays there.
+    assert_eq!(
+        timeline.map(&mut hold, maps, Some(SOUNDBAR)),
+        Some(soundbar)
+    );
+
+    // A phone anchor on the soundbar's timeline where the move put it
+    // changes nothing; nothing is flushed.
+    let remote_us = soundbar.to_remote_us(50_000);
+    let again = RateAnchor {
+        timeline: SOUNDBAR,
+        rtp: 1000,
+        remote_us,
+    };
+    assert!(!hold.set_rate(Some(true), Some(again)));
+}
