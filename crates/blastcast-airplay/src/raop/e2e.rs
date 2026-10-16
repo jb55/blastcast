@@ -1469,8 +1469,14 @@ async fn an_airplay_2_timeline_pause_and_flush_reach_a_sendspin_player() {
     assert_placed(&first, anchored(&map, 0, t, 0), 0);
     assert_eq!(speaker.control(), ["start"]);
 
-    // Paused a third of a second in.
+    // Paused a third of a second in. However far ahead the hold hands the
+    // audio over, the speaker is sent only its send-ahead's worth, so the
+    // pause leaves it little to drop
+    // (headway:tune-assistant/rebel-tonight-skill).
     tokio::time::sleep_until(rig.clock.instant_at(t + 300_000)).await;
+    let newest = speaker.audio().iter().map(|c| c.0).max().unwrap();
+    let ahead = newest - rig.clock.now_us();
+    assert!(ahead < 400_000, "the speaker holds {ahead} µs");
     let paused_at = rig.clock.now_us();
     let paused = ((paused_at - anchored(&map, 0, t, 0)) * 44_100 / 1_000_000) as u32;
     phone

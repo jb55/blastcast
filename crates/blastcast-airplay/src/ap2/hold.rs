@@ -14,7 +14,9 @@
 //! [`Anchor`]. With rate 1, each packet is handed to the receiver's
 //! [`Sink`] [`HAND_OVER_LEAD_US`] before it plays, stamped
 //! [`Anchor::play_at_us`] through the follower's map of that timeline, so
-//! the Sendspin stream gets seconds of lead and adds no latency. What is
+//! the Sendspin stream gets seconds of lead and adds no latency. The stream
+//! sends each player its own send-ahead's worth of that and holds the
+//! rest, so a pause's `stream/clear` leaves a speaker little to drop. What is
 //! ready at once goes as one chunk, since the stream's queue counts chunks,
 //! not frames. The sink wraps the stream in blastcast's
 //! [`RateMatch`](blastcast::RateMatch), as it does AirPlay 1's. A packet
@@ -81,8 +83,8 @@ use crate::raop::announce::{CHANNELS, SAMPLE_RATE};
 /// How long before it plays a packet is handed over: as much lead as the
 /// Sendspin stream can use. It covers the AirPlay 1 bridge's
 /// `required_lead_time_ms` (2.5 s), so a phone that leaves that much has
-/// it honoured, and fits in a player's default buffer (1 MiB, about 5 s of
-/// PCM).
+/// it honoured. The stream paces it out to each player at that player's
+/// send-ahead, so a speaker that needs 250 ms isn't sent 3 s.
 pub const HAND_OVER_LEAD_US: i64 = 3_000_000;
 
 /// The most held, in frames: [`AUDIO_BUFFER_SIZE`] bytes of decoded s16

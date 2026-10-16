@@ -911,11 +911,12 @@ async fn a_timed_source_plays_at_its_stamps_at_any_chunk_size() {
         );
         let stream = AudioStream::start(clock, source.boxed()).unwrap();
         stream.add_player(conn.clone());
-        sleep_ms(2500).await;
+        // Paced, the last is sent a send-ahead before it plays at 4 s.
+        sleep_ms(4000).await;
 
         let chunks = audio(&mut q);
-        // Stamped up to 3.5 s by 2.5 s: 75 chunks, less a partial one.
-        assert!(chunks.len() >= 74, "{rate} Hz, {frames}: {}", chunks.len());
+        // Two seconds: 100 chunks, less a partial one.
+        assert!(chunks.len() >= 99, "{rate} Hz, {frames}: {}", chunks.len());
         let ts: Vec<i64> = chunks.iter().map(|c| c.0).collect();
         let exact: Vec<i64> = (0..ts.len() as i64)
             .map(|k| 2_000_000 + k * 20_000)
@@ -980,7 +981,8 @@ async fn a_flush_clears_the_players_and_resets_the_added_latency() {
     stream.add_player(conn.clone());
     sleep_ms(1100).await;
     assert_eq!(added_latency_ms(&conn, clock.now_us()), 200.0);
-    sleep_ms(1000).await;
+    // Paced: the new stamps' chunks go a send-ahead before 3 s.
+    sleep_ms(1900).await;
 
     assert_eq!(control(&mut q), ["start", "clear"]);
     let ts: Vec<i64> = audio(&mut q).iter().map(|c| c.0).collect();
@@ -1004,7 +1006,8 @@ async fn a_jump_in_stamps_past_the_tolerance_moves_the_timeline() {
         .chunks(1_715_000, 5, 960, 500_000);
     let stream = AudioStream::start_with(clock, source.boxed(), hub.probe("s")).unwrap();
     stream.add_player(conn.clone());
-    sleep_ms(1500).await;
+    // Paced: the last goes a send-ahead before it plays at 1.795 s.
+    sleep_ms(1600).await;
 
     let ts: Vec<i64> = audio(&mut q).iter().map(|c| c.0).collect();
     let mut expected: Vec<i64> = (0..10).map(|k| 1_000_000 + k * 20_000).collect();
@@ -1035,7 +1038,8 @@ async fn a_timed_source_with_the_lead_for_it_honours_the_required_lead() {
             Scripted::new(clock, SESSION_FORMAT).chunks(lead_us + 100_000, 3, 960, lead_us);
         let stream = AudioStream::start(clock, source.boxed()).unwrap();
         stream.add_player(conn.clone());
-        sleep_ms(200).await;
+        // Paced: sent its send-ahead before it plays, 0.98 s at the latest.
+        sleep_ms(1000).await;
         let stats = conn.stats().snapshot(clock.now_us(), 0).stream.unwrap();
         assert_eq!(stats.send_ahead_ms, send_ahead_ms, "{lead_ms} ms of lead");
         assert_eq!(stats.added_latency_ms, 0.0, "{lead_ms} ms of lead");
@@ -1113,12 +1117,14 @@ async fn a_jump_in_a_trimmable_sources_stamps_trims_again() {
     let contiguous: Vec<i64> = (0..15).map(|k| 1_300_000 + k * 20_000).collect();
     assert_eq!(ts, contiguous, "the audio carries on through both jumps");
     // Each chunk arrives 20 ms after the last, so each keeps the lead the
-    // first was given: the floor and the keep, not 360 ms more.
+    // first was given: the floor and the keep, not 360 ms more. The player
+    // is sent each its send-ahead and RELEASE_EARLY_US before it plays; the
+    // keep stays here, as margin for the source's lateness.
     let leads: Vec<f64> = track(&hub, now, Series::Lead, "kitchen")
         .iter()
         .map(|p| p.value)
         .collect();
-    assert_eq!(leads, [300_000.0; 15]);
+    assert_eq!(leads, [270_000.0; 15]);
     assert_eq!(trimmed_lead_ms(&conn, now), 0.0);
     assert_eq!(added_latency_ms(&conn, now), 140.0, "the 1.2 s back");
 
@@ -1137,5 +1143,51 @@ async fn a_jump_in_a_trimmable_sources_stamps_trims_again() {
     assert_eq!(marks(Series::LatencyAdded), [(1_200_000, 140_000.0)]);
     assert!(marks(Series::TimelineRebase).is_empty());
     assert_eq!(control(&mut q), ["start", "end"], "no stream/clear");
+    drop(stream);
+}
+
+/// A timed source stamped three seconds ahead, as AirPlay 2's hold hands
+/// its audio over: each player is sent each chunk its own send-ahead
+/// before it plays, and no sooner. One that needs 250 ms holds about that,
+/// one that needs 2.5 s still gets it, and nothing is added to the play
+/// times. A flush finds most of the first player's audio still here, so
+/// that player had only its send-ahead to drop, not three seconds.
+#[tokio::test(start_paused = true)]
+async fn a_live_sources_chunks_go_to_each_player_at_its_own_send_ahead() {
+    let clock = ServerClock::new();
+    let hub = blastcast_telemetry::Telemetry::new();
+    let (speaker, mut sq) = traced_player(clock, &hub, "speaker");
+    let (bridge, mut bq) = traced_player(clock, &hub, "bridge");
+    state(
+        &bridge,
+        r#"{"player":{"min_buffer_ms":2000,"required_lead_time_ms":2500}}"#,
+    );
+    // Four seconds from 3 s on, each chunk arriving 3 s before it plays,
+    // and a flush at 4.5 s.
+    let source = Scripted::new(clock, SESSION_FORMAT)
+        .chunks(3_000_000, 200, 960, 3_000_000)
+        .flush(4_500_000);
+    let stream = AudioStream::start(clock, source.boxed()).unwrap();
+    stream.add_player(speaker.clone());
+    stream.add_player(bridge.clone());
+    sleep_ms(5000).await;
+    let now = clock.now_us();
+
+    let leads = |name| -> Vec<f64> {
+        let points = track(&hub, now, Series::Lead, name);
+        points.iter().map(|p| p.value).collect()
+    };
+    // By the flush, the speaker had what plays by 4.77 s; the bridge all.
+    let speaker_ts: Vec<i64> = audio(&mut sq).iter().map(|c| c.0).collect();
+    let expected: Vec<i64> = (0..89).map(|k| 3_000_000 + k * 20_000).collect();
+    assert_eq!(speaker_ts, expected);
+    assert_eq!(leads("speaker"), [270_000.0; 89]);
+    assert_eq!(audio(&mut bq).len(), 200);
+    assert_eq!(leads("bridge"), [2_520_000.0; 200]);
+    for (conn, q) in [(&speaker, &mut sq), (&bridge, &mut bq)] {
+        assert_eq!(added_latency_ms(conn, now), 0.0);
+        // The source runs out after its flush, which ends the stream.
+        assert_eq!(control(q), ["start", "clear", "end"]);
+    }
     drop(stream);
 }

@@ -24,8 +24,18 @@
 //! **Buffer tracking.** A source that isn't live may be read ahead as far as
 //! the players hold: a [`BufferTracker`] per player counts the bytes sent
 //! and not yet played against its `buffer_capacity`, capped at 30 s. A live
-//! source is sent as it arrives; a chunk that wouldn't fit is dropped for
-//! that player rather than holding up the rest.
+//! source's chunk that wouldn't fit is dropped for that player rather than
+//! holding up the rest.
+//!
+//! **Pacing.** A live source's chunk goes to each player its own
+//! send-ahead before it plays, and no sooner: the stream holds it until
+//! then ([`RELEASE_EARLY_US`] early, for the timer's lateness). A source
+//! may hand over audio seconds before it plays (an AirPlay 2 phone's, so
+//! a player that needs that lead has it), and a player sent it all at once
+//! would hold seconds that a `stream/clear` must drop: one that plays on
+//! instead makes a pause seconds late. Paced, each player holds about its
+//! send-ahead, and a clear drops the rest here. Audio that arrives later
+//! than a player's send-ahead, as most live audio does, goes at once.
 //!
 //! **Lifecycle.** A player gets `stream/start` when it is added, or when it
 //! becomes available again. [`AudioStream::seek`] sends `stream/clear` and
@@ -150,6 +160,11 @@ pub fn send_ahead_us(timing: &PlayerTiming, live: bool) -> i64 {
     (buffer_ms + i64::from(timing.output_delay_ms)) * 1000
 }
 
+/// How much sooner than its player's send-ahead a held chunk of a live
+/// source is sent ([`Output::release`]): a wake-up's lateness, so a chunk
+/// doesn't reach the player short of it.
+pub const RELEASE_EARLY_US: i64 = 20_000;
+
 /// The least lead a late joiner's first chunk is sent with:
 /// aiosendspin's `LATE_JOINER_MIN_LEAD_US`. It is below
 /// [`DEFAULT_SEND_AHEAD_US`] so a stream running at that send-ahead always
@@ -209,6 +224,7 @@ impl AudioStream {
             pending: None,
             pending_at: None,
             wake_us: None,
+            release_us: None,
             probe,
         };
         // Under the span of whoever started it: a group's session.
@@ -304,6 +320,9 @@ struct Output {
     /// It has had `stream/start` and no `stream/end` since. A player that
     /// went unavailable is paused, not started, but still open.
     open: bool,
+    /// A live source's chunks encoded for it and not yet due to be sent,
+    /// oldest first (see pacing in the module docs).
+    held: VecDeque<(Span, Bytes)>,
 }
 
 impl Output {
@@ -348,7 +367,38 @@ impl Output {
         );
     }
 
+    /// Queues a chunk for it: a live source's is held until it is due
+    /// ([`Output::release`]), anything else is sent now.
+    fn deliver(&mut self, bytes: Bytes, span: Span, now: i64, live: bool) {
+        if live {
+            self.held.push_back((span, bytes));
+        } else {
+            send_chunk(self, &bytes, span, now, false);
+        }
+    }
+
+    /// Sends the held chunks that play within its send-ahead (with or
+    /// `without_lead`, the required lead) of `now`, [`RELEASE_EARLY_US`]
+    /// early. Returns when the next one is due.
+    fn release(&mut self, now: i64, without_lead: bool) -> Option<i64> {
+        let ahead =
+            send_ahead_us(&self.conn.player_status().timing, without_lead) + RELEASE_EARLY_US;
+        while let Some((span, _)) = self.held.front() {
+            if !self.started {
+                self.held.clear();
+                return None;
+            }
+            if span.start_us > now + ahead {
+                return Some(span.start_us - ahead);
+            }
+            let (span, bytes) = self.held.pop_front().expect("just looked");
+            send_chunk(self, &bytes, span, now, true);
+        }
+        None
+    }
+
     fn end(&mut self) {
+        self.held.clear();
         if self.open {
             self.send_control(ServerMessage::StreamEnd(StreamEnd {
                 server_transmitted: None,
@@ -479,6 +529,7 @@ enum Event {
     Command(Option<Command>),
     Feed(FeedItem),
     Wake,
+    Release,
 }
 
 /// The stream task's state.
@@ -524,6 +575,8 @@ struct Streamer {
     /// When to look again at the pending chunk, or, with the feed ended,
     /// when the last chunk has played.
     wake_us: Option<i64>,
+    /// When the next chunk held for a player is due.
+    release_us: Option<i64>,
     /// Where the stream's own timings go.
     probe: Probe,
 }
@@ -532,12 +585,15 @@ impl Streamer {
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         loop {
             let wake = self.wake_us.map(|us| self.clock.instant_at(us));
+            let release = self.release_us.map(|us| self.clock.instant_at(us));
             let can_read = self.pending.is_none();
             let event = tokio::select! {
                 biased;
                 cmd = commands.recv() => Event::Command(cmd),
                 item = async { self.feed.as_mut().expect("guarded").recv().await },
                     if can_read && self.feed.is_some() => Event::Feed(item),
+                _ = async { tokio::time::sleep_until(release.expect("guarded")).await },
+                    if release.is_some() => Event::Release,
                 _ = async { tokio::time::sleep_until(wake.expect("guarded")).await },
                     if wake.is_some() => Event::Wake,
             };
@@ -569,6 +625,7 @@ impl Streamer {
                     self.feed = None;
                     self.next_feed();
                 }
+                Event::Release => self.release(self.clock.now_us()),
                 Event::Wake if self.pending.is_some() => self.pump(),
                 Event::Wake => {
                     tracing::info!("stream played out");
@@ -628,12 +685,16 @@ impl Streamer {
         self.pending = None;
         self.pending_at = None;
         self.wake_us = None;
+        self.release_us = None;
         self.timeline = None;
         self.history.clear();
         self.probe
             .mark(Series::StreamClear, self.clock.now_us(), 0.0);
         self.set_added(0);
         self.set_trimmed(None);
+        for out in &mut self.outputs {
+            out.held.clear();
+        }
         for out in self.outputs.iter_mut().filter(|o| o.started) {
             out.send_control(ServerMessage::StreamClear(StreamClear {
                 server_transmitted: None,
@@ -727,6 +788,7 @@ impl Streamer {
             conn,
             started: false,
             open: false,
+            held: VecDeque::new(),
         };
         match self.position(&client_id) {
             Some(i) => {
@@ -802,10 +864,22 @@ impl Streamer {
                 .iter_mut()
                 .filter(|o| o.started && o.format == format)
             {
-                send_chunk(out, &bytes, span, now, live);
+                out.deliver(bytes.clone(), span, now, live);
             }
         }
         self.history.push_back((session_span, samples));
+        self.release(now);
+    }
+
+    /// Sends every player the held chunks due by `now`, and sets
+    /// `release_us` for the next.
+    fn release(&mut self, now: i64) {
+        let without_lead = !self.honour_lead;
+        self.release_us = self
+            .outputs
+            .iter_mut()
+            .filter_map(|o| o.release(now, without_lead))
+            .min();
     }
 
     /// Starts the timeline at `floor`, or shifts it, and every running
@@ -1005,6 +1079,7 @@ impl Streamer {
                     "player unavailable, pausing its stream"
                 );
                 out.started = false;
+                out.held.clear();
                 out.conn.stats().stream_stopped();
             }
             self.outputs[i].tracker.prune(now);
@@ -1045,6 +1120,8 @@ impl Streamer {
             .expect("added with its output");
         let lead = send_ahead_us(&out.conn.player_status().timing, without_lead);
         let target = now + lead.max(LATE_JOIN_MIN_LEAD_US);
+        // Restarted: what was held for it goes again from what is kept.
+        out.held.clear();
 
         if encoding.running {
             out.start(encoding, without_lead, offset);
@@ -1055,7 +1132,7 @@ impl Streamer {
                 out.tracker.capacity_bytes(),
             );
             for (span, bytes) in encoding.sent.range(encoding.sent.len() - n..) {
-                send_chunk(out, bytes, *span, now, live);
+                out.deliver(bytes.clone(), *span, now, live);
             }
             return;
         }
@@ -1084,7 +1161,7 @@ impl Streamer {
             }
             at = span.end_us();
             if let Some((bytes, span)) = encoding.encode(samples) {
-                send_chunk(out, &bytes, span, now, live);
+                out.deliver(bytes, span, now, live);
             }
         }
         if at != cursor {
